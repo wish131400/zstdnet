@@ -782,6 +782,7 @@ public final class ClientProxyPublisher {
         }
 
         EditBox backendPortEdit = findBackendPortEdit(listeners, screen);
+        applyDefaultBackendPort(backendPortEdit);
         Button vanillaStartButton = null;
         for (Object listener : listeners) {
             if (listener instanceof Button button && isLanStartButton(button)) {
@@ -821,6 +822,17 @@ public final class ClientProxyPublisher {
 
         event.addListener(zstdPortEdit);
         return state;
+    }
+
+    private void applyDefaultBackendPort(EditBox backendPortEdit) {
+        if (backendPortEdit == null) {
+            return;
+        }
+        String current = backendPortEdit.getValue();
+        if (current != null && !current.isBlank()) {
+            return;
+        }
+        backendPortEdit.setValue(String.valueOf(ServerProxyConfigFile.readTargetPort()));
     }
 
     private void applyZstdPortResponse(ShareToLanState state, String raw) {

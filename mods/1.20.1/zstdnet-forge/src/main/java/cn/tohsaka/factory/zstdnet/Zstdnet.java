@@ -20,6 +20,7 @@
 package cn.tohsaka.factory.zstdnet;
 
 import cn.tohsaka.factory.zstdnet.client.ClientProxyPublisher;
+import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
 import com.mojang.logging.LogUtils;
 import net.minecraftforge.fml.common.Mod;
@@ -42,6 +43,7 @@ public class Zstdnet {
      * 模组加载时注册客户端与服务端功能。
      */
     public Zstdnet() {
+        LanCompressionSync.init();
         DistExecutor.safeRunWhenOn(Dist.CLIENT, () -> ClientProxyPublisher::init);
         ServerProxyBootstrap.init();
         LOGGER.info("zstdnet loaded");
