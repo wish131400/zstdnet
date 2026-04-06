@@ -13,6 +13,23 @@
 
 本模组设计之初是为了降低机械动力类服务器具有大量重复的数据发包带宽，在整合包齿轮盛宴（[齿轮盛宴 - Minecraft机械动力整合包 | 官方网站](https://www.xn--dctt54dhmrbwo.com/)）中，多台官方服务器压缩效果极为明显，平均带宽降低约90%
 
+### 实际效果示例
+
+```
+Raw: 189.06 GB (3.6MB/s) | Zstd: 10.28 GB (252.7KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.06 GB (5.0MB/s) | Zstd: 10.28 GB (234.3KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.06 GB (3.2MB/s) | Zstd: 10.28 GB (215.5KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.07 GB (4.8MB/s) | Zstd: 10.28 GB (303.7KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.07 GB (4.3MB/s) | Zstd: 10.28 GB (477.2KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.08 GB (3.3MB/s) | Zstd: 10.28 GB (319.7KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.08 GB (3.5MB/s) | Zstd: 10.28 GB (154.1KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.08 GB (4.2MB/s) | Zstd: 10.28 GB (353.0KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.09 GB (2.9MB/s) | Zstd: 10.28 GB (49.8KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.09 GB (2.8MB/s) | Zstd: 10.28 GB (324.2KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.09 GB (3.3MB/s) | Zstd: 10.28 GB (137.8KB/s) | Ratio: 5.44% | Conns: 8
+Raw: 189.10 GB (2.9MB/s) | Zstd: 10.28 GB (201.2KB/s) | Ratio: 5.44% | Conns: 8
+```
+
 ## 第一次使用
 
 在使用之前，请确保服务器的正版验证（online-mode=false）已经关闭，并且网络压缩阈值（network-compression-threshold=1048576）调整到合适数值
