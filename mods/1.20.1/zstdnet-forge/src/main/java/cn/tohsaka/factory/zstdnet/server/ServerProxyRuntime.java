@@ -80,6 +80,8 @@ final class ServerProxyRuntime {
     private static final int DEFAULT_MAX_REQ_PER_WINDOW = 30;
     private static final int DEFAULT_BURST_BYTES = 256 * 1024;
     private static final Duration DEFAULT_IDLE_TIMEOUT = Duration.ofSeconds(25);
+    private static final int CLIENT_PEEK_BUFFER = 4096;
+    private static final int MAX_HANDSHAKE_PACKET_SIZE = 2048;
 
     private final Object lifecycleLock = new Object();
 
@@ -204,7 +206,7 @@ final class ServerProxyRuntime {
         String sourceIp = remoteIp;
 
         try (Socket clientSocket = client) {
-            PushbackInputStream pushIn = new PushbackInputStream(clientSocket.getInputStream(), 16);
+            PushbackInputStream pushIn = new PushbackInputStream(clientSocket.getInputStream(), CLIENT_PEEK_BUFFER);
             ProxyInfo proxyInfo = parseProxyProtocolV2(pushIn);
             if (proxyInfo.valid && proxyInfo.sourceIp != null && !proxyInfo.sourceIp.isBlank()) {
                 sourceIp = proxyInfo.sourceIp;
@@ -212,6 +214,12 @@ final class ServerProxyRuntime {
 
             if (!guard.begin(sourceIp)) {
                 LOGGER.warn("[server] blocked {} by flood guard", sourceIp);
+                return;
+            }
+
+            DetectedClientMode clientMode = detectClientMode(pushIn);
+            if (clientMode.mode == ClientMode.RAW_LOGIN) {
+                LOGGER.warn("[server] dropped raw login attempt from {} on zstd-only entry", sourceIp);
                 return;
             }
 
@@ -228,6 +236,11 @@ final class ServerProxyRuntime {
                 applyReadTimeout(upstream, cfg.idleTimeout);
                 applyReadTimeout(clientSocket, cfg.idleTimeout);
                 TokenBucketLimiter perConnLimiter = TokenBucketLimiter.create(cfg.maxRatePerConnBps, cfg.burstBytes);
+
+                if (clientMode.mode == ClientMode.RAW_STATUS) {
+                    forwardRawStatus(clientSocket, pushIn, upstream, clientMode.initialWireData, stats);
+                    return;
+                }
 
                 Future<Exception> c2s = workers.submit(() -> {
                     try {
@@ -295,6 +308,81 @@ final class ServerProxyRuntime {
     /**
      * 客户端 -> 后端：zstd 解压后透传。
      */
+    /**
+     * Detect whether the public entry is receiving a raw status ping or a zstd-wrapped play/login stream.
+     */
+    private DetectedClientMode detectClientMode(PushbackInputStream in) throws IOException {
+        byte[] firstPacketWire = tryReadPacketWire(in, 1500);
+        if (firstPacketWire == null || firstPacketWire.length == 0) {
+            return DetectedClientMode.zstd();
+        }
+
+        byte[] firstPacket = extractPacketPayload(firstPacketWire);
+        Integer nextState = extractHandshakeNextState(firstPacket);
+        if (nextState != null && nextState == 1) {
+            byte[] secondPacketWire = tryReadPacketWire(in, 1500);
+            if (secondPacketWire != null && secondPacketWire.length > 0) {
+                byte[] secondPacket = extractPacketPayload(secondPacketWire);
+                if (isStatusRequestPacket(secondPacket)) {
+                    return new DetectedClientMode(
+                        ClientMode.RAW_STATUS,
+                        concat(firstPacketWire, secondPacketWire)
+                    );
+                }
+                in.unread(secondPacketWire);
+            }
+        } else if (nextState != null && nextState == 2) {
+            byte[] secondPacketWire = tryReadPacketWire(in, 1500);
+            if (secondPacketWire != null && secondPacketWire.length > 0) {
+                byte[] secondPacket = extractPacketPayload(secondPacketWire);
+                if (isLoginStartPacket(secondPacket)) {
+                    return new DetectedClientMode(ClientMode.RAW_LOGIN, concat(firstPacketWire, secondPacketWire));
+                }
+                in.unread(secondPacketWire);
+            }
+        }
+
+        in.unread(firstPacketWire);
+        return DetectedClientMode.zstd();
+    }
+
+    private void forwardRawStatus(
+        Socket clientSocket,
+        InputStream clientIn,
+        Socket upstream,
+        byte[] initialWireData,
+        TrafficStats stats
+    ) throws Exception {
+        OutputStream upstreamOut = upstream.getOutputStream();
+        upstreamOut.write(initialWireData);
+        upstreamOut.flush();
+        addRawPassthroughStats(initialWireData.length, stats);
+
+        Future<?> upstreamWriter = workers.submit(() -> {
+            try {
+                streamRaw(clientIn, upstreamOut, stats);
+            } catch (Exception ignored) {
+            } finally {
+                closeWrite(upstream);
+            }
+        });
+
+        Future<?> downstreamWriter = workers.submit(() -> {
+            try {
+                streamRaw(upstream.getInputStream(), clientSocket.getOutputStream(), stats);
+            } catch (Exception ignored) {
+            } finally {
+                closeWrite(clientSocket);
+            }
+        });
+
+        upstreamWriter.get();
+        downstreamWriter.get();
+    }
+
+    /**
+     * Client -> backend: decompress zstd traffic before forwarding to Minecraft.
+     */
     private void forwardDecompress(Socket dst, InputStream src, TrafficStats stats) throws IOException {
         try (ZstdInputStream zstdIn = new ZstdInputStream(new CountingInputStream(src, stats::addZstd))) {
             OutputStream dstOut = dst.getOutputStream();
@@ -311,6 +399,23 @@ final class ServerProxyRuntime {
 
     /**
      * 后端 -> 客户端：zstd 压缩后透传，并按配置执行 flush 与限速。
+     */
+    /**
+     * Raw status traffic bypasses compression but still updates bandwidth stats as 100% ratio traffic.
+     */
+    private void streamRaw(InputStream in, OutputStream out, TrafficStats stats) throws IOException {
+        byte[] buf = new byte[16 * 1024];
+        int n;
+        while ((n = in.read(buf)) >= 0) {
+            if (n > 0) {
+                out.write(buf, 0, n);
+                addRawPassthroughStats(n, stats);
+            }
+        }
+    }
+
+    /**
+     * Backend -> client: compress outbound traffic with zstd and apply flush/rate controls.
      */
     private void forwardCompress(
         OutputStream dst,
@@ -458,6 +563,54 @@ final class ServerProxyRuntime {
     /**
      * 按长度精确读取，长度不足抛 EOF。
      */
+    /**
+     * Read the first raw Minecraft packet if it looks small enough to be a handshake; otherwise leave the stream untouched.
+     */
+    private byte[] tryReadPacketWire(PushbackInputStream in, int maxWaitMillis) throws IOException {
+        long deadline = System.currentTimeMillis() + Math.max(200L, maxWaitMillis);
+        byte[] prefix = new byte[5];
+        int prefixLength = 0;
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                int next = in.read();
+                if (next < 0) {
+                    if (prefixLength == 0) {
+                        return new byte[0];
+                    }
+                    throw new EOFException("unexpected eof during packet read");
+                }
+
+                if (prefixLength >= prefix.length) {
+                    throw new IOException("packet length varint too large");
+                }
+
+                prefix[prefixLength++] = (byte) next;
+                VarIntRead packetLength = readVarInt(prefix, 0, prefixLength);
+                if (packetLength == null) {
+                    continue;
+                }
+
+                if (packetLength.value <= 0 || packetLength.value > MAX_HANDSHAKE_PACKET_SIZE) {
+                    in.unread(prefix, 0, prefixLength);
+                    return null;
+                }
+
+                byte[] payload = readFully(in, packetLength.value);
+                byte[] packet = new byte[prefixLength + payload.length];
+                System.arraycopy(prefix, 0, packet, 0, prefixLength);
+                System.arraycopy(payload, 0, packet, prefixLength, payload.length);
+                return packet;
+            } catch (SocketTimeoutException ignored) {
+            }
+        }
+
+        if (prefixLength > 0) {
+            in.unread(prefix, 0, prefixLength);
+        }
+        return new byte[0];
+    }
+
     private byte[] readFully(InputStream in, int len) throws IOException {
         byte[] out = new byte[len];
         int off = 0;
@@ -469,6 +622,103 @@ final class ServerProxyRuntime {
             off += n;
         }
         return out;
+    }
+
+    private byte[] extractPacketPayload(byte[] packetWire) throws IOException {
+        VarIntRead packetLength = readVarInt(packetWire, 0, packetWire.length);
+        if (packetLength == null || packetLength.value < 0 || packetLength.next + packetLength.value > packetWire.length) {
+            throw new IOException("invalid packet payload");
+        }
+        return Arrays.copyOfRange(packetWire, packetLength.next, packetLength.next + packetLength.value);
+    }
+
+    private boolean isStatusRequestPacket(byte[] payload) {
+        return payload != null && payload.length == 1 && payload[0] == 0;
+    }
+
+    private boolean isLoginStartPacket(byte[] payload) {
+        if (payload == null || payload.length < 3) {
+            return false;
+        }
+
+        VarIntRead packetId = readVarInt(payload, 0, payload.length);
+        if (packetId == null || packetId.value != 0) {
+            return false;
+        }
+
+        VarIntRead nameLength = readVarInt(payload, packetId.next, payload.length);
+        if (nameLength == null || nameLength.value < 1 || nameLength.value > 16) {
+            return false;
+        }
+
+        int nameStart = nameLength.next;
+        int nameEnd = nameStart + nameLength.value;
+        if (nameEnd > payload.length) {
+            return false;
+        }
+
+        for (int i = nameStart; i < nameEnd; i++) {
+            int ch = payload[i] & 0xFF;
+            boolean valid = (ch >= '0' && ch <= '9')
+                || (ch >= 'A' && ch <= 'Z')
+                || (ch >= 'a' && ch <= 'z')
+                || ch == '_';
+            if (!valid) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private Integer extractHandshakeNextState(byte[] handshakePayload) {
+        VarIntRead packetId = readVarInt(handshakePayload, 0, handshakePayload.length);
+        if (packetId == null || packetId.value != 0) {
+            return null;
+        }
+
+        VarIntRead protocol = readVarInt(handshakePayload, packetId.next, handshakePayload.length);
+        if (protocol == null) {
+            return null;
+        }
+
+        VarIntRead hostLength = readVarInt(handshakePayload, protocol.next, handshakePayload.length);
+        if (hostLength == null || hostLength.value < 0) {
+            return null;
+        }
+
+        int afterHost = hostLength.next + hostLength.value;
+        int afterPort = afterHost + 2;
+        if (afterPort > handshakePayload.length) {
+            return null;
+        }
+
+        VarIntRead nextState = readVarInt(handshakePayload, afterPort, handshakePayload.length);
+        if (nextState == null || (nextState.value != 1 && nextState.value != 2)) {
+            return null;
+        }
+        return nextState.value;
+    }
+
+    private VarIntRead readVarInt(byte[] data, int start, int endExclusive) {
+        int value = 0;
+        int position = 0;
+        int index = start;
+
+        while (index < endExclusive) {
+            int next = data[index++] & 0xFF;
+            value |= (next & 0x7F) << position;
+            if ((next & 0x80) == 0) {
+                return new VarIntRead(value, index);
+            }
+
+            position += 7;
+            if (position > 28) {
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private String ipString(byte[] data, int offset, int len) throws IOException {
@@ -483,6 +733,31 @@ final class ServerProxyRuntime {
     /**
      * 定时输出流量与连接统计，同时触发防刷状态清理。
      */
+    /**
+     * Utility helpers for packet framing and passthrough traffic accounting.
+     */
+    private void addRawPassthroughStats(int bytes, TrafficStats stats) {
+        if (stats == null || bytes <= 0) {
+            return;
+        }
+        stats.addRaw(bytes);
+        stats.addZstd(bytes);
+    }
+
+    private byte[] concat(byte[] first, byte[] second) {
+        if (first == null || first.length == 0) {
+            return second == null ? new byte[0] : second;
+        }
+        if (second == null || second.length == 0) {
+            return first;
+        }
+
+        byte[] merged = new byte[first.length + second.length];
+        System.arraycopy(first, 0, merged, 0, first.length);
+        System.arraycopy(second, 0, merged, first.length, second.length);
+        return merged;
+    }
+
     private void startStatsPrinter() {
         long periodMs = Math.max(250L, cfg.statsInterval.toMillis());
         AtomicLong prevRaw = new AtomicLong();
@@ -811,6 +1086,18 @@ final class ServerProxyRuntime {
     /**
      * 服务端配置快照模块。
      */
+    private enum ClientMode {
+        ZSTD,
+        RAW_STATUS,
+        RAW_LOGIN
+    }
+
+    private record DetectedClientMode(ClientMode mode, byte[] initialWireData) {
+        private static DetectedClientMode zstd() {
+            return new DetectedClientMode(ClientMode.ZSTD, null);
+        }
+    }
+
     private record ProxyConfig(
         boolean enabled,
         HostPort listen,
@@ -1177,6 +1464,9 @@ final class ServerProxyRuntime {
     /**
      * 线程命名工厂模块，便于日志与诊断定位线程用途。
      */
+    private record VarIntRead(int value, int next) {
+    }
+
     private static final class NamedFactory implements ThreadFactory {
         private final String prefix;
         private final AtomicInteger index = new AtomicInteger(1);
