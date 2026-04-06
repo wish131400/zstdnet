@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 wish131400
+ * Copyright (c) 2026 wish
  *
  * This file is part of ZstdNet.
  *
@@ -34,11 +34,13 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class LocalZstdNet {
     private static final Logger LOGGER = LogUtils.getLogger();
@@ -89,14 +91,15 @@ public final class LocalZstdNet {
 
         Mode resolvedMode = resolveMode(remoteHost, remotePort, requestedMode);
         AtomicBoolean running = new AtomicBoolean(true);
+        ProxyStats stats = new ProxyStats();
         Thread acceptThread = new Thread(
-            () -> acceptLoop(listener, running, remoteHost, remotePort, statusHost, statusPort, presentedHost, presentedPort, level, resolvedMode),
+            () -> acceptLoop(listener, running, remoteHost, remotePort, statusHost, statusPort, presentedHost, presentedPort, level, resolvedMode, stats),
             "zstdnet-accept-" + ACCEPT_SEQ.getAndIncrement() + "-" + remoteHost + ":" + remotePort
         );
         acceptThread.setDaemon(true);
         acceptThread.start();
 
-        return new ProxyHandle(listener, running, acceptThread, resolvedMode);
+        return new ProxyHandle(listener, running, acceptThread, resolvedMode, remoteHost, remotePort, stats);
     }
 
     private static Mode resolveMode(String remoteHost, int remotePort, Mode requestedMode) {
@@ -157,7 +160,8 @@ public final class LocalZstdNet {
         String presentedHost,
         int presentedPort,
         int level,
-        Mode mode
+        Mode mode,
+        ProxyStats stats
     ) {
         while (running.get()) {
             try {
@@ -171,7 +175,8 @@ public final class LocalZstdNet {
                     presentedHost,
                     presentedPort,
                     level,
-                    mode
+                    mode,
+                    stats
                 ));
             } catch (SocketException e) {
                 if (running.get()) {
@@ -193,7 +198,8 @@ public final class LocalZstdNet {
         String presentedHost,
         int presentedPort,
         int level,
-        Mode mode
+        Mode mode,
+        ProxyStats stats
     ) {
         try {
             localClient.setTcpNoDelay(true);
@@ -211,14 +217,14 @@ public final class LocalZstdNet {
             boolean isStatus = nextState != null && nextState == 1;
 
             if (isStatus) {
-                handleRawConnection(localClient, statusHost, statusPort, rewrittenHandshake);
+                handleRawConnection(localClient, statusHost, statusPort, rewrittenHandshake, stats);
                 return;
             }
 
             if (mode == Mode.RAW) {
-                handleRawConnection(localClient, remoteHost, remotePort, rewrittenHandshake);
+                handleRawConnection(localClient, remoteHost, remotePort, rewrittenHandshake, stats);
             } else {
-                handleZstdConnection(localClient, remoteHost, remotePort, level, rewrittenHandshake);
+                handleZstdConnection(localClient, remoteHost, remotePort, level, rewrittenHandshake, stats);
             }
         } catch (Exception e) {
             LOGGER.debug("zstdnet: proxy pipe closed: {}", e.toString());
@@ -226,13 +232,19 @@ public final class LocalZstdNet {
         }
     }
 
-    private static void handleRawConnection(Socket localClient, String remoteHost, int remotePort, byte[] firstPacket) throws Exception {
+    private static void handleRawConnection(
+        Socket localClient,
+        String remoteHost,
+        int remotePort,
+        byte[] firstPacket,
+        ProxyStats stats
+    ) throws Exception {
         try (Socket client = localClient; Socket upstream = new Socket()) {
             upstream.connect(new InetSocketAddress(remoteHost, remotePort), 5000);
             upstream.setTcpNoDelay(true);
             upstream.setSoTimeout(0);
 
-            OutputStream upstreamOut = upstream.getOutputStream();
+            OutputStream upstreamOut = new CountingOutputStream(upstream.getOutputStream(), stats::addClientToServerRawPassthrough);
             writePacket(upstreamOut, firstPacket);
             upstreamOut.flush();
 
@@ -250,7 +262,10 @@ public final class LocalZstdNet {
 
             Future<?> downstreamWriter = WORKERS.submit(() -> {
                 try {
-                    streamCopy(upstream.getInputStream(), client.getOutputStream());
+                    streamCopy(
+                        new CountingInputStream(upstream.getInputStream(), stats::addServerToClientRawPassthrough),
+                        client.getOutputStream()
+                    );
                 } catch (Exception ignored) {
                 } finally {
                     try {
@@ -265,18 +280,29 @@ public final class LocalZstdNet {
         }
     }
 
-    private static void handleZstdConnection(Socket localClient, String remoteHost, int remotePort, int level, byte[] firstPacket) throws Exception {
+    private static void handleZstdConnection(
+        Socket localClient,
+        String remoteHost,
+        int remotePort,
+        int level,
+        byte[] firstPacket,
+        ProxyStats stats
+    ) throws Exception {
         try (Socket client = localClient; Socket upstream = new Socket()) {
             upstream.connect(new InetSocketAddress(remoteHost, remotePort), 5000);
             upstream.setTcpNoDelay(true);
             upstream.setSoTimeout(0);
 
             Future<?> upstreamWriter = WORKERS.submit(() -> {
-                try (ZstdOutputStream zstdOut = new ZstdOutputStream(upstream.getOutputStream(), level)) {
+                try (ZstdOutputStream zstdOut = new ZstdOutputStream(
+                    new CountingOutputStream(upstream.getOutputStream(), stats::addClientToServerZstd),
+                    level
+                )) {
                     zstdOut.setCloseFrameOnFlush(false);
-                    writePacket(zstdOut, firstPacket);
-                    zstdOut.flush();
-                    streamCompress(client.getInputStream(), zstdOut);
+                    OutputStream countedRawOut = new CountingOutputStream(zstdOut, stats::addClientToServerRaw);
+                    writePacket(countedRawOut, firstPacket);
+                    countedRawOut.flush();
+                    streamCompress(client.getInputStream(), countedRawOut);
                 } catch (Exception ignored) {
                 } finally {
                     try {
@@ -287,8 +313,10 @@ public final class LocalZstdNet {
             });
 
             Future<?> downstreamWriter = WORKERS.submit(() -> {
-                try (ZstdInputStream zstdIn = new ZstdInputStream(upstream.getInputStream())) {
-                    streamCopy(zstdIn, client.getOutputStream());
+                try (ZstdInputStream zstdIn = new ZstdInputStream(
+                    new CountingInputStream(upstream.getInputStream(), stats::addServerToClientZstd)
+                )) {
+                    streamCopy(zstdIn, new CountingOutputStream(client.getOutputStream(), stats::addServerToClientRaw));
                 } catch (Exception ignored) {
                 } finally {
                     try {
@@ -630,12 +658,26 @@ public final class LocalZstdNet {
         private final AtomicBoolean running;
         private final Thread acceptThread;
         private final Mode mode;
+        private final String remoteHost;
+        private final int remotePort;
+        private final ProxyStats stats;
 
-        private ProxyHandle(ServerSocket listener, AtomicBoolean running, Thread acceptThread, Mode mode) {
+        private ProxyHandle(
+            ServerSocket listener,
+            AtomicBoolean running,
+            Thread acceptThread,
+            Mode mode,
+            String remoteHost,
+            int remotePort,
+            ProxyStats stats
+        ) {
             this.listener = listener;
             this.running = running;
             this.acceptThread = acceptThread;
             this.mode = mode;
+            this.remoteHost = remoteHost;
+            this.remotePort = remotePort;
+            this.stats = stats;
         }
 
         public int localPort() {
@@ -644,6 +686,18 @@ public final class LocalZstdNet {
 
         public Mode mode() {
             return mode;
+        }
+
+        public String remoteHost() {
+            return remoteHost;
+        }
+
+        public int remotePort() {
+            return remotePort;
+        }
+
+        public StatsSnapshot statsSnapshot() {
+            return stats.snapshot(mode, remoteHost, remotePort);
         }
 
         @Override
@@ -659,5 +713,187 @@ public final class LocalZstdNet {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    public record StatsSnapshot(
+        Mode mode,
+        String remoteHost,
+        int remotePort,
+        long rawUpBytes,
+        long rawDownBytes,
+        long wireUpBytes,
+        long wireDownBytes,
+        long rawUpRate,
+        long rawDownRate,
+        long wireUpRate,
+        long wireDownRate,
+        double ratioPercent
+    ) {
+    }
+
+    private static final class ProxyStats {
+        private static final long RATE_SAMPLE_INTERVAL_MS = 500L;
+
+        private final AtomicLong rawUpBytes = new AtomicLong();
+        private final AtomicLong rawDownBytes = new AtomicLong();
+        private final AtomicLong wireUpBytes = new AtomicLong();
+        private final AtomicLong wireDownBytes = new AtomicLong();
+
+        private volatile long sampleAtMs = System.currentTimeMillis();
+        private volatile long sampledRawUpBytes;
+        private volatile long sampledRawDownBytes;
+        private volatile long sampledWireUpBytes;
+        private volatile long sampledWireDownBytes;
+        private volatile long rawUpRate;
+        private volatile long rawDownRate;
+        private volatile long wireUpRate;
+        private volatile long wireDownRate;
+
+        private void addClientToServerRaw(long bytes) {
+            if (bytes > 0) {
+                rawUpBytes.addAndGet(bytes);
+            }
+        }
+
+        private void addServerToClientRaw(long bytes) {
+            if (bytes > 0) {
+                rawDownBytes.addAndGet(bytes);
+            }
+        }
+
+        private void addClientToServerZstd(long bytes) {
+            if (bytes > 0) {
+                wireUpBytes.addAndGet(bytes);
+            }
+        }
+
+        private void addServerToClientZstd(long bytes) {
+            if (bytes > 0) {
+                wireDownBytes.addAndGet(bytes);
+            }
+        }
+
+        private void addClientToServerRawPassthrough(long bytes) {
+            if (bytes > 0) {
+                rawUpBytes.addAndGet(bytes);
+                wireUpBytes.addAndGet(bytes);
+            }
+        }
+
+        private void addServerToClientRawPassthrough(long bytes) {
+            if (bytes > 0) {
+                rawDownBytes.addAndGet(bytes);
+                wireDownBytes.addAndGet(bytes);
+            }
+        }
+
+        private synchronized StatsSnapshot snapshot(Mode mode, String remoteHost, int remotePort) {
+            long now = System.currentTimeMillis();
+            long currentRawUp = rawUpBytes.get();
+            long currentRawDown = rawDownBytes.get();
+            long currentWireUp = wireUpBytes.get();
+            long currentWireDown = wireDownBytes.get();
+
+            long elapsedMs = now - sampleAtMs;
+            if (elapsedMs >= RATE_SAMPLE_INTERVAL_MS) {
+                rawUpRate = scaleRate(currentRawUp - sampledRawUpBytes, elapsedMs);
+                rawDownRate = scaleRate(currentRawDown - sampledRawDownBytes, elapsedMs);
+                wireUpRate = scaleRate(currentWireUp - sampledWireUpBytes, elapsedMs);
+                wireDownRate = scaleRate(currentWireDown - sampledWireDownBytes, elapsedMs);
+
+                sampledRawUpBytes = currentRawUp;
+                sampledRawDownBytes = currentRawDown;
+                sampledWireUpBytes = currentWireUp;
+                sampledWireDownBytes = currentWireDown;
+                sampleAtMs = now;
+            }
+
+            long totalRaw = currentRawUp + currentRawDown;
+            long totalWire = currentWireUp + currentWireDown;
+            double ratio = totalRaw <= 0 ? 0.0D : (double) totalWire * 100.0D / (double) totalRaw;
+            return new StatsSnapshot(
+                mode,
+                remoteHost,
+                remotePort,
+                currentRawUp,
+                currentRawDown,
+                currentWireUp,
+                currentWireDown,
+                rawUpRate,
+                rawDownRate,
+                wireUpRate,
+                wireDownRate,
+                ratio
+            );
+        }
+
+        private long scaleRate(long deltaBytes, long elapsedMs) {
+            if (deltaBytes <= 0 || elapsedMs <= 0) {
+                return 0L;
+            }
+            return Math.max(0L, Math.round(deltaBytes * (1000.0D / elapsedMs)));
+        }
+    }
+
+    private static final class CountingInputStream extends InputStream {
+        private final InputStream delegate;
+        private final Counter counter;
+
+        private CountingInputStream(InputStream delegate, Counter counter) {
+            this.delegate = Objects.requireNonNull(delegate);
+            this.counter = Objects.requireNonNull(counter);
+        }
+
+        @Override
+        public int read() throws IOException {
+            int value = delegate.read();
+            if (value >= 0) {
+                counter.add(1);
+            }
+            return value;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int read = delegate.read(b, off, len);
+            if (read > 0) {
+                counter.add(read);
+            }
+            return read;
+        }
+    }
+
+    private static final class CountingOutputStream extends OutputStream {
+        private final OutputStream delegate;
+        private final Counter counter;
+
+        private CountingOutputStream(OutputStream delegate, Counter counter) {
+            this.delegate = Objects.requireNonNull(delegate);
+            this.counter = Objects.requireNonNull(counter);
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            delegate.write(b);
+            counter.add(1);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            delegate.write(b, off, len);
+            if (len > 0) {
+                counter.add(len);
+            }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            delegate.flush();
+        }
+    }
+
+    @FunctionalInterface
+    private interface Counter {
+        void add(long bytes);
     }
 }

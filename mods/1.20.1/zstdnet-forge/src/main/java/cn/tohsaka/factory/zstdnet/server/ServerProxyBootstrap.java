@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 wish131400
+ * Copyright (c) 2026 wish
  *
  * This file is part of ZstdNet.
  *
@@ -21,8 +21,10 @@ package cn.tohsaka.factory.zstdnet.server;
 
 import com.mojang.logging.LogUtils;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
@@ -42,6 +44,8 @@ public final class ServerProxyBootstrap {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final AtomicBoolean INITIALIZED = new AtomicBoolean(false);
     private static final ServerProxyRuntime RUNTIME = new ServerProxyRuntime();
+    private static volatile int publishedLanPort = -1;
+    private static volatile int activeLanPort = -1;
 
     private ServerProxyBootstrap() {
     }
@@ -55,8 +59,27 @@ public final class ServerProxyBootstrap {
         }
         MinecraftForge.EVENT_BUS.addListener(ServerProxyBootstrap::onServerStarted);
         MinecraftForge.EVENT_BUS.addListener(ServerProxyBootstrap::onServerStopping);
+        MinecraftForge.EVENT_BUS.addListener(ServerProxyBootstrap::onServerTick);
         MinecraftForge.EVENT_BUS.addListener(ServerProxyBootstrap::onPlayerLoggedIn);
         LOGGER.info("zstdnet server bootstrap initialized");
+    }
+
+    public static ServerHudSnapshot currentHudSnapshot() {
+        ServerProxyRuntime.HudSnapshot snapshot = RUNTIME.hudSnapshot();
+        if (snapshot == null) {
+            return null;
+        }
+        return new ServerHudSnapshot(
+            snapshot.modeName(),
+            snapshot.listenHost(),
+            snapshot.listenPort(),
+            snapshot.rawBytes(),
+            snapshot.zstdBytes(),
+            snapshot.rawRate(),
+            snapshot.zstdRate(),
+            snapshot.ratioPercent(),
+            snapshot.connections()
+        );
     }
 
     /**
@@ -73,14 +96,69 @@ public final class ServerProxyBootstrap {
      * 专用服停止前关闭代理运行时。
      */
     private static void onServerStopping(ServerStoppingEvent event) {
-        if (!event.getServer().isDedicatedServer()) {
-            return;
-        }
+        publishedLanPort = -1;
+        activeLanPort = -1;
         RUNTIME.stop();
     }
 
+    private static void onServerTick(TickEvent.ServerTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) {
+            return;
+        }
+
+        MinecraftServer server = event.getServer();
+        if (server == null) {
+            return;
+        }
+
+        if (server.isDedicatedServer()) {
+            if (RUNTIME.configChangedOnDisk()) {
+                LOGGER.info("[zstdnet-server] config changed on disk, reloading proxy.");
+                RUNTIME.stop();
+                RUNTIME.start(server.getPort());
+            }
+            return;
+        }
+
+        boolean published = server.isPublished();
+        int lanPort = published ? server.getPort() : -1;
+
+        if (published && lanPort > 0) {
+            forceDisableLanAuthentication(server);
+            if (publishedLanPort != lanPort || RUNTIME.configChangedOnDisk()) {
+                publishedLanPort = lanPort;
+                if (RUNTIME.isRunning()) {
+                    LOGGER.info("[zstdnet-server] config/LAN state changed, reloading proxy.");
+                    RUNTIME.stop();
+                }
+                RUNTIME.startLan(lanPort);
+                activeLanPort = RUNTIME.isLanMode() ? lanPort : -1;
+                if (activeLanPort > 0) {
+                    LOGGER.info("[zstdnet-server] LAN world published on {}, zstd proxy armed.", lanPort);
+                } else {
+                    LOGGER.warn("[zstdnet-server] LAN world published on {}, but zstd proxy did not start. Check zstdnet-server.properties.", lanPort);
+                }
+            }
+            return;
+        }
+
+        if (RUNTIME.isLanMode()) {
+            LOGGER.info("[zstdnet-server] LAN world is no longer published, stopping zstd proxy.");
+            RUNTIME.stop();
+        }
+        publishedLanPort = -1;
+        activeLanPort = -1;
+    }
+
+    private static void forceDisableLanAuthentication(MinecraftServer server) {
+        if (server.usesAuthentication()) {
+            server.setUsesAuthentication(false);
+            LOGGER.info("[zstdnet-server] LAN mode detected, disabled online authentication by default.");
+        }
+    }
+
     private static void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
-        if (!RUNTIME.isRunning()) {
+        if (!RUNTIME.protectsBackendLogin()) {
             return;
         }
         if (!(event.getEntity() instanceof ServerPlayer player)) {
@@ -106,5 +184,18 @@ public final class ServerProxyBootstrap {
             return false;
         }
         return ip.isLoopbackAddress() || ip.isAnyLocalAddress();
+    }
+
+    public record ServerHudSnapshot(
+        String mode,
+        String listenHost,
+        int listenPort,
+        long rawBytes,
+        long zstdBytes,
+        long rawRate,
+        long zstdRate,
+        double ratioPercent,
+        int connections
+    ) {
     }
 }

@@ -16,7 +16,7 @@ def externalProjectBuildDir = new File(externalBuildRoot, "mods/${minecraft_vers
 layout.buildDirectory.set(externalProjectBuildDir)
 
 base {
-    archivesName = "zstdent-${minecraft_version}forge-${mod_version}"
+    archivesName = "zstdent-${minecraft_version}forge"
 }
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)

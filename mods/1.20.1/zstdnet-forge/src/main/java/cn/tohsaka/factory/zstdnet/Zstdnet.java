@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 wish131400
+ * Copyright (c) 2026 wish
  *
  * This file is part of ZstdNet.
  *

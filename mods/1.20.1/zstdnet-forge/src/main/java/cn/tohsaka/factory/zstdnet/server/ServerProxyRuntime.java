@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 wish131400
+ * Copyright (c) 2026 wish
  *
  * This file is part of ZstdNet.
  *
@@ -81,7 +81,7 @@ final class ServerProxyRuntime {
     private static final int DEFAULT_MAX_CONN_PER_IP = 20;
     private static final int DEFAULT_MAX_REQ_PER_WINDOW = 30;
     private static final int DEFAULT_BURST_BYTES = 256 * 1024;
-    private static final Duration DEFAULT_IDLE_TIMEOUT = Duration.ofSeconds(25);
+    private static final Duration DEFAULT_IDLE_TIMEOUT = Duration.ZERO;
     private static final int CLIENT_PEEK_BUFFER = 4096;
     private static final int MAX_HANDSHAKE_PACKET_SIZE = 2048;
 
@@ -96,17 +96,28 @@ final class ServerProxyRuntime {
     private TrafficStats stats;
     private ProxyConfig cfg;
     private TokenBucketLimiter globalLimiter;
+    private RuntimeMode runtimeMode;
+    private volatile HudSnapshot latestHudSnapshot;
+    private volatile long loadedConfigLastModified = Long.MIN_VALUE;
 
     /**
      * 启动运行时。
      */
     void start(int mcServerPort) {
+        start(mcServerPort, RuntimeMode.DEDICATED);
+    }
+
+    void startLan(int lanPort) {
+        start(lanPort, RuntimeMode.LAN);
+    }
+
+    private void start(int mcServerPort, RuntimeMode mode) {
         synchronized (lifecycleLock) {
             if (running) {
                 return;
             }
 
-            Path configPath = FMLPaths.GAMEDIR.get().resolve("config").resolve("zstdnet-server.properties");
+            Path configPath = ServerProxyConfigFile.path();
             ProxyConfig loaded = loadOrCreateConfig(configPath, mcServerPort);
             if (loaded == null) {
                 return;
@@ -115,6 +126,10 @@ final class ServerProxyRuntime {
                 LOGGER.warn("[zstdnet-server] config exists but enabled=false, skip start. File: {}", configPath);
                 LOGGER.warn("[zstdnet-server] set enabled=true after checking listen/target.");
                 return;
+            }
+
+            if (mode == RuntimeMode.LAN) {
+                loaded = loaded.withTarget(new HostPort("127.0.0.1", mcServerPort));
             }
 
             try {
@@ -133,6 +148,8 @@ final class ServerProxyRuntime {
             this.workers = Executors.newCachedThreadPool(new NamedFactory("zstdsrv-worker"));
             this.statsTicker = Executors.newSingleThreadScheduledExecutor(new NamedFactory("zstdsrv-stats"));
             this.globalLimiter = TokenBucketLimiter.create(loaded.maxRateGlobalBps, loaded.burstBytes);
+            this.runtimeMode = mode;
+            this.latestHudSnapshot = new HudSnapshot(mode, loaded.listen.host, loaded.listen.port, 0L, 0L, 0L, 0L, 0.0D, 0);
             this.running = true;
 
             startStatsPrinter();
@@ -140,7 +157,10 @@ final class ServerProxyRuntime {
             acceptThread.setDaemon(true);
             acceptThread.start();
 
-            LOGGER.info("[zstdnet-server] started: listen={} target={}", loaded.listen, loaded.target);
+            LOGGER.info("[zstdnet-server] started: mode={} listen={} target={}", mode.name().toLowerCase(Locale.ROOT), loaded.listen, loaded.target);
+            if (mode == RuntimeMode.LAN) {
+                LOGGER.info("[zstdnet-server] LAN host detected. Point your tunnel to {} instead of the raw LAN port {}.", loaded.listen, mcServerPort);
+            }
             LOGGER.info("[zstdnet-server] guard: max_conn={} max_req={} window={} ban={}",
                 loaded.maxConnPerIp, loaded.maxReqPerWindow, loaded.window, loaded.banDuration);
             LOGGER.info("[zstdnet-server] tuning: flush={} idle_timeout={} rate_per_conn={}B/s rate_global={}B/s burst={}B",
@@ -175,6 +195,8 @@ final class ServerProxyRuntime {
             stats = null;
             cfg = null;
             globalLimiter = null;
+            runtimeMode = null;
+            latestHudSnapshot = null;
             LOGGER.info("[zstdnet-server] stopped");
         }
     }
@@ -184,6 +206,24 @@ final class ServerProxyRuntime {
      */
     boolean isRunning() {
         return running;
+    }
+
+    boolean protectsBackendLogin() {
+        return running && runtimeMode == RuntimeMode.DEDICATED;
+    }
+
+    boolean isLanMode() {
+        return running && runtimeMode == RuntimeMode.LAN;
+    }
+
+    HudSnapshot hudSnapshot() {
+        return latestHudSnapshot;
+    }
+
+    boolean configChangedOnDisk() {
+        Path path = ServerProxyConfigFile.path();
+        long current = readLastModified(path);
+        return current > 0L && current != loadedConfigLastModified;
     }
 
     private void acceptLoop() {
@@ -245,8 +285,9 @@ final class ServerProxyRuntime {
 
                 upstream.setTcpNoDelay(true);
                 clientSocket.setTcpNoDelay(true);
+                // Client->server play traffic can legitimately stay idle for a while.
+                // Applying SO_TIMEOUT there causes false disconnects in LAN/Forge sessions.
                 applyReadTimeout(upstream, cfg.idleTimeout);
-                applyReadTimeout(clientSocket, cfg.idleTimeout);
                 TokenBucketLimiter perConnLimiter = TokenBucketLimiter.create(cfg.maxRatePerConnBps, cfg.burstBytes);
 
                 if (clientMode.mode == ClientMode.RAW_STATUS) {
@@ -870,6 +911,7 @@ final class ServerProxyRuntime {
             long rawPerSec = (long) (dr * (1000.0 / periodMs));
             long zstdPerSec = (long) (dz * (1000.0 / periodMs));
             double ratio = raw <= 0 ? 0.0 : ((double) zstd * 100.0 / (double) raw);
+            latestHudSnapshot = new HudSnapshot(runtimeMode, cfg.listen.host, cfg.listen.port, raw, zstd, rawPerSec, zstdPerSec, ratio, conns);
 
             String now = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
             LOGGER.info("[{}] Raw: {} ({}) | Zstd: {} ({}) | Ratio: {}% | Conns: {}",
@@ -921,11 +963,10 @@ final class ServerProxyRuntime {
                 String body = buildDefaultConfig(mcServerPort);
                 Files.writeString(path, body, StandardCharsets.UTF_8);
                 LOGGER.warn("[zstdnet-server] generated config: {}", path);
-                LOGGER.warn("[zstdnet-server] please edit config and set enabled=true, then restart server.");
+                LOGGER.warn("[zstdnet-server] default config uses enabled=true and target=127.0.0.1:{}, restart after checking listen/target.", DEFAULT_MINECRAFT_PORT);
             } catch (IOException e) {
                 LOGGER.error("[zstdnet-server] failed to create config {}: {}", path, e.toString());
             }
-            return null;
         }
 
         Properties props = new Properties();
@@ -935,12 +976,13 @@ final class ServerProxyRuntime {
             LOGGER.error("[zstdnet-server] failed reading config {}: {}", path, e.toString());
             return null;
         }
+        loadedConfigLastModified = readLastModified(path);
 
         boolean enabled = Boolean.parseBoolean(props.getProperty("enabled", "false").trim());
         HostPort listen = HostPort.parse(props.getProperty("listen", "0.0.0.0:" + DEFAULT_LISTEN_PORT));
         HostPort target = HostPort.parse(props.getProperty(
             "target",
-            "127.0.0.1:" + (mcServerPort > 0 ? mcServerPort : DEFAULT_MINECRAFT_PORT)
+            "127.0.0.1:" + DEFAULT_MINECRAFT_PORT
         ));
 
         int level = clamp(parseInt(props.getProperty("level"), DEFAULT_ZSTD_LEVEL), 1, 22);
@@ -995,7 +1037,6 @@ final class ServerProxyRuntime {
      * 生成默认配置模板文本。
      */
     private String buildDefaultConfig(int mcServerPort) {
-        int targetPort = mcServerPort > 0 ? mcServerPort : DEFAULT_MINECRAFT_PORT;
         return """
             # ------------------------------------------------------------
             # zstdnet 内置服务端配置（自动生成）
@@ -1005,7 +1046,7 @@ final class ServerProxyRuntime {
             # 3) 地址不要写成 127.0.0.1.（末尾带点会解析失败）。
 
             # 是否启用内置 zstd 代理。
-            enabled=false
+            enabled=true
 
             # zstd 公网监听入口。
             listen=0.0.0.0:${LISTEN_PORT}
@@ -1034,8 +1075,8 @@ final class ServerProxyRuntime {
             # zstd flush 间隔，0ms 表示每次写入都 flush。
             flush_interval=2ms
 
-            # idle read timeout, 0 means disabled.
-            idle_timeout=25s
+            # idle read timeout for backend reads, 0 means disabled.
+            idle_timeout=0
 
             # 单连接限速（字节/秒，0 表示关闭）。
             max_rate_per_conn_bps=0
@@ -1047,7 +1088,7 @@ final class ServerProxyRuntime {
             burst_bytes=${BURST_BYTES}
             """
             .replace("${LISTEN_PORT}", String.valueOf(DEFAULT_LISTEN_PORT))
-            .replace("${TARGET_PORT}", String.valueOf(targetPort))
+            .replace("${TARGET_PORT}", String.valueOf(DEFAULT_MINECRAFT_PORT))
             .replace("${LEVEL}", String.valueOf(DEFAULT_ZSTD_LEVEL))
             .replace("${MAX_CONN}", String.valueOf(DEFAULT_MAX_CONN_PER_IP))
             .replace("${MAX_REQ}", String.valueOf(DEFAULT_MAX_REQ_PER_WINDOW))
@@ -1166,6 +1207,14 @@ final class ServerProxyRuntime {
         executor.shutdownNow();
     }
 
+    private long readLastModified(Path path) {
+        try {
+            return Files.exists(path) ? Files.getLastModifiedTime(path).toMillis() : Long.MIN_VALUE;
+        } catch (IOException ignored) {
+            return Long.MIN_VALUE;
+        }
+    }
+
     /**
      * PROXY protocol 解析结果模块。
      */
@@ -1182,6 +1231,27 @@ final class ServerProxyRuntime {
         ZSTD,
         RAW_STATUS,
         RAW_LOGIN
+    }
+
+    private enum RuntimeMode {
+        DEDICATED,
+        LAN
+    }
+
+    record HudSnapshot(
+        RuntimeMode mode,
+        String listenHost,
+        int listenPort,
+        long rawBytes,
+        long zstdBytes,
+        long rawRate,
+        long zstdRate,
+        double ratioPercent,
+        int connections
+    ) {
+        String modeName() {
+            return mode.name();
+        }
     }
 
     private record DetectedClientMode(ClientMode mode, byte[] initialWireData) {
@@ -1206,6 +1276,24 @@ final class ServerProxyRuntime {
         long maxRateGlobalBps,
         int burstBytes
     ) {
+        private ProxyConfig withTarget(HostPort newTarget) {
+            return new ProxyConfig(
+                enabled,
+                listen,
+                newTarget,
+                level,
+                maxConnPerIp,
+                maxReqPerWindow,
+                window,
+                banDuration,
+                statsInterval,
+                flushInterval,
+                idleTimeout,
+                maxRatePerConnBps,
+                maxRateGlobalBps,
+                burstBytes
+            );
+        }
     }
 
     /**
