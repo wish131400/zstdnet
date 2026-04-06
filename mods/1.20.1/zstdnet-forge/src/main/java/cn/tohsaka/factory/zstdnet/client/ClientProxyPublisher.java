@@ -35,10 +35,6 @@ import net.minecraftforge.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 
 import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -52,16 +48,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 客户端线路发布模块。
- * <p>
- * 负责周期读取线路配置、启动本地回环代理、并将线路写入 MC 多人游戏列表。
+ * Publishes simplified local loopback entries from servers.zstd.json.
  */
 public final class ClientProxyPublisher {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final Gson GSON = new Gson();
-    private static final HttpClient HTTP = HttpClient.newBuilder()
-        .followRedirects(HttpClient.Redirect.NORMAL)
-        .build();
     private static final ClientProxyPublisher INSTANCE = new ClientProxyPublisher();
 
     private final Map<String, LocalZstdNet.ProxyHandle> runningProxies = new ConcurrentHashMap<>();
@@ -83,9 +74,6 @@ public final class ClientProxyPublisher {
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "zstdproxy-client-shutdown"));
     }
 
-    /**
-     * 客户端初始化入口：注册生命周期事件与配置。
-     */
     public static void init() {
         var modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
         modEventBus.addListener(INSTANCE::onLoadComplete);
@@ -97,9 +85,6 @@ public final class ClientProxyPublisher {
         startAutoRefresh();
     }
 
-    /**
-     * 启动定时刷新任务（2 秒一次）。
-     */
     private void startAutoRefresh() {
         if (stopped.get()) {
             return;
@@ -107,6 +92,7 @@ public final class ClientProxyPublisher {
         if (!refreshStarted.compareAndSet(false, true)) {
             return;
         }
+
         refresher.scheduleAtFixedRate(() -> {
             if (stopped.get()) {
                 return;
@@ -117,6 +103,7 @@ public final class ClientProxyPublisher {
                 LOGGER.error("zstdproxy: refresh tick failed", e);
             }
         }, 0, 2, TimeUnit.SECONDS);
+
         LOGGER.info("zstdproxy: auto refresh enabled (2s)");
     }
 
@@ -134,7 +121,6 @@ public final class ClientProxyPublisher {
         }
 
         List<ZstdServerList.ZstdServer> configured = parseServers(raw);
-
         lastServerRaw = raw;
         lastLevel = level;
 
@@ -149,22 +135,12 @@ public final class ClientProxyPublisher {
 
             try {
                 LocalZstdNet.HostPort hostPort = LocalZstdNet.HostPort.parse(server.addr());
-                LocalZstdNet.HostPort statusHostPort = blank(server.statusAddr())
-                    ? hostPort
-                    : LocalZstdNet.HostPort.parse(server.statusAddr());
                 LocalZstdNet.Mode mode = parseMode(server.mode());
-                LocalZstdNet.ProxyHandle proxy = LocalZstdNet.start(
-                    hostPort.host(),
-                    hostPort.port(),
-                    statusHostPort.host(),
-                    statusHostPort.port(),
-                    level,
-                    mode
-                );
+                LocalZstdNet.ProxyHandle proxy = LocalZstdNet.start(hostPort.host(), hostPort.port(), level, mode);
                 runningProxies.put(server.mask(), proxy);
                 proxyPortMap.put(server.mask(), proxy.localPort());
-                LOGGER.info("zstd server {} ({}) [{}] -> 127.0.0.1:{} (status via {}:{})",
-                    safe(server.name()), server.mask(), proxy.mode(), proxy.localPort(), statusHostPort.host(), statusHostPort.port());
+                LOGGER.info("zstd server {} ({}) [{}] -> 127.0.0.1:{}",
+                    safe(server.name()), server.mask(), proxy.mode(), proxy.localPort());
             } catch (Exception e) {
                 LOGGER.error("failed to start local proxy for {} ({})", safe(server.name()), safe(server.addr()), e);
             }
@@ -176,27 +152,24 @@ public final class ClientProxyPublisher {
         }
     }
 
-    /**
-     * 无可用配置时清理已发布线路与本地代理。
-     */
     private void resetPublishedServers(int level) {
         if ("".equals(lastServerRaw) && lastLevel == level) {
             return;
         }
+
         lastServerRaw = "";
         lastLevel = level;
         closeAllProxies();
         activeServers.clear();
+
         Minecraft mc = Minecraft.getInstance();
         if (mc != null) {
             mc.execute(this::updateServerList);
         }
+
         LOGGER.warn("zstdproxy: no server source loaded");
     }
 
-    /**
-     * 解析线路 JSON。
-     */
     private List<ZstdServerList.ZstdServer> parseServers(String raw) {
         try {
             ZstdServerList list = GSON.fromJson(raw, ZstdServerList.class);
@@ -210,23 +183,7 @@ public final class ClientProxyPublisher {
         }
     }
 
-    /**
-     * 按优先级读取线路配置：
-     * URL -> 游戏目录 -> 当前工作目录。
-     */
     private String readServerRaw() {
-        String url = ClientConfig.getUrl();
-        if (!blank(url) && (url.startsWith("http://") || url.startsWith("https://"))) {
-            try {
-                HttpRequest request = HttpRequest.newBuilder().uri(URI.create(url)).build();
-                String body = HTTP.send(request, HttpResponse.BodyHandlers.ofString()).body();
-                LOGGER.debug("zstdproxy: loaded server list from url {}", url);
-                return body;
-            } catch (Exception e) {
-                LOGGER.error("zstdproxy: failed to fetch {}", url, e);
-            }
-        }
-
         Path gameDirFile = FMLPaths.GAMEDIR.get().resolve("servers.zstd.json");
         if (Files.exists(gameDirFile)) {
             try {
@@ -252,29 +209,23 @@ public final class ClientProxyPublisher {
         return "";
     }
 
-    /**
-     * 首次运行生成本地模板文件，方便用户填写线路。
-     */
     private void createTemplateIfMissing(Path target) {
         try {
             Path parent = target.getParent();
             if (parent != null) {
                 Files.createDirectories(parent);
             }
+
             String template = """
                     {
                       "_comment": "zstd server list template. Fill addr/mask as needed.",
                       "servers": [
                         {
-                          "name": "\u8bf7\u524d\u5f80\u6574\u5408\u5305\u76ee\u5f55servers.zstd.json\u4e2d\u586b\u5199\u670d\u52a1\u5668\u5730\u5740\u540e\u7b49\u5f855\u79d2",
+                          "name": "\\u8bf7\\u586b\\u5199\\u670d\\u52a1\\u5668\\u5730\\u5740\\u540e\\u7b49\\u5f855\\u79d2",
                           "addr": "example.com:35566",
-                          "statusAddr": "mc.example.com:25565",
                           "mask": "line1",
                           "mode": "zstd",
-                          "icon": "",
-                          "_comment_mode": "auto/raw/zstd. zstd will probe first.",
-                          "_comment_statusAddr": "Optional. RAW status/MOTD source. Defaults to addr when empty.",
-                          "_comment_icon": "\u56fe\u6807\u53ef\u7559\u7a7a\uff1b\u5982\u9700\u81ea\u5b9a\u4e49\u53ef\u586b base64 PNG"
+                          "_comment_mode": "auto/raw/zstd. zstd will probe first."
                         }
                       ]
                     }
@@ -286,9 +237,6 @@ public final class ClientProxyPublisher {
         }
     }
 
-    /**
-     * 将当前线路同步到多人服务器列表（带 [zstd] 后缀）。
-     */
     private void updateServerList() {
         try {
             ServerList serverList = new ServerList(Minecraft.getInstance());
@@ -305,6 +253,7 @@ public final class ClientProxyPublisher {
                 if (server == null || blank(server.mask())) {
                     continue;
                 }
+
                 Integer localPort = proxyPortMap.get(server.mask());
                 if (localPort == null) {
                     continue;
@@ -323,9 +272,6 @@ public final class ClientProxyPublisher {
         }
     }
 
-    /**
-     * 关闭所有本地代理并清空映射表。
-     */
     private synchronized void closeAllProxies() {
         for (LocalZstdNet.ProxyHandle handle : runningProxies.values()) {
             if (handle != null) {
@@ -339,9 +285,6 @@ public final class ClientProxyPublisher {
         proxyPortMap.clear();
     }
 
-    /**
-     * 客户端退出时关闭定时任务并回收代理资源。
-     */
     private void shutdown() {
         if (!stopped.compareAndSet(false, true)) {
             return;
@@ -368,6 +311,7 @@ public final class ClientProxyPublisher {
         if (blank(raw)) {
             return LocalZstdNet.Mode.ZSTD;
         }
+
         String value = raw.trim().toLowerCase();
         return switch (value) {
             case "raw" -> LocalZstdNet.Mode.RAW;

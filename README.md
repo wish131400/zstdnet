@@ -67,7 +67,7 @@ Raw: 189.10 GB (2.9MB/s) | Zstd: 10.28 GB (201.2KB/s) | Ratio: 5.44% | Conns: 8
 
 ### 1. 客户端侧（Forge 模组）
 
-- 启动后读取 `servers.zstd.json`（或配置 URL）
+- 启动后读取 `servers.zstd.json`
 - 为每条线路启动本地 loopback 代理端口（`127.0.0.1:随机端口`）
 - 将多人列表中的线路替换/追加为本地地址
 - 游戏连接本地端口后：
@@ -75,9 +75,7 @@ Raw: 189.10 GB (2.9MB/s) | Zstd: 10.28 GB (201.2KB/s) | Ratio: 5.44% | Conns: 8
   - 远端 -> 客户端：zstd 解压并回灌给 Minecraft
     字段说明：
 - `addr`：实际进入服务器时使用的目标地址，也就是登录/游戏流量走的地址。
-- `statusAddr`：RAW 状态地址，用于多人列表获取 MOTD、人数和图标；不填写时默认使用 `addr`。
 - `mask`：用于热更新替换的稳定唯一标识。
-- `icon`：可选的 Base64 PNG 图标覆盖内容。
 
 `mode` 可选值：
 

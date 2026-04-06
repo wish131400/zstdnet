@@ -22,27 +22,19 @@ package cn.tohsaka.factory.zstdnet;
 import net.minecraftforge.common.ForgeConfigSpec;
 
 /**
- * 客户端配置模块。
- * <p>
- * 负责定义并读取 Forge 客户端侧的 zstdproxy 配置项：
- * URL（远端线路配置）与压缩等级。
+ * Client-side config used by the local publisher.
  */
 public final class ClientConfig {
     public static final ForgeConfigSpec SPEC;
 
-    private static final ForgeConfigSpec.ConfigValue<String> URL;
     private static final ForgeConfigSpec.IntValue LEVEL;
 
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
 
-        URL = builder
-                .comment("Remote JSON endpoint. Leave empty to use local servers.zstd.json")
-                .define("url", "");
-
         LEVEL = builder
-                .comment("zstd compression level for client->server stream")
-                .defineInRange("level", 3, 1, 22);
+            .comment("zstd compression level for client->server stream")
+            .defineInRange("level", 3, 1, 22);
 
         SPEC = builder.build();
     }
@@ -50,18 +42,6 @@ public final class ClientConfig {
     private ClientConfig() {
     }
 
-    /**
-     * 获取线路配置来源 URL。
-     * 为空时表示使用本地 servers.zstd.json。
-     */
-    public static String getUrl() {
-        String value = URL.get();
-        return value == null ? "" : value.trim();
-    }
-
-    /**
-     * 获取客户端上行压缩等级。
-     */
     public static int getLevel() {
         return LEVEL.get();
     }

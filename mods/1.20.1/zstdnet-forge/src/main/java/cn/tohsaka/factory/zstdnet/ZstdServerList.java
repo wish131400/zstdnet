@@ -22,19 +22,12 @@ package cn.tohsaka.factory.zstdnet;
 import java.util.List;
 
 /**
- * 线路配置数据模型。
- *
- * @param servers 客户端可发布的 zstd 线路列表
+ * Client-published zstd server list model.
  */
 public record ZstdServerList(List<ZstdServer> servers) {
     /**
-     * 单条线路定义。
-     *
-     * @param name 显示名
-     * @param addr 远端代理地址（host:port）
-     * @param mask 线路唯一标识
-     * @param icon 服务器图标（可选 base64）
+     * Simplified client entry format.
      */
-    public record ZstdServer(String name, String addr, String mask, String icon, String mode, String statusAddr) {
+    public record ZstdServer(String name, String addr, String mask, String mode) {
     }
 }
