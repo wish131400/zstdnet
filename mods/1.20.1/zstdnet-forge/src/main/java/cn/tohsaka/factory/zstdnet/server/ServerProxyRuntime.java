@@ -69,6 +69,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * 4) 管理线程池与生命周期启停。
  */
 final class ServerProxyRuntime {
+    static final String ZSTD_ADDRESS_HINT = "当前服务器启用了 ZSTD 连接，请联系服务器管理员获取正确的连接地址。";
+
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final byte[] PROXY_V2_SIGNATURE = new byte[]{
         0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
@@ -180,6 +182,10 @@ final class ServerProxyRuntime {
     /**
      * 接收入口连接并交给工作线程处理。
      */
+    boolean isRunning() {
+        return running;
+    }
+
     private void acceptLoop() {
         while (running) {
             try {
@@ -223,7 +229,7 @@ final class ServerProxyRuntime {
                 sendLoginDisconnect(
                     clientSocket,
                     """
-                    当前服务器启用了 ZSTD 连接，请联系服务器管理员获取正确的连接地址。
+                    当前服务器启用了 ZSTD 连接，请联系服务器管理员获取正确的连接方式。
                     """
                 );
                 return;

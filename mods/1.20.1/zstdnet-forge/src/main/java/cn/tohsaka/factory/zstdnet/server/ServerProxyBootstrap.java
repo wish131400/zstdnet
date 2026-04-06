@@ -20,11 +20,17 @@
 package cn.tohsaka.factory.zstdnet.server;
 
 import com.mojang.logging.LogUtils;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import org.slf4j.Logger;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -49,6 +55,7 @@ public final class ServerProxyBootstrap {
         }
         MinecraftForge.EVENT_BUS.addListener(ServerProxyBootstrap::onServerStarted);
         MinecraftForge.EVENT_BUS.addListener(ServerProxyBootstrap::onServerStopping);
+        MinecraftForge.EVENT_BUS.addListener(ServerProxyBootstrap::onPlayerLoggedIn);
         LOGGER.info("zstdnet server bootstrap initialized");
     }
 
@@ -70,5 +77,34 @@ public final class ServerProxyBootstrap {
             return;
         }
         RUNTIME.stop();
+    }
+
+    private static void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
+        if (!RUNTIME.isRunning()) {
+            return;
+        }
+        if (!(event.getEntity() instanceof ServerPlayer player)) {
+            return;
+        }
+
+        SocketAddress remoteAddress = player.connection.getRemoteAddress();
+        if (isLoopback(remoteAddress)) {
+            return;
+        }
+
+        LOGGER.warn("[server] rejected direct backend login from {}", remoteAddress);
+        player.connection.disconnect(Component.literal(ServerProxyRuntime.ZSTD_ADDRESS_HINT));
+    }
+
+    private static boolean isLoopback(SocketAddress address) {
+        if (!(address instanceof InetSocketAddress inet)) {
+            return false;
+        }
+
+        InetAddress ip = inet.getAddress();
+        if (ip == null) {
+            return false;
+        }
+        return ip.isLoopbackAddress() || ip.isAnyLocalAddress();
     }
 }
