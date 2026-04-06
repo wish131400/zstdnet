@@ -1,0 +1,15 @@
+﻿# common
+*.log
+*.tmp
+
+# gradle
+.gradle/
+build/
+out/
+
+# java
+*.class
+bin/
+
+# go
+*.exe
