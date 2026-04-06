@@ -60,7 +60,18 @@ public final class LocalZstdNet {
     }
 
     public static ProxyHandle start(String remoteHost, int remotePort, int level, Mode requestedMode) throws IOException {
-        return start(remoteHost, remotePort, remoteHost, remotePort, level, requestedMode);
+        return start(remoteHost, remotePort, remoteHost, remotePort, remoteHost, remotePort, level, requestedMode);
+    }
+
+    public static ProxyHandle start(
+        String remoteHost,
+        int remotePort,
+        String presentedHost,
+        int presentedPort,
+        int level,
+        Mode requestedMode
+    ) throws IOException {
+        return start(remoteHost, remotePort, remoteHost, remotePort, presentedHost, presentedPort, level, requestedMode);
     }
 
     public static ProxyHandle start(
@@ -68,6 +79,8 @@ public final class LocalZstdNet {
         int remotePort,
         String statusHost,
         int statusPort,
+        String presentedHost,
+        int presentedPort,
         int level,
         Mode requestedMode
     ) throws IOException {
@@ -77,7 +90,7 @@ public final class LocalZstdNet {
         Mode resolvedMode = resolveMode(remoteHost, remotePort, requestedMode);
         AtomicBoolean running = new AtomicBoolean(true);
         Thread acceptThread = new Thread(
-            () -> acceptLoop(listener, running, remoteHost, remotePort, statusHost, statusPort, level, resolvedMode),
+            () -> acceptLoop(listener, running, remoteHost, remotePort, statusHost, statusPort, presentedHost, presentedPort, level, resolvedMode),
             "zstdnet-accept-" + ACCEPT_SEQ.getAndIncrement() + "-" + remoteHost + ":" + remotePort
         );
         acceptThread.setDaemon(true);
@@ -141,13 +154,25 @@ public final class LocalZstdNet {
         int remotePort,
         String statusHost,
         int statusPort,
+        String presentedHost,
+        int presentedPort,
         int level,
         Mode mode
     ) {
         while (running.get()) {
             try {
                 Socket localClient = listener.accept();
-                WORKERS.execute(() -> handleConnection(localClient, remoteHost, remotePort, statusHost, statusPort, level, mode));
+                WORKERS.execute(() -> handleConnection(
+                    localClient,
+                    remoteHost,
+                    remotePort,
+                    statusHost,
+                    statusPort,
+                    presentedHost,
+                    presentedPort,
+                    level,
+                    mode
+                ));
             } catch (SocketException e) {
                 if (running.get()) {
                     LOGGER.warn("zstdnet: accept failed: {}", e.toString());
@@ -165,6 +190,8 @@ public final class LocalZstdNet {
         int remotePort,
         String statusHost,
         int statusPort,
+        String presentedHost,
+        int presentedPort,
         int level,
         Mode mode
     ) {
@@ -179,18 +206,19 @@ public final class LocalZstdNet {
             }
 
             localClient.setSoTimeout(0);
+            byte[] rewrittenHandshake = rewriteHandshakeDestination(handshake, presentedHost, presentedPort);
             Integer nextState = extractHandshakeNextState(handshake);
             boolean isStatus = nextState != null && nextState == 1;
 
             if (isStatus) {
-                handleRawConnection(localClient, statusHost, statusPort, handshake);
+                handleRawConnection(localClient, statusHost, statusPort, rewrittenHandshake);
                 return;
             }
 
             if (mode == Mode.RAW) {
-                handleRawConnection(localClient, remoteHost, remotePort, handshake);
+                handleRawConnection(localClient, remoteHost, remotePort, rewrittenHandshake);
             } else {
-                handleZstdConnection(localClient, remoteHost, remotePort, level, handshake);
+                handleZstdConnection(localClient, remoteHost, remotePort, level, rewrittenHandshake);
             }
         } catch (Exception e) {
             LOGGER.debug("zstdnet: proxy pipe closed: {}", e.toString());
@@ -359,6 +387,57 @@ public final class LocalZstdNet {
         return nextState == null ? null : nextState.value;
     }
 
+    private static byte[] rewriteHandshakeDestination(byte[] handshakePayload, String host, int port) {
+        if (handshakePayload == null || handshakePayload.length == 0 || host == null || host.isBlank()) {
+            return handshakePayload;
+        }
+
+        VarIntRead packetId = readVarInt(handshakePayload, 0);
+        if (packetId == null || packetId.value != 0) {
+            return handshakePayload;
+        }
+
+        VarIntRead protocol = readVarInt(handshakePayload, packetId.next);
+        if (protocol == null) {
+            return handshakePayload;
+        }
+
+        VarIntRead hostLength = readVarInt(handshakePayload, protocol.next);
+        if (hostLength == null || hostLength.value < 0) {
+            return handshakePayload;
+        }
+
+        int hostStart = hostLength.next;
+        int hostEnd = hostStart + hostLength.value;
+        int portStart = hostEnd;
+        int portEnd = portStart + 2;
+        if (portEnd > handshakePayload.length) {
+            return handshakePayload;
+        }
+
+        String originalHost = new String(handshakePayload, hostStart, hostLength.value, StandardCharsets.UTF_8);
+        String hostSuffix = extractHandshakeHostSuffix(originalHost);
+        byte[] hostBytes = (host + hostSuffix).getBytes(StandardCharsets.UTF_8);
+        return concat(
+            slice(handshakePayload, 0, protocol.next),
+            encodeVarInt(hostBytes.length),
+            hostBytes,
+            new byte[]{(byte) (port >>> 8), (byte) port},
+            slice(handshakePayload, portEnd, handshakePayload.length)
+        );
+    }
+
+    private static String extractHandshakeHostSuffix(String originalHost) {
+        if (originalHost == null || originalHost.isEmpty()) {
+            return "";
+        }
+        int markerIndex = originalHost.indexOf('\0');
+        if (markerIndex < 0) {
+            return "";
+        }
+        return originalHost.substring(markerIndex);
+    }
+
     private static void streamCompress(InputStream in, OutputStream out) throws IOException {
         byte[] buffer = new byte[16 * 1024];
         int read;
@@ -495,6 +574,14 @@ public final class LocalZstdNet {
             offset += array.length;
         }
         return merged;
+    }
+
+    private static byte[] slice(byte[] source, int startInclusive, int endExclusive) {
+        int start = Math.max(0, startInclusive);
+        int end = Math.max(start, Math.min(source.length, endExclusive));
+        byte[] out = new byte[end - start];
+        System.arraycopy(source, start, out, 0, out.length);
+        return out;
     }
 
     private static void closeQuietly(Socket socket) {

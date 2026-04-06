@@ -219,7 +219,13 @@ final class ServerProxyRuntime {
 
             DetectedClientMode clientMode = detectClientMode(pushIn);
             if (clientMode.mode == ClientMode.RAW_LOGIN) {
-                LOGGER.warn("[server] dropped raw login attempt from {} on zstd-only entry", sourceIp);
+                LOGGER.warn("[server] rejected raw login attempt from {} on zstd-only entry", sourceIp);
+                sendLoginDisconnect(
+                    clientSocket,
+                    """
+                    当前服务器启用了 ZSTD 连接，请联系服务器管理员获取正确的连接地址。
+                    """
+                );
                 return;
             }
 
@@ -719,6 +725,86 @@ final class ServerProxyRuntime {
         }
 
         return null;
+    }
+
+    private void sendLoginDisconnect(Socket clientSocket, String message) {
+        if (clientSocket == null || message == null || message.isBlank()) {
+            return;
+        }
+
+        try {
+            OutputStream out = clientSocket.getOutputStream();
+            byte[] packet = buildLoginDisconnectPacket(message);
+            out.write(packet);
+            out.flush();
+        } catch (IOException e) {
+            LOGGER.debug("[server] failed to send raw-login disconnect packet: {}", e.toString());
+        }
+    }
+
+    private byte[] buildLoginDisconnectPacket(String message) throws IOException {
+        byte[] componentJson = buildTextComponentJson(message).getBytes(StandardCharsets.UTF_8);
+        byte[] packetId = writeVarInt(0);
+        byte[] componentLength = writeVarInt(componentJson.length);
+
+        byte[] payload = new byte[packetId.length + componentLength.length + componentJson.length];
+        int offset = 0;
+        System.arraycopy(packetId, 0, payload, offset, packetId.length);
+        offset += packetId.length;
+        System.arraycopy(componentLength, 0, payload, offset, componentLength.length);
+        offset += componentLength.length;
+        System.arraycopy(componentJson, 0, payload, offset, componentJson.length);
+
+        byte[] packetLength = writeVarInt(payload.length);
+        byte[] packet = new byte[packetLength.length + payload.length];
+        System.arraycopy(packetLength, 0, packet, 0, packetLength.length);
+        System.arraycopy(payload, 0, packet, packetLength.length, payload.length);
+        return packet;
+    }
+
+    private String buildTextComponentJson(String text) {
+        return "{\"text\":\"" + escapeJson(text) + "\"}";
+    }
+
+    private String escapeJson(String text) {
+        StringBuilder builder = new StringBuilder(text.length() + 16);
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            switch (ch) {
+                case '\\' -> builder.append("\\\\");
+                case '"' -> builder.append("\\\"");
+                case '\b' -> builder.append("\\b");
+                case '\f' -> builder.append("\\f");
+                case '\n' -> builder.append("\\n");
+                case '\r' -> builder.append("\\r");
+                case '\t' -> builder.append("\\t");
+                default -> {
+                    if (ch < 0x20) {
+                        builder.append(String.format(Locale.ROOT, "\\u%04x", (int) ch));
+                    } else {
+                        builder.append(ch);
+                    }
+                }
+            }
+        }
+        return builder.toString();
+    }
+
+    private byte[] writeVarInt(int value) {
+        byte[] out = new byte[5];
+        int index = 0;
+        int remaining = value;
+
+        do {
+            int next = remaining & 0x7F;
+            remaining >>>= 7;
+            if (remaining != 0) {
+                next |= 0x80;
+            }
+            out[index++] = (byte) next;
+        } while (remaining != 0);
+
+        return Arrays.copyOf(out, index);
     }
 
     private String ipString(byte[] data, int offset, int len) throws IOException {

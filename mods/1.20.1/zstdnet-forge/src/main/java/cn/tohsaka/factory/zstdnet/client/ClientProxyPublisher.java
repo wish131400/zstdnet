@@ -20,303 +20,412 @@
 package cn.tohsaka.factory.zstdnet.client;
 
 import cn.tohsaka.factory.zstdnet.ClientConfig;
-import cn.tohsaka.factory.zstdnet.ZstdServerList;
 import cn.tohsaka.factory.zstdnet.proxy.LocalZstdNet;
-import com.google.gson.Gson;
 import com.mojang.logging.LogUtils;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.ConnectScreen;
+import net.minecraft.client.gui.screens.DirectJoinServerScreen;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.multiplayer.JoinMultiplayerScreen;
+import net.minecraft.client.gui.screens.multiplayer.ServerSelectionList;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.ServerList;
+import net.minecraft.client.multiplayer.resolver.ResolvedServerAddress;
+import net.minecraft.client.multiplayer.resolver.ServerAddress;
+import net.minecraft.client.multiplayer.resolver.ServerNameResolver;
+import net.minecraft.client.resources.language.I18n;
+import net.minecraft.client.server.LanServer;
+import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.client.event.ScreenEvent;
 import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.config.ModConfig;
-import net.minecraftforge.fml.event.lifecycle.FMLLoadCompleteEvent;
-import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
-import net.minecraftforge.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Objects;
+import java.util.WeakHashMap;
 
 /**
- * Publishes simplified local loopback entries from servers.zstd.json.
+ * Client-side runtime that keeps vanilla server entries untouched and only swaps
+ * the actual connect target to a temporary local zstd proxy when the player joins.
  */
 public final class ClientProxyPublisher {
     private static final Logger LOGGER = LogUtils.getLogger();
-    private static final Gson GSON = new Gson();
     private static final ClientProxyPublisher INSTANCE = new ClientProxyPublisher();
 
-    private final Map<String, LocalZstdNet.ProxyHandle> runningProxies = new ConcurrentHashMap<>();
-    private final Map<String, Integer> proxyPortMap = new ConcurrentHashMap<>();
-    private final List<ZstdServerList.ZstdServer> activeServers = new ArrayList<>();
+    private final Object stateLock = new Object();
+    private final Map<JoinMultiplayerScreen, JoinScreenState> joinScreens = new WeakHashMap<>();
+    private final Map<DirectJoinServerScreen, DirectJoinState> directJoinScreens = new WeakHashMap<>();
 
-    private final ScheduledExecutorService refresher = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "zstdproxy-refresh");
-        t.setDaemon(true);
-        return t;
-    });
-    private final AtomicBoolean refreshStarted = new AtomicBoolean(false);
-    private final AtomicBoolean stopped = new AtomicBoolean(false);
-
-    private volatile String lastServerRaw = null;
-    private volatile int lastLevel = Integer.MIN_VALUE;
+    private LocalZstdNet.ProxyHandle activeProxy;
+    private Object lastListEntry;
+    private long lastListClickTime;
 
     private ClientProxyPublisher() {
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "zstdproxy-client-shutdown"));
     }
 
     public static void init() {
-        var modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
-        modEventBus.addListener(INSTANCE::onLoadComplete);
         ModLoadingContext.get().registerConfig(ModConfig.Type.CLIENT, ClientConfig.SPEC);
-        LOGGER.info("zstdproxy client mode initialized");
+        MinecraftForge.EVENT_BUS.addListener(INSTANCE::onScreenInit);
+        MinecraftForge.EVENT_BUS.addListener(INSTANCE::onScreenClosing);
+        MinecraftForge.EVENT_BUS.addListener(INSTANCE::onKeyPressed);
+        MinecraftForge.EVENT_BUS.addListener(INSTANCE::onMousePressed);
+        MinecraftForge.EVENT_BUS.addListener(INSTANCE::onScreenOpening);
+        LOGGER.info("zstdproxy client runtime initialized");
     }
 
-    private void onLoadComplete(FMLLoadCompleteEvent event) {
-        startAutoRefresh();
+    private void onScreenInit(ScreenEvent.Init.Post event) {
+        Screen screen = event.getScreen();
+        List<?> listeners = event.getListenersList();
+
+        if (screen instanceof JoinMultiplayerScreen joinScreen) {
+            JoinScreenState state = JoinScreenState.from(listeners);
+            synchronized (stateLock) {
+                joinScreens.put(joinScreen, state);
+            }
+            LOGGER.debug("zstdproxy: hooked multiplayer screen");
+            return;
+        }
+
+        if (screen instanceof DirectJoinServerScreen directJoinScreen) {
+            DirectJoinState state = DirectJoinState.from(listeners);
+            synchronized (stateLock) {
+                directJoinScreens.put(directJoinScreen, state);
+            }
+            LOGGER.debug("zstdproxy: hooked direct-join screen");
+        }
     }
 
-    private void startAutoRefresh() {
-        if (stopped.get()) {
-            return;
+    private void onScreenClosing(ScreenEvent.Closing event) {
+        Screen screen = event.getScreen();
+        synchronized (stateLock) {
+            if (screen instanceof JoinMultiplayerScreen joinScreen) {
+                joinScreens.remove(joinScreen);
+            } else if (screen instanceof DirectJoinServerScreen directJoinScreen) {
+                directJoinScreens.remove(directJoinScreen);
+            }
         }
-        if (!refreshStarted.compareAndSet(false, true)) {
-            return;
-        }
+    }
 
-        refresher.scheduleAtFixedRate(() -> {
-            if (stopped.get()) {
+    private void onScreenOpening(ScreenEvent.Opening event) {
+        if (event.getCurrentScreen() instanceof ConnectScreen && event.getNewScreen() != null) {
+            closeActiveProxy();
+        }
+    }
+
+    private void onKeyPressed(ScreenEvent.KeyPressed.Pre event) {
+        Screen screen = event.getScreen();
+
+        if (screen instanceof JoinMultiplayerScreen joinScreen) {
+            if (!net.minecraft.client.gui.navigation.CommonInputs.selected(event.getKeyCode())) {
                 return;
             }
-            try {
-                reloadAndPublishIfChanged();
-            } catch (Exception e) {
-                LOGGER.error("zstdproxy: refresh tick failed", e);
+            if (connectSelected(joinScreen)) {
+                event.setCanceled(true);
             }
-        }, 0, 2, TimeUnit.SECONDS);
-
-        LOGGER.info("zstdproxy: auto refresh enabled (2s)");
-    }
-
-    private synchronized void reloadAndPublishIfChanged() {
-        String raw = readServerRaw();
-        int level = ClientConfig.getLevel();
-
-        if (blank(raw)) {
-            resetPublishedServers(level);
             return;
         }
 
-        if (raw.equals(lastServerRaw) && level == lastLevel) {
-            return;
-        }
-
-        List<ZstdServerList.ZstdServer> configured = parseServers(raw);
-        lastServerRaw = raw;
-        lastLevel = level;
-
-        closeAllProxies();
-        activeServers.clear();
-        activeServers.addAll(configured);
-
-        for (ZstdServerList.ZstdServer server : configured) {
-            if (server == null || blank(server.mask()) || blank(server.addr())) {
-                continue;
+        if (screen instanceof DirectJoinServerScreen directJoinScreen) {
+            if (event.getKeyCode() != 257 && event.getKeyCode() != 335) {
+                return;
             }
-
-            try {
-                LocalZstdNet.HostPort hostPort = LocalZstdNet.HostPort.parse(server.addr());
-                LocalZstdNet.Mode mode = parseMode(server.mode());
-                LocalZstdNet.ProxyHandle proxy = LocalZstdNet.start(hostPort.host(), hostPort.port(), level, mode);
-                runningProxies.put(server.mask(), proxy);
-                proxyPortMap.put(server.mask(), proxy.localPort());
-                LOGGER.info("zstd server {} ({}) [{}] -> 127.0.0.1:{}",
-                    safe(server.name()), server.mask(), proxy.mode(), proxy.localPort());
-            } catch (Exception e) {
-                LOGGER.error("failed to start local proxy for {} ({})", safe(server.name()), safe(server.addr()), e);
+            DirectJoinState state = getDirectJoinState(directJoinScreen);
+            if (state == null || state.ipEdit == null || state.selectButton == null || !state.selectButton.active) {
+                return;
             }
-        }
-
-        Minecraft mc = Minecraft.getInstance();
-        if (mc != null) {
-            mc.execute(this::updateServerList);
+            if (screen.getFocused() != state.ipEdit) {
+                return;
+            }
+            if (connectDirect(directJoinScreen, state)) {
+                event.setCanceled(true);
+            }
         }
     }
 
-    private void resetPublishedServers(int level) {
-        if ("".equals(lastServerRaw) && lastLevel == level) {
+    private void onMousePressed(ScreenEvent.MouseButtonPressed.Pre event) {
+        if (event.getButton() != 0) {
             return;
         }
 
-        lastServerRaw = "";
-        lastLevel = level;
-        closeAllProxies();
-        activeServers.clear();
+        Screen screen = event.getScreen();
 
-        Minecraft mc = Minecraft.getInstance();
-        if (mc != null) {
-            mc.execute(this::updateServerList);
+        if (screen instanceof JoinMultiplayerScreen joinScreen) {
+            JoinScreenState state = getJoinScreenState(joinScreen);
+            if (state == null) {
+                return;
+            }
+
+            if (state.selectButton != null && state.selectButton.active && state.selectButton.isMouseOver(event.getMouseX(), event.getMouseY())) {
+                if (connectSelected(joinScreen)) {
+                    event.setCanceled(true);
+                }
+                return;
+            }
+
+            if (state.serverList == null || !state.serverList.isMouseOver(event.getMouseX(), event.getMouseY())) {
+                return;
+            }
+
+            ServerSelectionList.Entry entry = hoveredEntry(state.serverList, event.getMouseX(), event.getMouseY());
+            if (entry == null) {
+                return;
+            }
+
+            long now = System.currentTimeMillis();
+            boolean isDoubleClick = entry == lastListEntry && (now - lastListClickTime) < 250L;
+            double rowOffsetX = event.getMouseX() - state.serverList.getRowLeft();
+            boolean isJoinIconClick = entry instanceof ServerSelectionList.OnlineServerEntry
+                && rowOffsetX > 16.0D
+                && rowOffsetX < 32.0D;
+            lastListEntry = entry;
+            lastListClickTime = now;
+
+            if (!isDoubleClick && !isJoinIconClick) {
+                return;
+            }
+
+            if (connectEntry(joinScreen, entry)) {
+                event.setCanceled(true);
+            }
+            return;
         }
 
-        LOGGER.warn("zstdproxy: no server source loaded");
+        if (screen instanceof DirectJoinServerScreen directJoinScreen) {
+            DirectJoinState state = getDirectJoinState(directJoinScreen);
+            if (state == null || state.selectButton == null || !state.selectButton.active) {
+                return;
+            }
+            if (state.selectButton.isMouseOver(event.getMouseX(), event.getMouseY()) && connectDirect(directJoinScreen, state)) {
+                event.setCanceled(true);
+            }
+        }
     }
 
-    private List<ZstdServerList.ZstdServer> parseServers(String raw) {
+    private boolean connectSelected(JoinMultiplayerScreen screen) {
+        JoinScreenState state = getJoinScreenState(screen);
+        if (state == null || state.serverList == null) {
+            return false;
+        }
+        ServerSelectionList.Entry entry = state.serverList.getSelected();
+        return connectEntry(screen, entry);
+    }
+
+    private boolean connectEntry(Screen parent, ServerSelectionList.Entry entry) {
+        if (entry instanceof ServerSelectionList.OnlineServerEntry onlineEntry) {
+            return connect(parent, onlineEntry.getServerData());
+        }
+        if (entry instanceof ServerSelectionList.NetworkServerEntry networkEntry) {
+            LanServer lanServer = networkEntry.getServerData();
+            return connect(parent, new ServerData(lanServer.getMotd(), lanServer.getAddress(), true));
+        }
+        return false;
+    }
+
+    private boolean connectDirect(DirectJoinServerScreen screen, DirectJoinState state) {
+        if (state.ipEdit == null) {
+            return false;
+        }
+        String raw = normalizeAddress(state.ipEdit.getValue());
+        if (raw.isEmpty() || !ServerAddress.isValidAddress(raw)) {
+            return false;
+        }
+        return connect(screen, resolveDirectJoinServer(raw));
+    }
+
+    private boolean connect(Screen parent, ServerData serverData) {
+        String remoteAddr = normalizeAddress(serverData.ip);
+        if (remoteAddr.isEmpty() || !ServerAddress.isValidAddress(remoteAddr)) {
+            LOGGER.warn("zstdproxy: invalid remote address {}", serverData.ip);
+            return false;
+        }
+
+        RemoteTarget remote = resolveRemoteTarget(remoteAddr);
+        if (remote == null) {
+            LOGGER.warn("zstdproxy: failed to resolve remote target {}", remoteAddr);
+            return false;
+        }
+        LocalZstdNet.ProxyHandle proxy;
+
         try {
-            ZstdServerList list = GSON.fromJson(raw, ZstdServerList.class);
-            if (list == null || list.servers() == null) {
-                return List.of();
+            synchronized (stateLock) {
+                closeActiveProxyLocked();
+                proxy = LocalZstdNet.start(
+                    remote.connectHost(),
+                    remote.connectPort(),
+                    remote.connectHost(),
+                    remote.connectPort(),
+                    remote.presentedHost(),
+                    remote.presentedPort(),
+                    ClientConfig.getLevel(),
+                    LocalZstdNet.Mode.ZSTD
+                );
+                activeProxy = proxy;
             }
-            return list.servers();
-        } catch (Exception e) {
-            LOGGER.error("zstdproxy: failed to parse servers.zstd.json", e);
-            return List.of();
-        }
-    }
-
-    private String readServerRaw() {
-        Path gameDirFile = FMLPaths.GAMEDIR.get().resolve("servers.zstd.json");
-        if (Files.exists(gameDirFile)) {
-            try {
-                LOGGER.debug("zstdproxy: loading {}", gameDirFile);
-                return Files.readString(gameDirFile, StandardCharsets.UTF_8);
-            } catch (IOException e) {
-                LOGGER.error("zstdproxy: failed reading {}", gameDirFile, e);
-            }
-        } else {
-            createTemplateIfMissing(gameDirFile);
-        }
-
-        Path cwdFile = Path.of("servers.zstd.json");
-        if (Files.exists(cwdFile)) {
-            try {
-                LOGGER.debug("zstdproxy: loading {}", cwdFile.toAbsolutePath());
-                return Files.readString(cwdFile, StandardCharsets.UTF_8);
-            } catch (IOException e) {
-                LOGGER.error("zstdproxy: failed reading {}", cwdFile.toAbsolutePath(), e);
-            }
-        }
-
-        return "";
-    }
-
-    private void createTemplateIfMissing(Path target) {
-        try {
-            Path parent = target.getParent();
-            if (parent != null) {
-                Files.createDirectories(parent);
-            }
-
-            String template = """
-                    {
-                      "_comment": "zstd server list template. Fill addr/mask as needed.",
-                      "servers": [
-                        {
-                          "name": "\\u8bf7\\u586b\\u5199\\u670d\\u52a1\\u5668\\u5730\\u5740\\u540e\\u7b49\\u5f855\\u79d2",
-                          "addr": "example.com:35566",
-                          "mask": "line1",
-                          "mode": "zstd",
-                          "_comment_mode": "auto/raw/zstd. zstd will probe first."
-                        }
-                      ]
-                    }
-                    """;
-            Files.writeString(target, template, StandardCharsets.UTF_8);
-            LOGGER.info("zstdproxy: generated template {}", target.toAbsolutePath());
         } catch (IOException e) {
-            LOGGER.error("zstdproxy: failed to generate template {}", target.toAbsolutePath(), e);
+            LOGGER.error("zstdproxy: failed to start local proxy for {}", remoteAddr, e);
+            return false;
+        }
+
+        serverData.ip = remoteAddr;
+        String localAddr = "127.0.0.1:" + proxy.localPort();
+        LOGGER.info("zstdproxy: {} -> {} via local {}", safe(serverData.name), remoteAddr, localAddr);
+        ConnectScreen.startConnecting(parent, Minecraft.getInstance(), ServerAddress.parseString(localAddr), serverData, false);
+        return true;
+    }
+
+    private JoinScreenState getJoinScreenState(JoinMultiplayerScreen screen) {
+        synchronized (stateLock) {
+            return joinScreens.get(screen);
         }
     }
 
-    private void updateServerList() {
+    private DirectJoinState getDirectJoinState(DirectJoinServerScreen screen) {
+        synchronized (stateLock) {
+            return directJoinScreens.get(screen);
+        }
+    }
+
+    private ServerSelectionList.Entry hoveredEntry(ServerSelectionList list, double mouseX, double mouseY) {
+        for (ServerSelectionList.Entry entry : list.children()) {
+            if (entry != null && entry.isMouseOver(mouseX, mouseY)) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    private void closeActiveProxy() {
+        synchronized (stateLock) {
+            closeActiveProxyLocked();
+        }
+    }
+
+    private void closeActiveProxyLocked() {
+        if (activeProxy == null) {
+            return;
+        }
         try {
-            ServerList serverList = new ServerList(Minecraft.getInstance());
-            serverList.load();
-
-            for (int i = serverList.size() - 1; i >= 0; i--) {
-                ServerData existing = serverList.get(i);
-                if (existing != null && existing.name != null && existing.name.endsWith(" [zstd]")) {
-                    serverList.remove(existing);
-                }
-            }
-
-            for (ZstdServerList.ZstdServer server : activeServers) {
-                if (server == null || blank(server.mask())) {
-                    continue;
-                }
-
-                Integer localPort = proxyPortMap.get(server.mask());
-                if (localPort == null) {
-                    continue;
-                }
-
-                String title = safe(server.name()) + " [zstd]";
-                String addr = "127.0.0.1:" + localPort;
-                ServerData data = new ServerData(title, addr, false);
-                serverList.add(data, false);
-            }
-
-            serverList.save();
-            LOGGER.info("zstdproxy: server list updated, {} zstd entries", activeServers.size());
-        } catch (Exception e) {
-            LOGGER.error("zstdproxy: failed to update multiplayer entries", e);
+            activeProxy.close();
+        } catch (Exception ignored) {
         }
-    }
-
-    private synchronized void closeAllProxies() {
-        for (LocalZstdNet.ProxyHandle handle : runningProxies.values()) {
-            if (handle != null) {
-                try {
-                    handle.close();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-        runningProxies.clear();
-        proxyPortMap.clear();
+        activeProxy = null;
     }
 
     private void shutdown() {
-        if (!stopped.compareAndSet(false, true)) {
-            return;
+        closeActiveProxy();
+    }
+
+    private ServerData resolveDirectJoinServer(String remoteAddr) {
+        Minecraft minecraft = Minecraft.getInstance();
+        ServerList serverList = new ServerList(minecraft);
+        serverList.load();
+
+        ServerData existing = serverList.get(remoteAddr);
+        if (existing != null) {
+            return existing;
         }
-        refresher.shutdownNow();
-        synchronized (this) {
-            closeAllProxies();
-            activeServers.clear();
+
+        ServerData created = new ServerData(I18n.get("selectServer.defaultName"), remoteAddr, false);
+        serverList.add(created, true);
+        serverList.save();
+        return created;
+    }
+
+    private RemoteTarget resolveRemoteTarget(String remoteAddr) {
+        ServerAddress requested = ServerAddress.parseString(remoteAddr);
+        if (requested == null || requested.getHost().isBlank()) {
+            return null;
+        }
+
+        ResolvedServerAddress resolved = ServerNameResolver.DEFAULT.resolveAddress(requested).orElse(null);
+        if (resolved == null) {
+            return null;
+        }
+
+        String connectHost = resolved.asInetSocketAddress().getHostString();
+        if (connectHost == null || connectHost.isBlank()) {
+            connectHost = resolved.getHostName();
+        }
+        if (connectHost == null || connectHost.isBlank()) {
+            connectHost = requested.getHost();
+        }
+
+        return new RemoteTarget(
+            connectHost,
+            resolved.getPort(),
+            connectHost,
+            resolved.getPort()
+        );
+    }
+
+    private static String normalizeAddress(String raw) {
+        return raw == null ? "" : raw.trim();
+    }
+
+    private static boolean isSelectButton(Button button) {
+        return button != null && Objects.equals(button.getMessage().getString(), I18n.get("selectServer.select"));
+    }
+
+    private static String safe(String value) {
+        return value == null || value.isBlank() ? "unnamed" : value.trim();
+    }
+
+    private static final class JoinScreenState {
+        private final ServerSelectionList serverList;
+        private final Button selectButton;
+
+        private JoinScreenState(ServerSelectionList serverList, Button selectButton) {
+            this.serverList = serverList;
+            this.selectButton = selectButton;
+        }
+
+        private static JoinScreenState from(List<?> listeners) {
+            ServerSelectionList list = null;
+            Button select = null;
+
+            for (Object listener : listeners) {
+                if (listener instanceof ServerSelectionList foundList) {
+                    list = foundList;
+                } else if (listener instanceof Button button && isSelectButton(button)) {
+                    select = button;
+                }
+            }
+
+            return new JoinScreenState(list, select);
         }
     }
 
-    private static boolean blank(String s) {
-        return s == null || s.trim().isEmpty();
-    }
+    private static final class DirectJoinState {
+        private final EditBox ipEdit;
+        private final Button selectButton;
 
-    private static String safe(String s) {
-        if (blank(s)) {
-            return "unnamed";
-        }
-        return s.trim();
-    }
-
-    private static LocalZstdNet.Mode parseMode(String raw) {
-        if (blank(raw)) {
-            return LocalZstdNet.Mode.ZSTD;
+        private DirectJoinState(EditBox ipEdit, Button selectButton) {
+            this.ipEdit = ipEdit;
+            this.selectButton = selectButton;
         }
 
-        String value = raw.trim().toLowerCase();
-        return switch (value) {
-            case "raw" -> LocalZstdNet.Mode.RAW;
-            case "auto" -> LocalZstdNet.Mode.AUTO;
-            default -> LocalZstdNet.Mode.ZSTD;
-        };
+        private static DirectJoinState from(List<?> listeners) {
+            EditBox ipEdit = null;
+            Button select = null;
+
+            for (Object listener : listeners) {
+                if (listener instanceof EditBox editBox) {
+                    ipEdit = editBox;
+                } else if (listener instanceof Button button && isSelectButton(button)) {
+                    select = button;
+                }
+            }
+
+            return new DirectJoinState(ipEdit, select);
+        }
+    }
+
+    private record RemoteTarget(String connectHost, int connectPort, String presentedHost, int presentedPort) {
     }
 }
