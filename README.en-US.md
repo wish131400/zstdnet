@@ -76,6 +76,14 @@ network-compression-threshold=1048576
 
 If you keep vanilla authentication or vanilla network compression enabled on the backend server, connections may fail or compression efficiency may be much worse than expected.
 
+If you still want premium account verification while keeping the backend in offline mode, you can additionally use [TrueUUID](https://www.mcmod.cn/class/21953.html).
+
+- This is useful for setups where the backend stays on `online-mode=false`, but you still want login-time premium account verification
+- It can help preserve premium UUIDs, correct name casing, and skin-related profile data while running in offline mode
+- This is especially practical for servers that need offline forwarding, NAT traversal, or proxy-style chains without fully giving up premium account checks
+
+In short, ZstdNet handles compression and forwarding; if you also need premium account verification, you can pair it with a mod such as TrueUUID.
+
 ## Dedicated Server Setup
 
 On first launch, the mod generates:
