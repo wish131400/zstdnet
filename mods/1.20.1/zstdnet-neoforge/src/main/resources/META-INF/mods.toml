@@ -1,0 +1,27 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="${mod_id}"
+version="${mod_version}"
+displayName="${mod_name}"
+description='''
+NeoForge 1.20.1 source-maintainable Zstd proxy mod.
+Automatically loads servers.zstd.json and publishes local loopback entries.
+Also supports dedicated-server zstd forwarding via config/zstdnet-server.properties.
+'''
+
+[[dependencies.${mod_id}]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.${mod_id}]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,1.21)"
+ordering="NONE"
+side="BOTH"
