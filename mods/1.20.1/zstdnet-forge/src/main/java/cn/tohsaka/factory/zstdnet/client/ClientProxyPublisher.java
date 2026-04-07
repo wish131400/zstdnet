@@ -205,25 +205,34 @@ public final class ClientProxyPublisher {
         int y = 8;
 
         if (hostSnapshot != null) {
+            String hostMode = translateServerHudMode(hostSnapshot.mode());
             String[] hostLines = {
-                "ZstdNet Host " + hostSnapshot.mode() + " " + hostSnapshot.listenHost() + ":" + hostSnapshot.listenPort(),
-                "Wire " + formatRate(hostSnapshot.zstdRate()) + " | Raw " + formatRate(hostSnapshot.rawRate()),
-                "Total " + formatSize(hostSnapshot.zstdBytes()) + " / " + formatSize(hostSnapshot.rawBytes())
-                    + " | Ratio " + String.format("%.2f%%", hostSnapshot.ratioPercent()),
-                "Conns " + hostSnapshot.connections()
+                I18n.get("zstdnet.hud.host.title", hostMode, hostSnapshot.listenHost(), hostSnapshot.listenPort()),
+                I18n.get("zstdnet.hud.host.rate", formatRate(hostSnapshot.zstdRate()), formatRate(hostSnapshot.rawRate())),
+                I18n.get(
+                    "zstdnet.hud.total_ratio",
+                    formatSize(hostSnapshot.zstdBytes()),
+                    formatSize(hostSnapshot.rawBytes()),
+                    formatPercent(hostSnapshot.ratioPercent())
+                ),
+                I18n.get("zstdnet.hud.connections", hostSnapshot.connections())
             };
             y = renderHudPanel(gui, minecraft, y, hostLines);
         }
 
         if (session != null) {
             LocalZstdNet.StatsSnapshot stats = session.statsSnapshot();
+            String clientMode = translateClientHudMode(stats.mode());
             String[] clientLines = {
-                "ZstdNet " + stats.mode() + " " + stats.remoteHost() + ":" + stats.remotePort(),
-                "Wire Up " + formatRate(stats.wireUpRate()) + " | Down " + formatRate(stats.wireDownRate()),
-                "Raw  Up " + formatRate(stats.rawUpRate()) + " | Down " + formatRate(stats.rawDownRate()),
-                "Total " + formatSize(stats.wireUpBytes() + stats.wireDownBytes())
-                    + " / " + formatSize(stats.rawUpBytes() + stats.rawDownBytes())
-                    + " | Ratio " + String.format("%.2f%%", stats.ratioPercent())
+                I18n.get("zstdnet.hud.client.title", clientMode, stats.remoteHost(), stats.remotePort()),
+                I18n.get("zstdnet.hud.client.wire", formatRate(stats.wireUpRate()), formatRate(stats.wireDownRate())),
+                I18n.get("zstdnet.hud.client.raw", formatRate(stats.rawUpRate()), formatRate(stats.rawDownRate())),
+                I18n.get(
+                    "zstdnet.hud.total_ratio",
+                    formatSize(stats.wireUpBytes() + stats.wireDownBytes()),
+                    formatSize(stats.rawUpBytes() + stats.rawDownBytes()),
+                    formatPercent(stats.ratioPercent())
+                )
             };
             renderHudPanel(gui, minecraft, y, clientLines);
         }
@@ -578,6 +587,11 @@ public final class ClientProxyPublisher {
     }
 
     private int setZstdPort(CommandContext<CommandSourceStack> context) {
+        if (!canEditPortConfig()) {
+            sendClientMessage(Component.translatable("zstdnet.command.port.no_permission"));
+            return 0;
+        }
+
         int port = IntegerArgumentType.getInteger(context, "port");
         try {
             ServerProxyConfigFile.writeListenPort(port);
@@ -591,6 +605,11 @@ public final class ClientProxyPublisher {
     }
 
     private int setGamePort(CommandContext<CommandSourceStack> context) {
+        if (!canEditPortConfig()) {
+            sendClientMessage(Component.translatable("zstdnet.command.port.no_permission"));
+            return 0;
+        }
+
         int port = IntegerArgumentType.getInteger(context, "port");
         try {
             ServerProxyConfigFile.writeTargetPort(port);
@@ -601,6 +620,13 @@ public final class ClientProxyPublisher {
         }
         sendClientMessage(Component.translatable("zstdnet.command.port.game_set", port));
         return 1;
+    }
+
+    private boolean canEditPortConfig() {
+        Minecraft minecraft = Minecraft.getInstance();
+        return minecraft.player != null
+            && minecraft.getSingleplayerServer() != null
+            && minecraft.player.hasPermissions(2);
     }
 
     private ServerData resolveDirectJoinServer(String remoteAddr) {
@@ -773,6 +799,32 @@ public final class ClientProxyPublisher {
             gui.drawString(minecraft.font, lines[i], x, y + lineHeight * i, color);
         }
         return y + height + 4;
+    }
+
+    private static String translateServerHudMode(String mode) {
+        if (mode == null) {
+            return "";
+        }
+        return switch (mode) {
+            case "DEDICATED" -> I18n.get("zstdnet.hud.mode.dedicated");
+            case "LAN" -> I18n.get("zstdnet.hud.mode.lan");
+            default -> mode;
+        };
+    }
+
+    private static String translateClientHudMode(LocalZstdNet.Mode mode) {
+        if (mode == null) {
+            return "";
+        }
+        return switch (mode) {
+            case AUTO -> I18n.get("zstdnet.hud.mode.auto");
+            case RAW -> I18n.get("zstdnet.hud.mode.raw");
+            case ZSTD -> I18n.get("zstdnet.hud.mode.zstd");
+        };
+    }
+
+    private static String formatPercent(double value) {
+        return String.format("%.2f%%", value);
     }
 
     private ShareToLanState attachShareToLanState(ShareToLanScreen screen, ScreenEvent.Init.Post event, List<?> listeners) {
