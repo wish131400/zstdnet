@@ -21,7 +21,7 @@ It is especially suitable for:
 
 The main purpose of this mod is to reduce public bandwidth usage caused by highly repetitive packet traffic.
 
-In large modpack（ https://www.xn--dctt54dhmrbwo.com/ ） environments, the compression gains can be very significant. Here is a real example of server-side stats:
+In large modpack [齿轮盛宴官方网站](https://www.xn--dctt54dhmrbwo.com) environments, the compression gains can be very significant. Here is a real example of server-side stats:
 
 ```text
 Raw: 189.06 GB (3.6MB/s) | Zstd: 10.28 GB (252.7KB/s) | Ratio: 5.44% | Conns: 8
