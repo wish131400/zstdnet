@@ -257,7 +257,7 @@ enabled=true
 # zstd public listening entry.
 listen=0.0.0.0:35565
 
-# Backend Minecraft / Velocity address.
+# Backend Minecraft
 target=127.0.0.1:25565
 
 # zstd compression level (1-22, usually recommended 3-9).

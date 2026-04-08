@@ -257,7 +257,7 @@ enabled=true
 # zstd 公网监听入口。
 listen=0.0.0.0:35565
 
-# 后端 Minecraft / Velocity 地址。
+# 后端 Minecraft
 target=127.0.0.1:25565
 
 # zstd 压缩等级（1-22，通常建议 3-9）。
