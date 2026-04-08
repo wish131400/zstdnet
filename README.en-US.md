@@ -236,10 +236,133 @@ Possibly.
 
 On the client side, this mod works by hooking into the connection flow through the UI. If another mod heavily rewrites the multiplayer menu or the "Open to LAN" screen, compatibility issues are possible.
 
-## Config Files
+## Configuration Files
 
 - Client: `config/zstdnet-client.toml`
 - Server: `config/zstdnet-server.properties`
+
+### Server Configuration File `zstdnet-server.properties` Content
+
+```properties
+# ------------------------------------------------------------
+# zstdnet built-in server configuration (auto-generated)
+# ------------------------------------------------------------
+# 1) First confirm listen / target, then set enabled to true.
+# 2) listen and target cannot be the same endpoint.
+# 3) Do not write the address as 127.0.0.1. (trailing dot will fail to parse).
+
+# Whether to enable built-in zstd proxy.
+enabled=true
+
+# zstd public listening entry.
+listen=0.0.0.0:35565
+
+# Backend Minecraft / Velocity address.
+target=127.0.0.1:25565
+
+# zstd compression level (1-22, usually recommended 3-9).
+level=9
+
+# Maximum concurrent connections per IP (<=0 means disable limit).
+max_conn_per_ip=20
+
+# Maximum requests per IP within request_window (<=0 means disable limit).
+max_req_per_window=30
+
+# Request counting time window.
+request_window=10s
+
+# Ban duration after exceeding limits.
+ban_duration=30m
+
+# Statistics log output interval.
+stats_interval=1s
+
+# zstd flush interval, 0ms means flush on every write.
+flush_interval=2ms
+
+# idle read timeout for backend reads, 0 means disabled.
+idle_timeout=0
+
+# Per-connection rate limit (bytes/second, 0 means disabled).
+max_rate_per_conn_bps=0
+
+# Global total rate limit (bytes/second, 0 means disabled).
+max_rate_global_bps=0
+
+# Token bucket burst capacity (bytes).
+burst_bytes=262144
+```
+
+**Configuration Item Explanation :**
+
+- `enabled`：Whether to enable ZstdNet service (default: true)
+  - Set to true to use Zstd compression
+
+- `listen`：Zstd compression entry address and port (default: 0.0.0.0:35565)
+  - This is the address and port players use to connect to the server
+  - 0.0.0.0 means allow access from all IPs
+
+- `target`：Backend Minecraft server address and port (default: 127.0.0.1:25565)
+  - ZstdNet forwards compressed traffic to this address
+  - 127.0.0.1 means local server
+
+- `level`：Compression strength (1-22, recommended 3-9, default: 9)
+  - Higher numbers mean better compression but use more CPU
+  - Usually 3-5 is enough for a good balance of performance and compression
+
+- `max_conn_per_ip`：Maximum simultaneous connections per IP (default: 20)
+  - Set to 0 or negative to disable limit
+  - Prevents a single IP from using too many connections
+
+- `max_req_per_window`：Maximum requests per IP within a time window (default: 30)
+  - Set to 0 or negative to disable limit
+  - Prevents malicious request spamming
+
+- `request_window`：Time range for request counting (default: 10s)
+  - Works with max_req_per_window, e.g., max 30 requests within 10 seconds
+
+- `ban_duration`：Ban duration after exceeding limits (default: 30m)
+  - Prevents malicious attacks, banned IPs can't connect temporarily
+
+- `stats_interval`：Interval for server logs to show traffic statistics (default: 1s)
+  - Shows traffic information in the console every 1 second
+
+- `flush_interval`：How often to send compressed data (default: 2ms)
+  - Set to 0 to send immediately after each compression
+  - Smaller values mean lower latency but may increase network overhead
+
+- `idle_timeout`：Backend connection idle timeout (default: 0)
+  - Set to 0 to keep connections active indefinitely
+  - Non-zero value means automatically close connections that are idle for longer than this time
+
+- `max_rate_per_conn_bps`：Maximum speed limit per connection (default: 0)
+  - Unit is bytes/second, set to 0 to disable limit
+  - Prevents a single connection from using too much bandwidth
+
+- `max_rate_global_bps`：Total speed limit for all connections (default: 0)
+  - Unit is bytes/second, set to 0 to disable limit
+  - Controls overall bandwidth usage
+
+- `burst_bytes`：Allowed burst traffic size (default: 262144)
+  - Unit is bytes, acts as a "buffer pool" for traffic
+  - Allows short-term burst traffic to exceed the limit even with rate limiting enabled
+
+### Client Configuration File `zstdnet-client.toml` Content
+
+```toml
+# Configuration file
+
+[general]
+	# zstd compression level for client->server stream
+	level = 3
+```
+
+**Configuration Item Explanation:**
+
+- `level`：Zstd compression level for client->server stream (default: 3, range: 1-22)
+  - Higher levels provide better compression but increase CPU usage
+  - It is recommended to choose between 3-5 to balance compression effect and performance
 
 ## Dependencies
 

@@ -241,6 +241,129 @@ mc.example.com:35565
 - 客户端：`config/zstdnet-client.toml`
 - 服务端：`config/zstdnet-server.properties`
 
+### 服务端配置文件 `zstdnet-server.properties` 内容
+
+```properties
+# ------------------------------------------------------------
+# zstdnet 内置服务端配置（自动生成）
+# ------------------------------------------------------------
+# 1) 先确认 listen / target，再把 enabled 改为 true。
+# 2) listen 与 target 不能是同一个端点。
+# 3) 地址不要写成 127.0.0.1.（末尾带点会解析失败）。
+
+# 是否启用内置 zstd 代理。
+enabled=true
+
+# zstd 公网监听入口。
+listen=0.0.0.0:35565
+
+# 后端 Minecraft / Velocity 地址。
+target=127.0.0.1:25565
+
+# zstd 压缩等级（1-22，通常建议 3-9）。
+level=9
+
+# 单个 IP 最大并发连接数（<=0 表示关闭限制）。
+max_conn_per_ip=20
+
+# 单个 IP 在 request_window 内最大请求次数（<=0 表示关闭限制）。
+max_req_per_window=30
+
+# 请求计数时间窗口。
+request_window=10s
+
+# 超限后的封禁时长。
+ban_duration=30m
+
+# 统计日志输出间隔。
+stats_interval=1s
+
+# zstd flush 间隔，0ms 表示每次写入都 flush。
+flush_interval=2ms
+
+# 后端读取的空闲超时时间，0 表示禁用。
+idle_timeout=0
+
+# 单连接限速（字节/秒，0 表示关闭）。
+max_rate_per_conn_bps=0
+
+# 全局总限速（字节/秒，0 表示关闭）。
+max_rate_global_bps=0
+
+# 令牌桶突发容量（字节）。
+burst_bytes=262144
+```
+
+**配置项说明：**
+
+- `enabled`：是否开启 ZstdNet 服务（默认：true）
+  - 设为 true 才能使用 Zstd 压缩功能
+
+- `listen`：Zstd 压缩入口的地址和端口（默认：0.0.0.0:35565）
+  - 玩家连接游戏时用的就是这个地址和端口
+  - 0.0.0.0 表示允许所有IP访问
+
+- `target`：后端 Minecraft 服务器的地址和端口（默认：127.0.0.1:25565）
+  - ZstdNet 会把压缩后的流量转发到这个地址
+  - 127.0.0.1 表示本地服务器
+
+- `level`：压缩强度（1-22，建议 3-9，默认：9）
+  - 数字越大，压缩效果越好，但会占用更多 CPU
+  - 一般设置 3-5 就足够了，平衡性能和压缩效果
+
+- `max_conn_per_ip`：每个 IP 最多能同时连接的数量（默认：20）
+  - 设为 0 或负数表示不限制
+  - 防止单个 IP 占用过多连接
+
+- `max_req_per_window`：每个 IP 在一定时间内最多能发起的请求次数（默认：30）
+  - 设为 0 或负数表示不限制
+  - 防止恶意刷请求
+
+- `request_window`：请求计数的时间范围（默认：10s）
+  - 配合 max_req_per_window 使用，比如 10s 内最多 30 次请求
+
+- `ban_duration`：超过限制后封禁的时间（默认：30m）
+  - 防止恶意攻击，被封禁的 IP 暂时无法连接
+
+- `stats_interval`：服务器日志显示流量统计的间隔（默认：1s）
+  - 每隔 1 秒在控制台显示一次流量情况
+
+- `flush_interval`：数据压缩后多久发送一次（默认：2ms）
+  - 设为 0 表示每次压缩后立即发送
+  - 数值越小，延迟越低，但可能增加网络开销
+
+- `idle_timeout`：后端连接的空闲超时时间（默认：0）
+  - 设为 0 表示不超时，保持连接一直活跃
+  - 非 0 值表示如果连接空闲超过这个时间就自动断开
+
+- `max_rate_per_conn_bps`：每个连接的最大速度限制（默认：0）
+  - 单位是字节/秒，设为 0 表示不限制
+  - 防止单个连接占用过多带宽
+
+- `max_rate_global_bps`：所有连接的总速度限制（默认：0）
+  - 单位是字节/秒，设为 0 表示不限制
+  - 控制整体带宽使用
+
+- `burst_bytes`：允许的突发流量大小（默认：262144）
+  - 单位是字节，相当于流量的"缓冲池"
+  - 即使设置了限速，短时间内的突发流量也可以超过限制
+
+### 客户端配置文件 `zstdnet-client.toml` 内容
+
+```toml
+# Configuration file
+
+[general]
+	# zstd compression level for client->server stream
+	level = 3
+```
+
+**配置项说明：**
+
+- `level`：客户端到服务端流的 Zstd 压缩级别（默认：3，范围：1-22）
+  - 级别越高，压缩率越好，但 CPU 使用率也会增加
+  - 建议在 3-5 之间选择，平衡压缩效果和性能
+
 ## 依赖
 
 - Minecraft Forge
