@@ -93,7 +93,7 @@ public final class ClientProxyPublisher {
     private Screen lastObservedScreen;
 
     private ClientProxyPublisher() {
-        Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "zstdproxy-client-shutdown"));
+        Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "zstdnet-client-shutdown"));
     }
 
     public static void init() {
@@ -102,7 +102,7 @@ public final class ClientProxyPublisher {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> INSTANCE.onClientLogout());
         HudRenderCallback.EVENT.register(INSTANCE::onRenderGui);
         ClientTickEvents.END_CLIENT_TICK.register(INSTANCE::onClientTick);
-        LOGGER.info("zstdproxy client runtime initialized");
+        LOGGER.info("zstdnet client runtime initialized");
     }
 
     public static void onJoinMultiplayerInit(JoinMultiplayerScreen screen) {
@@ -473,13 +473,13 @@ public final class ClientProxyPublisher {
     private boolean connect(Screen parent, ServerData serverData) {
         String remoteAddr = normalizeAddress(serverData.ip);
         if (remoteAddr.isEmpty() || !ServerAddress.isValidAddress(remoteAddr)) {
-            LOGGER.warn("zstdproxy: invalid remote address {}", serverData.ip);
+            LOGGER.warn("zstdnet: invalid remote address {}", serverData.ip);
             return false;
         }
 
         RemoteTarget remote = resolveRemoteTarget(remoteAddr);
         if (remote == null) {
-            LOGGER.warn("zstdproxy: failed to resolve remote target {}", remoteAddr);
+            LOGGER.warn("zstdnet: failed to resolve remote target {}", remoteAddr);
             return false;
         }
         LocalZstdNet.ProxyHandle proxy;
@@ -501,13 +501,13 @@ public final class ClientProxyPublisher {
                 activeProxy = proxy;
             }
         } catch (IOException e) {
-            LOGGER.error("zstdproxy: failed to start local proxy for {}", remoteAddr, e);
+            LOGGER.error("zstdnet: failed to start local proxy for {}", remoteAddr, e);
             return false;
         }
 
         serverData.ip = remoteAddr;
         String localAddr = "127.0.0.1:" + proxy.localPort();
-        LOGGER.info("zstdproxy: {} -> {} via local {}", safe(serverData.name), remoteAddr, localAddr);
+        LOGGER.info("zstdnet: {} -> {} via local {}", safe(serverData.name), remoteAddr, localAddr);
         ConnectScreen.startConnecting(parent, Minecraft.getInstance(), ServerAddress.parseString(localAddr), serverData, false);
         return true;
     }
@@ -634,7 +634,7 @@ public final class ClientProxyPublisher {
         try {
             ServerProxyConfigFile.writeListenPort(port);
         } catch (IOException e) {
-            LOGGER.error("zstdproxy: failed to update zstd listen port {}", port, e);
+            LOGGER.error("zstdnet: failed to update zstd listen port {}", port, e);
             sendClientMessage(Component.translatable("zstdnet.command.port.write_failed"));
             return 0;
         }
@@ -652,7 +652,7 @@ public final class ClientProxyPublisher {
         try {
             ServerProxyConfigFile.writeTargetPort(port);
         } catch (IOException e) {
-            LOGGER.error("zstdproxy: failed to update game target port {}", port, e);
+            LOGGER.error("zstdnet: failed to update game target port {}", port, e);
             sendClientMessage(Component.translatable("zstdnet.command.port.write_failed"));
             return 0;
         }
@@ -919,7 +919,7 @@ public final class ClientProxyPublisher {
         try {
             ServerProxyConfigFile.writePorts(state.zstdPort, backendPort);
         } catch (IOException e) {
-            LOGGER.error("zstdproxy: failed to write LAN zstd port {}", state.zstdPort, e);
+            LOGGER.error("zstdnet: failed to write LAN zstd port {}", state.zstdPort, e);
             sendClientMessage(Component.translatable("zstdnet.share_to_lan.write_failed"));
             return false;
         }

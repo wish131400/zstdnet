@@ -7,9 +7,8 @@ modId="${mod_id}"
 version="${mod_version}"
 displayName="${mod_name}"
 description='''
-NeoForge 1.20.1 source-maintainable Zstd proxy mod.
-Automatically loads servers.zstd.json and publishes local loopback entries.
-Also supports dedicated-server zstd forwarding via config/zstdnet-server.properties.
+NeoForge 1.20.1 source-maintainable zstdnet mod.
+ZstdNet is a Minecraft Java Edition mod that uses ZSTD to compress relayed traffic between clients and servers, with the goal of significantly reducing public bandwidth usage in high-repetition data scenarios.
 '''
 
 [[dependencies.${mod_id}]]
