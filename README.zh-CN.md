@@ -42,39 +42,43 @@ Raw: 189.07 GB (4.8MB/s) | Zstd: 10.28 GB (303.7KB/s) | Ratio: 5.44% | Conns: 8
 
 ## 普通玩家怎么连接
 
-如果服主已经配置好了 ZstdNet，那么玩家加入时直接填写 **Zstd 入口地址**，而不是原版游戏端口。
+如果服主使用默认推荐的 `auto_takeover=true`，那么玩家通常继续填写服主原来公开的那个地址和端口即可，不需要额外学习一套新端口。
 
 例如：
 
 ```text
-play.example.com:35565
-1.2.3.4:35565
+play.example.com:25565
+1.2.3.4:25565
 ```
 
-如果服主的配置是：
+也就是说在默认自动接管模式下：
+
+- 玩家继续连接 `server.properties` 里的公网端口
+- ZstdNet 会自动接管这个端口
+- 后端 Minecraft 会被自动挪到另一个本地端口
+
+只有当服主手动关闭 `auto_takeover`，改成手动模式时，玩家才需要连接 `listen` 里单独配置的 Zstd 端口，比如：
 
 ```properties
+auto_takeover=false
 listen=0.0.0.0:35565
 target=127.0.0.1:25565
 ```
-
-那么玩家应该连接 **35565**，不要连接 **25565**。
 
 ## 必要准备
 
 在专用服上使用内置 ZstdNet 服务端入口之前，请先确认后端 Minecraft 服务器已经正确配置。
 
-在服务器的 `server.properties` 中设置：
+在服务器的 `server.properties` 中至少设置：
 
 ```properties
 online-mode=false
-network-compression-threshold=1048576
 ```
 
 - `online-mode=false`：关闭后端服务器的原版正版验证
-- `network-compression-threshold=1048576`：基本关闭原版网络压缩，让 ZstdNet 接管压缩
+- `network-compression-threshold=1048576`：专用服启用内置 ZstdNet 服务端入口后，模组会在启动时自动接管这一项，通常不需要再手动填写
 
-如果后端服务器继续启用原版验证或原版网络压缩，连接可能失败，或者压缩收益会明显低于预期。
+如果后端服务器继续启用原版验证，连接可能失败；如果原版网络压缩没有被 ZstdNet 接管，压缩收益也会明显低于预期。
 
 如果你仍然希望保留正版校验能力，可以额外搭配 [TrueUUID（正版离线共存）](https://www.mcmod.cn/class/21953.html)。
 
@@ -96,21 +100,22 @@ config/zstdnet-server.properties
 
 ```properties
 enabled=true
-listen=0.0.0.0:35565
-target=127.0.0.1:25565
+auto_takeover=true
 ```
 
 含义：
 
-- `listen`：ZstdNet 对外提供的压缩入口
-- `target`：后端 Minecraft 或代理实际监听的端口
+- `auto_takeover=true`：启动时读取 `server.properties` 里的 `server-port`，直接把它接管成公网入口
+- `listen` / `target`：自动模式下由 ZstdNet 在运行时内部解析，通常不需要手填
 
 也就是说：
 
-- 玩家连接 `listen`
-- ZstdNet 解压/压缩后再把流量转发给 `target`
+- 玩家继续连接原来的公网端口
+- ZstdNet 会在内部自动接管并转发到后端端口
 
 如果你前面还有 FRP、HAProxy、内网穿透或其他转发层，请确保公网入口最终转发到 `listen`，不要直接转发到原版游戏端口，否则会绕过 zstd。
+
+默认推荐直接使用 `auto_takeover=true`。这样模组会在启动时读取 `server.properties` 里的 `server-port`，把它作为公网入口 `listen`，再自动把后端 Minecraft 挪到另一个本地空闲端口 `target`，服主通常不需要再手动填写端口。
 
 ## FRP 典型链路
 
@@ -123,15 +128,16 @@ target=127.0.0.1:25565
 例如：
 
 - 游戏端口：`25565`
-- ZstdNet 端口：`35565`
-- FRP 公网端口：`35565`
+- 公网入口：`25565`
+- 后端游戏端口：`25566`（如果空闲会自动分配）
+- FRP 公网端口：`25565`
 
 那么推荐这样配置：
 
-- 在 `zstdnet-server.properties` 中把 `listen` 设为 `0.0.0.0:35565`
-- 把 `target` 设为 `127.0.0.1:25565`
-- 在 `frpc.toml` 中把公网端口转发到主机的 `35565`
-- 玩家最终连接公网 `35565`
+- 在 `zstdnet-server.properties` 中保持 `auto_takeover=true`
+- 公网入口最终转发到当前 `listen`
+- 后端 `target` 由 ZstdNet 在启动时自动分配
+- 玩家最终继续连接原来的公网端口
 
 ## 单机 / 局域网开房
 
@@ -152,6 +158,7 @@ config/zstdnet-server.properties
 ```
 
 并支持热重载。
+和专用服不同，这个场景下配置文件通常会直接写出当前的 `listen` / `target`，方便房主查看正在使用的 zstd 端口和本地游戏端口。
 
 如果朋友要从外网加入，请把下面这个地址发给对方：
 
@@ -216,7 +223,7 @@ mc.example.com:35565
 
 优先检查这些问题：
 
-1. 玩家填写的是不是 `Zstd 端口`，而不是原版游戏端口。
+1. 如果 `auto_takeover=true`，玩家继续填写原来 `server.properties` 里的公网端口即可；如果 `auto_takeover=false`，再确认玩家填写的是不是配置里的 `listen` 端口。
 2. FRP 或其他隧道是不是转发到了 `listen` 端口。
 3. `config/zstdnet-server.properties` 里的 `enabled=true` 是否已设置。
 4. `listen` 和 `target` 是否写反。
@@ -241,88 +248,48 @@ mc.example.com:35565
 - 客户端：`config/zstdnet-client.toml`
 - 服务端：`config/zstdnet-server.properties`
 
-### 服务端配置文件 `zstdnet-server.properties` 内容
-
-```properties
-# ------------------------------------------------------------
-# zstdnet 内置服务端配置（自动生成）
-# ------------------------------------------------------------
-# 1) 先确认 listen / target，再把 enabled 改为 true。
-# 2) listen 与 target 不能是同一个端点。
-# 3) 地址不要写成 127.0.0.1.（末尾带点会解析失败）。
-
-# 是否启用内置 zstd 代理。
-enabled=true
-
-# zstd 公网监听入口。
-listen=0.0.0.0:35565
-
-# 后端 Minecraft
-target=127.0.0.1:25565
-
-# zstd 压缩等级（1-22，通常建议 3-9）。
-level=9
-
-# 单个 IP 最大并发连接数（<=0 表示关闭限制）。
-max_conn_per_ip=20
-
-# 单个 IP 在 request_window 内最大请求次数（<=0 表示关闭限制）。
-max_req_per_window=30
-
-# 请求计数时间窗口。
-request_window=10s
-
-# 超限后的封禁时长。
-ban_duration=30m
-
-# 统计日志输出间隔。
-stats_interval=1s
-
-# zstd flush 间隔，0ms 表示每次写入都 flush。
-flush_interval=2ms
-
-# 后端读取的空闲超时时间，0 表示禁用。
-idle_timeout=0
-
-# 单连接限速（字节/秒，0 表示关闭）。
-max_rate_per_conn_bps=0
-
-# 全局总限速（字节/秒，0 表示关闭）。
-max_rate_global_bps=0
-
-# 令牌桶突发容量（字节）。
-burst_bytes=262144
-```
-
 **配置项说明：**
 
 - `enabled`：是否开启 ZstdNet 服务（默认：true）
   - 设为 true 才能使用 Zstd 压缩功能
 
-- `listen`：Zstd 压缩入口的地址和端口（默认：0.0.0.0:35565）
-  - 玩家连接游戏时用的就是这个地址和端口
+- `auto_takeover`：是否自动读取 `server.properties` 里的 `server-port` 并接管为公网入口（默认：true）
+  - 开启后，专用服通常不需要再手动填写 `listen` / `target`
+  - ZstdNet 会在启动时自动把后端 Minecraft 挪到另一个本地空闲端口
+
+- 专用服自动模式：配置文件通常不会固定写出 `listen` / `target`
+  - `listen` 会在启动时解析成当前公网入口
+  - `target` 会在启动时解析成自动分配的本地后端端口
+  - 不要把运行中的 `target` 直接暴露到公网
+
+- `listen`：手动模式下的 Zstd 压缩入口地址和端口
+  - 当 `auto_takeover=false` 时，玩家连接游戏时用的就是这个地址和端口
   - 0.0.0.0 表示允许所有IP访问
 
-- `target`：后端 Minecraft 服务器的地址和端口（默认：127.0.0.1:25565）
+- `target`：手动模式下后端 Minecraft 服务器的地址和端口
   - ZstdNet 会把压缩后的流量转发到这个地址
   - 127.0.0.1 表示本地服务器
+
+- 单机 / 局域网开房：配置文件通常会直接保留 `listen` / `target`
+  - 这是为了让房主直接看到当前分享出去的 zstd 端口和本地游戏端口
+  - 通过 `/zstdport` 修改后，这两个值也会随之更新
 
 - `level`：压缩强度（1-22，建议 3-9，默认：9）
   - 数字越大，压缩效果越好，但会占用更多 CPU
   - 一般设置 3-5 就足够了，平衡性能和压缩效果
 
-- `max_conn_per_ip`：每个 IP 最多能同时连接的数量（默认：20）
+- `max_conn_per_ip`：每个 IP 最多能同时连接的数量（默认：9999）
   - 设为 0 或负数表示不限制
   - 防止单个 IP 占用过多连接
 
-- `max_req_per_window`：每个 IP 在一定时间内最多能发起的请求次数（默认：30）
+- `max_req_per_window`：每个 IP 在一定时间内最多能发起的请求次数（默认：50）
   - 设为 0 或负数表示不限制
   - 防止恶意刷请求
 
 - `request_window`：请求计数的时间范围（默认：10s）
-  - 配合 max_req_per_window 使用，比如 10s 内最多 30 次请求
+  - 配合 max_req_per_window 使用，比如 10s 内最多 50 次请求
 
-- `ban_duration`：超过限制后封禁的时间（默认：30m）
+- `ban_duration`：超过限制后封禁的时间（默认：1m）
   - 防止恶意攻击，被封禁的 IP 暂时无法连接
 
 - `stats_interval`：服务器日志显示流量统计的间隔（默认：1s）

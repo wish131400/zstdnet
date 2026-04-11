@@ -5,6 +5,8 @@
   "zstdnet.share_to_lan.port_invalid": "Zstd 端口必须在 1024 到 65535 之间",
   "zstdnet.share_to_lan.port_unavailable": "Zstd 端口已被占用",
   "zstdnet.share_to_lan.write_failed": "开启局域网前写入 zstdnet-server.properties 失败。",
+  "zstdnet.singleplayer.lan_hint": "在启动局域网服务器时，请设置好你要开放的 Zstd（公网端口）和游戏端口（随机的也行）即可。",
+  "zstdnet.singleplayer.lan_command_hint": "如果使用高级联机 Mod 无法显示 Zstd 的 UI，可以使用指令 /zstdport game <端口> 和 /zstdport zstd <端口> 设置端口。",
   "zstdnet.command.hud.status": "ZstdNet HUD 当前为 %s。使用 /zstdhud on|off|toggle 切换",
   "zstdnet.command.hud.enabled": "ZstdNet HUD 已启用。",
   "zstdnet.command.hud.disabled": "ZstdNet HUD 已关闭。",
@@ -23,6 +25,8 @@
   "zstdnet.command.port.status": "当前 Zstd 端口为 %s，游戏端口为 %s。",
   "zstdnet.command.port.no_permission": "只有拥有管理员权限的本地房主才能修改 ZstdNet 端口。",
   "zstdnet.command.port.zstd_set": "已将 Zstd 端口设置为 %s。",
+  "zstdnet.command.port.zstd_reloaded": "Zstd 已重载端口：%s。",
   "zstdnet.command.port.game_set": "已将游戏端口设置为 %s。",
+  "zstdnet.command.port.game_set_reopen": "已将游戏端口设置为 %s。当前世界已开放局域网，需要重新开放局域网后才会完全生效。",
   "zstdnet.command.port.write_failed": "写入 zstdnet-server.properties 失败。"
 }

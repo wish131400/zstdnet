@@ -88,6 +88,7 @@ public final class ClientProxyPublisher {
     private LocalZstdNet.ProxyHandle activeProxy;
     private LocalZstdNet.ProxyHandle activeSession;
     private boolean hudVisible;
+    private boolean singleplayerLanHintShown;
     private Object lastListEntry;
     private long lastListClickTime;
     private Screen lastObservedScreen;
@@ -184,6 +185,19 @@ public final class ClientProxyPublisher {
             releaseActiveProxyListener();
         }
         lastObservedScreen = currentScreen;
+
+        boolean inSingleplayerWorld = minecraft.player != null && minecraft.getSingleplayerServer() != null;
+        if (!inSingleplayerWorld) {
+            singleplayerLanHintShown = false;
+            return;
+        }
+        if (singleplayerLanHintShown) {
+            return;
+        }
+
+        sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_hint"));
+        sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_command_hint"));
+        singleplayerLanHintShown = true;
     }
 
     private void onClientLogin() {
@@ -638,7 +652,10 @@ public final class ClientProxyPublisher {
             sendClientMessage(Component.translatable("zstdnet.command.port.write_failed"));
             return 0;
         }
-        sendClientMessage(Component.translatable("zstdnet.command.port.zstd_set", port));
+        sendClientMessage(Component.translatable(
+            isLanPublished() ? "zstdnet.command.port.zstd_reloaded" : "zstdnet.command.port.zstd_set",
+            port
+        ));
         return 1;
     }
 
@@ -656,7 +673,10 @@ public final class ClientProxyPublisher {
             sendClientMessage(Component.translatable("zstdnet.command.port.write_failed"));
             return 0;
         }
-        sendClientMessage(Component.translatable("zstdnet.command.port.game_set", port));
+        sendClientMessage(Component.translatable(
+            isLanPublished() ? "zstdnet.command.port.game_set_reopen" : "zstdnet.command.port.game_set",
+            port
+        ));
         return 1;
     }
 
@@ -665,6 +685,11 @@ public final class ClientProxyPublisher {
         return minecraft.player != null
             && minecraft.getSingleplayerServer() != null
             && minecraft.player.hasPermissions(2);
+    }
+
+    private boolean isLanPublished() {
+        Minecraft minecraft = Minecraft.getInstance();
+        return minecraft.getSingleplayerServer() != null && minecraft.getSingleplayerServer().isPublished();
     }
 
     private ServerData resolveDirectJoinServer(String remoteAddr) {
