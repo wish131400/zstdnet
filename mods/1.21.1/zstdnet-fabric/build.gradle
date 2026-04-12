@@ -1,0 +1,87 @@
+buildscript {
+    repositories {
+        maven {
+            url = 'https://maven.fabricmc.net/'
+        }
+        mavenCentral()
+        gradlePluginPortal()
+    }
+    dependencies {
+        classpath 'net.fabricmc:fabric-loom:1.7.4'
+    }
+}
+
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+}
+
+apply plugin: 'fabric-loom'
+
+version = mod_version
+group = mod_group_id
+
+def externalBuildRoot = new File(projectDir, '../../../../zstdnet-build').canonicalFile
+def externalProjectBuildDir = new File(externalBuildRoot, "mods/${minecraft_version}/zstdnet-fabric").canonicalFile
+
+layout.buildDirectory.set(externalProjectBuildDir)
+
+base {
+    archivesName = "zstdnet-${minecraft_version}-fabric"
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+    withSourcesJar()
+}
+
+repositories {
+    maven {
+        url = 'https://maven.fabricmc.net/'
+    }
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
+
+    implementation 'com.github.luben:zstd-jni:1.5.7-7'
+    include 'com.github.luben:zstd-jni:1.5.7-7'
+}
+
+loom {
+    runs {
+        client {
+            client()
+            runDir = "../../../../zstdnet-build/mods/${minecraft_version}/zstdnet-fabric/run"
+        }
+        server {
+            server()
+            runDir = "../../../../zstdnet-build/mods/${minecraft_version}/zstdnet-fabric/run"
+            programArgs '--nogui'
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+processResources {
+    def replaceProperties = [
+        mod_id           : mod_id,
+        mod_name         : mod_name,
+        mod_version      : mod_version,
+        minecraft_version: minecraft_version,
+        loader_version   : loader_version
+    ]
+    inputs.properties(replaceProperties)
+
+    filesMatching(['fabric.mod.json', 'pack.mcmeta']) {
+        expand replaceProperties
+    }
+}

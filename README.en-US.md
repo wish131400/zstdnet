@@ -36,6 +36,8 @@ Raw: 189.07 GB (4.8MB/s) | Zstd: 10.28 GB (303.7KB/s) | Ratio: 5.44% | Conns: 8
 
 It is recommended to install this mod on both the client and the server.
 
+- Current versions supported in this repository:
+  Forge 1.20.1, NeoForge 1.20.1, NeoForge 1.21.1, Fabric 1.20.1, Fabric 1.21.1
 - When connecting to a remote ZstdNet-enabled server: the client needs it
 - When using the built-in Zstd server entry: the server needs it
 - When opening a LAN world and sharing a Zstd entry externally: the host client needs it

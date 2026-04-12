@@ -6,6 +6,14 @@
 
 ## 省流版
 
+### 当前支持版本
+
+- Forge 1.20.1
+- NeoForge 1.20.1
+- NeoForge 1.21.1
+- Fabric 1.20.1
+- Fabric 1.21.1
+
 ### 客户端联机配置
 
 安装好mod后，在启动局域网服务器时，请设置好你要开放的zstd（公网端口）和游戏端口（随机的也行）即可，如果使用高级联机mod无法显示zstd的ui，可以使用指令/zstdport game xxxxx /zstdport zstd xxxxx设置端口

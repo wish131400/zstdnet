@@ -279,6 +279,15 @@ $targets = @(
         publicPort = 25595
         gradleBat = $gradleHome
         javaHome = 'C:\Program Files\Java\jdk-17'
+    },
+    @{
+        name = 'fabric-1.21.1'
+        projectDir = Join-Path $repoRoot 'mods\1.21.1\zstdnet-fabric'
+        projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-fabric-1.21.1-startup-check'
+        runDir = Join-Path $buildRoot 'mods\1.21.1\zstdnet-fabric\run'
+        publicPort = 25605
+        gradleBat = $gradleHome
+        javaHome = 'C:\Program Files\Java\jdk-21'
     }
 )
 

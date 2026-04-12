@@ -27,6 +27,9 @@ function Invoke-GradleBuild {
         if ($LASTEXITCODE -ne 0) {
             throw "Build failed for $($Target.name)"
         }
+        if ($Target.ContainsKey('jarSyncSource') -and $Target.ContainsKey('jarSyncTarget')) {
+            Copy-Item -LiteralPath $Target.jarSyncSource -Destination $Target.jarSyncTarget -Force
+        }
     } finally {
         Pop-Location
     }
@@ -58,12 +61,24 @@ $targets = @(
         projectDir = Join-Path $repoRoot 'mods\1.21.1\zstdnet-neoforge'
         projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-neoforge-1.21.1-regression'
         javaHome = 'C:\Program Files\Java\jdk-21'
+        jarSyncSource = Join-Path $buildRoot 'mods\1.21.1\zstdnet-neoforge\libs\zstdnet-1.21.1-neoforge-1.3.6.jar'
+        jarSyncTarget = Join-Path $buildRoot 'mods\1.21.1\zstdnet-neoforge\libs\zstdnet-1.21.1-neoforge-1.3.6-all.jar'
     },
     @{
         name = 'fabric-1.20.1'
         projectDir = Join-Path $repoRoot 'mods\1.20.1\zstdnet-fabric'
         projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-fabric-1.20.1-regression'
         javaHome = 'C:\Program Files\Java\jdk-17'
+        jarSyncSource = Join-Path $buildRoot 'mods\1.20.1\zstdnet-fabric\libs\zstdnet-1.20.1-fabric-1.3.6.jar'
+        jarSyncTarget = Join-Path $buildRoot 'mods\1.20.1\zstdnet-fabric\libs\zstdnet-1.20.1-fabric-1.3.6-all.jar'
+    },
+    @{
+        name = 'fabric-1.21.1'
+        projectDir = Join-Path $repoRoot 'mods\1.21.1\zstdnet-fabric'
+        projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-fabric-1.21.1-regression'
+        javaHome = 'C:\Program Files\Java\jdk-21'
+        jarSyncSource = Join-Path $buildRoot 'mods\1.21.1\zstdnet-fabric\libs\zstdnet-1.21.1-fabric-1.3.6.jar'
+        jarSyncTarget = Join-Path $buildRoot 'mods\1.21.1\zstdnet-fabric\libs\zstdnet-1.21.1-fabric-1.3.6-all.jar'
     }
 )
 

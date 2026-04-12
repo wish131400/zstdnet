@@ -1,0 +1,1788 @@
+/*
+ * Copyright (c) 2026 wish
+ *
+ * This file is part of ZstdNet.
+ *
+ * ZstdNet is free software: you can redistribute it and/or modify
+ * it under the terms of the MIT License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * ZstdNet is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * MIT License for more details.
+ *
+ * You should have received a copy of the MIT License
+ * along with ZstdNet. If not, see <https://opensource.org/licenses/MIT>.
+ */
+
+package cn.tohsaka.factory.zstdnet.server;
+
+import com.github.luben.zstd.ZstdInputStream;
+import com.github.luben.zstd.ZstdOutputStream;
+import com.mojang.logging.LogUtils;
+import org.slf4j.Logger;
+
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PushbackInputStream;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketAddress;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * 内置服务端代理运行时模块。
+ * <p>
+ * 负责：
+ * 1) 读取/生成配置并监听入口端口；
+ * 2) 双向转发（客户端->后端解压，后端->客户端压缩）；
+ * 3) 限流、防刷与连接统计；
+ * 4) 管理线程池与生命周期启停。
+ */
+final class ServerProxyRuntime {
+    static final String ZSTD_ADDRESS_HINT = "当前服务器启用了 ZSTD 连接，请联系服务器管理员获取正确的连接地址。";
+
+    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final byte[] PROXY_V2_SIGNATURE = new byte[]{
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a
+    };
+    private static final int DEFAULT_MINECRAFT_PORT = 25565;
+    private static final int DEFAULT_LISTEN_PORT = 35565;
+    private static final int DEFAULT_ZSTD_LEVEL = 9;
+    private static final int DEFAULT_MAX_CONN_PER_IP = 9999;
+    private static final int DEFAULT_MAX_REQ_PER_WINDOW = 50;
+    private static final int DEFAULT_BURST_BYTES = 256 * 1024;
+    private static final Duration DEFAULT_BAN_DURATION = Duration.ofMinutes(1);
+    private static final Duration DEFAULT_IDLE_TIMEOUT = Duration.ZERO;
+    private static final int CLIENT_PEEK_BUFFER = 4096;
+    private static final int MAX_HANDSHAKE_PACKET_SIZE = 2048;
+
+    private final Object lifecycleLock = new Object();
+
+    private volatile boolean running;
+    private ServerSocket listener;
+    private Thread acceptThread;
+    private ExecutorService workers;
+    private ScheduledExecutorService statsTicker;
+    private FloodGuard guard;
+    private TrafficStats stats;
+    private ProxyConfig cfg;
+    private TokenBucketLimiter globalLimiter;
+    private RuntimeMode runtimeMode;
+    private volatile HudSnapshot latestHudSnapshot;
+    private volatile long loadedConfigLastModified = Long.MIN_VALUE;
+
+    /**
+     * 启动运行时。
+     */
+    void start(int mcServerPort) {
+        start(mcServerPort, RuntimeMode.DEDICATED);
+    }
+
+    void startLan(int lanPort) {
+        start(lanPort, RuntimeMode.LAN);
+    }
+
+    private void start(int mcServerPort, RuntimeMode mode) {
+        synchronized (lifecycleLock) {
+            if (running) {
+                return;
+            }
+
+            Path configPath = ServerProxyConfigFile.path();
+            ProxyConfig loaded = loadOrCreateConfig(configPath, mcServerPort, mode);
+            if (loaded == null) {
+                return;
+            }
+            if (!loaded.enabled) {
+                LOGGER.warn("[zstdnet-server] config exists but enabled=false, skip start. File: {}", configPath);
+                LOGGER.warn("[zstdnet-server] set enabled=true after checking listen/target.");
+                return;
+            }
+
+            if (mode == RuntimeMode.DEDICATED && loaded.autoTakeover) {
+                DedicatedServerAutoPort.AutoPortPlan plan = DedicatedServerAutoPort.activePlan();
+                if (plan == null) {
+                    LOGGER.error("[zstdnet-server] auto_takeover=true but no dedicated auto-port plan was prepared. Restart the server and check mixin logs.");
+                    return;
+                }
+                loaded = loaded.withEndpoints(
+                    new HostPort(plan.listenHost(), plan.listenPort()),
+                    new HostPort(plan.targetHost(), plan.targetPort())
+                );
+            }
+
+            if (mode == RuntimeMode.LAN) {
+                loaded = loaded.withTarget(new HostPort("127.0.0.1", mcServerPort));
+            }
+
+            try {
+                listener = new ServerSocket();
+                listener.bind(loaded.listen.toAddress());
+            } catch (IOException e) {
+                LOGGER.error("[zstdnet-server] bind failed on {}: {}", loaded.listen, e.toString());
+                closeQuietly(listener);
+                listener = null;
+                return;
+            }
+
+            this.cfg = loaded;
+            this.stats = new TrafficStats();
+            this.guard = new FloodGuard(loaded);
+            this.workers = Executors.newCachedThreadPool(new NamedFactory("zstdsrv-worker"));
+            this.statsTicker = Executors.newSingleThreadScheduledExecutor(new NamedFactory("zstdsrv-stats"));
+            this.globalLimiter = TokenBucketLimiter.create(loaded.maxRateGlobalBps, loaded.burstBytes);
+            this.runtimeMode = mode;
+            this.latestHudSnapshot = new HudSnapshot(mode, loaded.listen.host, loaded.listen.port, 0L, 0L, 0L, 0L, 0.0D, 0);
+            this.running = true;
+
+            startStatsPrinter();
+            acceptThread = new Thread(this::acceptLoop, "zstdsrv-accept");
+            acceptThread.setDaemon(true);
+            acceptThread.start();
+
+            LOGGER.info("[zstdnet-server] started: mode={} listen={} target={}", mode.name().toLowerCase(Locale.ROOT), loaded.listen, loaded.target);
+            if (mode == RuntimeMode.LAN) {
+                LOGGER.info("[zstdnet-server] LAN host detected. Point your tunnel to {} instead of the raw LAN port {}.", loaded.listen, mcServerPort);
+            }
+            LOGGER.info("[zstdnet-server] guard: max_conn={} max_req={} window={} ban={}",
+                loaded.maxConnPerIp, loaded.maxReqPerWindow, loaded.window, loaded.banDuration);
+            LOGGER.info("[zstdnet-server] tuning: flush={} idle_timeout={} rate_per_conn={}B/s rate_global={}B/s burst={}B",
+                loaded.flushInterval, loaded.idleTimeout, loaded.maxRatePerConnBps, loaded.maxRateGlobalBps, loaded.burstBytes);
+            if (loaded.autoTakeover && mode == RuntimeMode.DEDICATED) {
+                LOGGER.info("[zstdnet-server] auto takeover active: public_entry={} backend={}", loaded.listen, loaded.target);
+            }
+            LOGGER.info("[zstdnet-server] raw vanilla login passthrough: disabled");
+        }
+    }
+
+    /**
+     * 停止运行时并回收资源。
+     */
+    void stop() {
+        synchronized (lifecycleLock) {
+            if (!running) {
+                return;
+            }
+            running = false;
+            closeQuietly(listener);
+            listener = null;
+            if (acceptThread != null) {
+                try {
+                    acceptThread.join(1000);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            acceptThread = null;
+            shutdownQuietly(statsTicker);
+            shutdownQuietly(workers);
+            statsTicker = null;
+            workers = null;
+            guard = null;
+            stats = null;
+            cfg = null;
+            globalLimiter = null;
+            runtimeMode = null;
+            latestHudSnapshot = null;
+            LOGGER.info("[zstdnet-server] stopped");
+        }
+    }
+
+    /**
+     * 接收入口连接并交给工作线程处理。
+     */
+    boolean isRunning() {
+        return running;
+    }
+
+    boolean protectsBackendLogin() {
+        return running && runtimeMode == RuntimeMode.DEDICATED;
+    }
+
+    boolean isLanMode() {
+        return running && runtimeMode == RuntimeMode.LAN;
+    }
+
+    HudSnapshot hudSnapshot() {
+        return latestHudSnapshot;
+    }
+
+    boolean configChangedOnDisk() {
+        Path path = ServerProxyConfigFile.path();
+        long current = readLastModified(path);
+        return current > 0L && current != loadedConfigLastModified;
+    }
+
+    private void acceptLoop() {
+        while (running) {
+            try {
+                Socket client = listener.accept();
+                workers.execute(() -> handleClient(client));
+            } catch (IOException e) {
+                if (running) {
+                    LOGGER.warn("[zstdnet-server] accept error: {}", e.toString());
+                }
+            } catch (Exception e) {
+                if (running) {
+                    LOGGER.warn("[zstdnet-server] accept unexpected error: {}", e.toString());
+                }
+            }
+        }
+    }
+
+    /**
+     * 处理单个客户端连接，建立到后端连接后执行双向转发。
+     */
+    private void handleClient(Socket client) {
+        stats.addConn(1);
+        String remoteIp = sourceIp(client.getRemoteSocketAddress());
+        String sourceIp = remoteIp;
+
+        try (Socket clientSocket = client) {
+            PushbackInputStream pushIn = new PushbackInputStream(clientSocket.getInputStream(), CLIENT_PEEK_BUFFER);
+            ProxyInfo proxyInfo = parseProxyProtocolV2(pushIn);
+            if (proxyInfo.valid && proxyInfo.sourceIp != null && !proxyInfo.sourceIp.isBlank()) {
+                sourceIp = proxyInfo.sourceIp;
+            }
+
+            if (!guard.begin(sourceIp)) {
+                LOGGER.warn("[server] blocked {} by flood guard", sourceIp);
+                return;
+            }
+
+            DetectedClientMode clientMode = detectClientMode(pushIn);
+            if (clientMode.mode == ClientMode.RAW_LOGIN) {
+                LOGGER.warn("[server] rejected raw login attempt from {} on zstd-only entry", sourceIp);
+                sendLoginDisconnect(
+                    clientSocket,
+                    """
+                    当前服务器启用了 ZSTD 连接，请联系服务器管理员获取正确的连接方式。
+                    """
+                );
+                return;
+            }
+
+            try (Socket upstream = new Socket()) {
+                try {
+                    upstream.connect(cfg.target.toAddress(), 5000);
+                } catch (IOException dialErr) {
+                    LOGGER.warn("[server] Remote {} Connect Error: {}", clientSocket.getRemoteSocketAddress(), dialErr.getMessage());
+                    return;
+                }
+
+                upstream.setTcpNoDelay(true);
+                clientSocket.setTcpNoDelay(true);
+                // Client->server play traffic can legitimately stay idle for a while.
+                // Applying SO_TIMEOUT there causes false disconnects in LAN/Forge sessions.
+                applyReadTimeout(upstream, cfg.idleTimeout);
+                TokenBucketLimiter perConnLimiter = TokenBucketLimiter.create(cfg.maxRatePerConnBps, cfg.burstBytes);
+
+                if (clientMode.mode == ClientMode.RAW_STATUS) {
+                    forwardRawPassthrough(clientSocket, pushIn, upstream, clientMode.initialWireData, stats);
+                    return;
+                }
+
+                Future<Exception> c2s = workers.submit(() -> {
+                    try {
+                        forwardDecompress(upstream, pushIn, stats);
+                        return null;
+                    } catch (Exception ex) {
+                        return ex;
+                    } finally {
+                        closeWrite(upstream);
+                    }
+                });
+
+                Future<Exception> s2c = workers.submit(() -> {
+                    try {
+                        forwardCompress(clientSocket.getOutputStream(), upstream, cfg.level, cfg.flushInterval, stats, perConnLimiter, globalLimiter);
+                        return null;
+                    } catch (Exception ex) {
+                        return ex;
+                    } finally {
+                        closeWrite(clientSocket);
+                    }
+                });
+
+                Exception err1 = null;
+                Exception err2 = null;
+                while (!c2s.isDone() && !s2c.isDone()) {
+                    Thread.sleep(20L);
+                }
+
+                if (c2s.isDone()) {
+                    err1 = c2s.get();
+                }
+                if (s2c.isDone()) {
+                    err2 = s2c.get();
+                }
+
+                // One direction ended: close both sockets so the other direction exits quickly too.
+                closeSocket(clientSocket);
+                closeSocket(upstream);
+
+                if (!c2s.isDone()) {
+                    err1 = c2s.get();
+                }
+                if (!s2c.isDone()) {
+                    err2 = s2c.get();
+                }
+                if (isRealPipeErr(err1)) {
+                    LOGGER.warn("pipe error source={} dir=client->mc: {}", sourceIp, err1.toString());
+                }
+                if (isRealPipeErr(err2)) {
+                    LOGGER.warn("pipe error source={} dir=mc->client: {}", sourceIp, err2.toString());
+                }
+            } finally {
+                guard.end(sourceIp);
+            }
+        } catch (Exception ex) {
+            if (isRealPipeErr(ex)) {
+                LOGGER.warn("[server] connection error source={} remote={}: {}", sourceIp, remoteIp, ex.toString());
+            }
+        } finally {
+            stats.addConn(-1);
+        }
+    }
+
+    /**
+     * 客户端 -> 后端：zstd 解压后透传。
+     */
+    /**
+     * Detect whether the public entry is receiving a raw status ping or a zstd-wrapped play/login stream.
+     */
+    private DetectedClientMode detectClientMode(PushbackInputStream in) throws IOException {
+        byte[] firstPacketWire = tryReadPacketWire(in, 1500);
+        if (firstPacketWire == null || firstPacketWire.length == 0) {
+            return DetectedClientMode.zstd();
+        }
+
+        byte[] firstPacket = extractPacketPayload(firstPacketWire);
+        Integer nextState = extractHandshakeNextState(firstPacket);
+        if (nextState != null && nextState == 1) {
+            byte[] secondPacketWire = tryReadPacketWire(in, 1500);
+            if (secondPacketWire != null && secondPacketWire.length > 0) {
+                byte[] secondPacket = extractPacketPayload(secondPacketWire);
+                if (isStatusRequestPacket(secondPacket)) {
+                    return new DetectedClientMode(
+                        ClientMode.RAW_STATUS,
+                        concat(firstPacketWire, secondPacketWire)
+                    );
+                }
+                in.unread(secondPacketWire);
+            }
+        } else if (nextState != null && nextState == 2) {
+            byte[] secondPacketWire = tryReadPacketWire(in, 1500);
+            if (secondPacketWire != null && secondPacketWire.length > 0) {
+                byte[] secondPacket = extractPacketPayload(secondPacketWire);
+                if (isLoginStartPacket(secondPacket)) {
+                    return new DetectedClientMode(ClientMode.RAW_LOGIN, concat(firstPacketWire, secondPacketWire));
+                }
+                in.unread(secondPacketWire);
+            }
+        }
+
+        in.unread(firstPacketWire);
+        return DetectedClientMode.zstd();
+    }
+
+    private void forwardRawPassthrough(
+        Socket clientSocket,
+        InputStream clientIn,
+        Socket upstream,
+        byte[] initialWireData,
+        TrafficStats stats
+    ) throws Exception {
+        OutputStream upstreamOut = upstream.getOutputStream();
+        upstreamOut.write(initialWireData);
+        upstreamOut.flush();
+        addRawPassthroughStats(initialWireData.length, stats);
+
+        Future<?> upstreamWriter = workers.submit(() -> {
+            try {
+                streamRaw(clientIn, upstreamOut, stats);
+            } catch (Exception ignored) {
+            } finally {
+                closeWrite(upstream);
+            }
+        });
+
+        Future<?> downstreamWriter = workers.submit(() -> {
+            try {
+                streamRaw(upstream.getInputStream(), clientSocket.getOutputStream(), stats);
+            } catch (Exception ignored) {
+            } finally {
+                closeWrite(clientSocket);
+            }
+        });
+
+        upstreamWriter.get();
+        downstreamWriter.get();
+    }
+
+    /**
+     * Client -> backend: decompress zstd traffic before forwarding to Minecraft.
+     */
+    private void forwardDecompress(Socket dst, InputStream src, TrafficStats stats) throws IOException {
+        try (ZstdInputStream zstdIn = new ZstdInputStream(new CountingInputStream(src, stats::addZstd))) {
+            OutputStream dstOut = dst.getOutputStream();
+            byte[] buf = new byte[16 * 1024];
+            int n;
+            while ((n = zstdIn.read(buf)) >= 0) {
+                if (n > 0) {
+                    dstOut.write(buf, 0, n);
+                    stats.addRaw(n);
+                }
+            }
+        }
+    }
+
+    /**
+     * 后端 -> 客户端：zstd 压缩后透传，并按配置执行 flush 与限速。
+     */
+    /**
+     * Raw status traffic bypasses compression but still updates bandwidth stats as 100% ratio traffic.
+     */
+    private void streamRaw(InputStream in, OutputStream out, TrafficStats stats) throws IOException {
+        byte[] buf = new byte[16 * 1024];
+        int n;
+        while ((n = in.read(buf)) >= 0) {
+            if (n > 0) {
+                out.write(buf, 0, n);
+                addRawPassthroughStats(n, stats);
+            }
+        }
+    }
+
+    /**
+     * Backend -> client: compress outbound traffic with zstd and apply flush/rate controls.
+     */
+    private void forwardCompress(
+        OutputStream dst,
+        Socket src,
+        int level,
+        Duration flushInterval,
+        TrafficStats stats,
+        TokenBucketLimiter perConnLimiter,
+        TokenBucketLimiter globalLimiter
+    ) throws IOException {
+        OutputStream limitedDst = new RateLimitedOutputStream(dst, perConnLimiter, globalLimiter);
+        try (ZstdOutputStream zstdOut = new ZstdOutputStream(new CountingOutputStream(limitedDst, stats::addZstd), level)) {
+            zstdOut.setCloseFrameOnFlush(false);
+            InputStream srcIn = src.getInputStream();
+            byte[] buf = new byte[16 * 1024];
+            final long flushIntervalNs = Math.max(0L, flushInterval.toNanos());
+            long lastFlushNs = System.nanoTime();
+            int originalTimeout = src.getSoTimeout();
+            int activeTimeout = originalTimeout;
+            boolean hasPending = false;
+            int n;
+            try {
+                while (true) {
+                    if (flushIntervalNs > 0L) {
+                        int desiredTimeout = originalTimeout;
+                        if (hasPending) {
+                            long elapsedNs = System.nanoTime() - lastFlushNs;
+                            long remainingNs = Math.max(1L, flushIntervalNs - elapsedNs);
+                            long remainingMs = Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNs));
+                            long boundedMs = Math.min((long) Integer.MAX_VALUE, remainingMs);
+                            desiredTimeout = (int) boundedMs;
+                            if (originalTimeout > 0) {
+                                desiredTimeout = Math.min(desiredTimeout, originalTimeout);
+                            }
+                        }
+                        if (desiredTimeout != activeTimeout) {
+                            src.setSoTimeout(desiredTimeout);
+                            activeTimeout = desiredTimeout;
+                        }
+                    }
+
+                    try {
+                        n = srcIn.read(buf);
+                    } catch (SocketTimeoutException timeout) {
+                        if (flushIntervalNs > 0L && hasPending && (System.nanoTime() - lastFlushNs) >= flushIntervalNs) {
+                            zstdOut.flush();
+                            hasPending = false;
+                            lastFlushNs = System.nanoTime();
+                        }
+                        continue;
+                    }
+
+                    if (n < 0) {
+                        break;
+                    }
+                    if (n == 0) {
+                        continue;
+                    }
+
+                    stats.addRaw(n);
+                    zstdOut.write(buf, 0, n);
+                    hasPending = true;
+                    if (flushIntervalNs == 0L || (System.nanoTime() - lastFlushNs) >= flushIntervalNs) {
+                        zstdOut.flush();
+                        hasPending = false;
+                        lastFlushNs = System.nanoTime();
+                    }
+                }
+            } finally {
+                src.setSoTimeout(originalTimeout);
+            }
+
+            zstdOut.flush();
+        }
+    }
+
+    /**
+     * 解析 PROXY protocol v2（仅处理 TCP over IPv4/IPv6）。
+     */
+    private ProxyInfo parseProxyProtocolV2(PushbackInputStream in) throws IOException {
+        byte[] first = new byte[PROXY_V2_SIGNATURE.length];
+        int n = readSome(in, first);
+        if (n < 0) {
+            return ProxyInfo.invalid();
+        }
+        if (n < PROXY_V2_SIGNATURE.length) {
+            in.unread(first, 0, n);
+            return ProxyInfo.invalid();
+        }
+        if (!Arrays.equals(first, PROXY_V2_SIGNATURE)) {
+            in.unread(first);
+            return ProxyInfo.invalid();
+        }
+
+        byte[] fixed = readFully(in, 4);
+        int verCmd = fixed[0] & 0xFF;
+        int famProto = fixed[1] & 0xFF;
+        int payloadLen = ((fixed[2] & 0xFF) << 8) | (fixed[3] & 0xFF);
+        byte[] payload = readFully(in, payloadLen);
+
+        int version = (verCmd & 0xF0) >> 4;
+        int command = verCmd & 0x0F;
+        int family = (famProto & 0xF0) >> 4;
+        int protocol = famProto & 0x0F;
+
+        if (version != 0x2 || command != 0x1 || protocol != 0x1) {
+            return ProxyInfo.invalid();
+        }
+
+        if (family == 0x1 && payload.length >= 12) {
+            String srcIp = ipString(payload, 0, 4);
+            String dstIp = ipString(payload, 4, 4);
+            int srcPort = u16(payload, 8);
+            int dstPort = u16(payload, 10);
+            return new ProxyInfo(true, srcIp, srcPort, dstIp, dstPort);
+        }
+        if (family == 0x2 && payload.length >= 36) {
+            String srcIp = ipString(payload, 0, 16);
+            String dstIp = ipString(payload, 16, 16);
+            int srcPort = u16(payload, 32);
+            int dstPort = u16(payload, 34);
+            return new ProxyInfo(true, srcIp, srcPort, dstIp, dstPort);
+        }
+        return ProxyInfo.invalid();
+    }
+
+    /**
+     * 尽量读取指定缓冲区，允许短读。
+     */
+    private int readSome(InputStream in, byte[] buf) throws IOException {
+        int off = 0;
+        while (off < buf.length) {
+            int n = in.read(buf, off, buf.length - off);
+            if (n < 0) {
+                return off == 0 ? -1 : off;
+            }
+            off += n;
+            if (n == 0) {
+                break;
+            }
+        }
+        return off;
+    }
+
+    /**
+     * 按长度精确读取，长度不足抛 EOF。
+     */
+    /**
+     * Read the first raw Minecraft packet if it looks small enough to be a handshake; otherwise leave the stream untouched.
+     */
+    private byte[] tryReadPacketWire(PushbackInputStream in, int maxWaitMillis) throws IOException {
+        long deadline = System.currentTimeMillis() + Math.max(200L, maxWaitMillis);
+        byte[] prefix = new byte[5];
+        int prefixLength = 0;
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                int next = in.read();
+                if (next < 0) {
+                    if (prefixLength == 0) {
+                        return new byte[0];
+                    }
+                    throw new EOFException("unexpected eof during packet read");
+                }
+
+                if (prefixLength >= prefix.length) {
+                    throw new IOException("packet length varint too large");
+                }
+
+                prefix[prefixLength++] = (byte) next;
+                VarIntRead packetLength = readVarInt(prefix, 0, prefixLength);
+                if (packetLength == null) {
+                    continue;
+                }
+
+                if (packetLength.value <= 0 || packetLength.value > MAX_HANDSHAKE_PACKET_SIZE) {
+                    in.unread(prefix, 0, prefixLength);
+                    return null;
+                }
+
+                byte[] payload = readFully(in, packetLength.value);
+                byte[] packet = new byte[prefixLength + payload.length];
+                System.arraycopy(prefix, 0, packet, 0, prefixLength);
+                System.arraycopy(payload, 0, packet, prefixLength, payload.length);
+                return packet;
+            } catch (SocketTimeoutException ignored) {
+            }
+        }
+
+        if (prefixLength > 0) {
+            in.unread(prefix, 0, prefixLength);
+        }
+        return new byte[0];
+    }
+
+    private byte[] readFully(InputStream in, int len) throws IOException {
+        byte[] out = new byte[len];
+        int off = 0;
+        while (off < len) {
+            int n = in.read(out, off, len - off);
+            if (n < 0) {
+                throw new EOFException("unexpected EOF");
+            }
+            off += n;
+        }
+        return out;
+    }
+
+    private byte[] extractPacketPayload(byte[] packetWire) throws IOException {
+        VarIntRead packetLength = readVarInt(packetWire, 0, packetWire.length);
+        if (packetLength == null || packetLength.value < 0 || packetLength.next + packetLength.value > packetWire.length) {
+            throw new IOException("invalid packet payload");
+        }
+        return Arrays.copyOfRange(packetWire, packetLength.next, packetLength.next + packetLength.value);
+    }
+
+    private boolean isStatusRequestPacket(byte[] payload) {
+        return payload != null && payload.length == 1 && payload[0] == 0;
+    }
+
+    private boolean isLoginStartPacket(byte[] payload) {
+        if (payload == null || payload.length < 3) {
+            return false;
+        }
+
+        VarIntRead packetId = readVarInt(payload, 0, payload.length);
+        if (packetId == null || packetId.value != 0) {
+            return false;
+        }
+
+        VarIntRead nameLength = readVarInt(payload, packetId.next, payload.length);
+        if (nameLength == null || nameLength.value < 1 || nameLength.value > 16) {
+            return false;
+        }
+
+        int nameStart = nameLength.next;
+        int nameEnd = nameStart + nameLength.value;
+        if (nameEnd > payload.length) {
+            return false;
+        }
+
+        for (int i = nameStart; i < nameEnd; i++) {
+            int ch = payload[i] & 0xFF;
+            boolean valid = (ch >= '0' && ch <= '9')
+                || (ch >= 'A' && ch <= 'Z')
+                || (ch >= 'a' && ch <= 'z')
+                || ch == '_';
+            if (!valid) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private Integer extractHandshakeNextState(byte[] handshakePayload) {
+        VarIntRead packetId = readVarInt(handshakePayload, 0, handshakePayload.length);
+        if (packetId == null || packetId.value != 0) {
+            return null;
+        }
+
+        VarIntRead protocol = readVarInt(handshakePayload, packetId.next, handshakePayload.length);
+        if (protocol == null) {
+            return null;
+        }
+
+        VarIntRead hostLength = readVarInt(handshakePayload, protocol.next, handshakePayload.length);
+        if (hostLength == null || hostLength.value < 0) {
+            return null;
+        }
+
+        int afterHost = hostLength.next + hostLength.value;
+        int afterPort = afterHost + 2;
+        if (afterPort > handshakePayload.length) {
+            return null;
+        }
+
+        VarIntRead nextState = readVarInt(handshakePayload, afterPort, handshakePayload.length);
+        if (nextState == null || (nextState.value != 1 && nextState.value != 2)) {
+            return null;
+        }
+        return nextState.value;
+    }
+
+    private VarIntRead readVarInt(byte[] data, int start, int endExclusive) {
+        int value = 0;
+        int position = 0;
+        int index = start;
+
+        while (index < endExclusive) {
+            int next = data[index++] & 0xFF;
+            value |= (next & 0x7F) << position;
+            if ((next & 0x80) == 0) {
+                return new VarIntRead(value, index);
+            }
+
+            position += 7;
+            if (position > 28) {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    private void sendLoginDisconnect(Socket clientSocket, String message) {
+        if (clientSocket == null || message == null || message.isBlank()) {
+            return;
+        }
+
+        try {
+            OutputStream out = clientSocket.getOutputStream();
+            byte[] packet = buildLoginDisconnectPacket(message);
+            out.write(packet);
+            out.flush();
+        } catch (IOException e) {
+            LOGGER.debug("[server] failed to send raw-login disconnect packet: {}", e.toString());
+        }
+    }
+
+    private byte[] buildLoginDisconnectPacket(String message) throws IOException {
+        byte[] componentJson = buildTextComponentJson(message).getBytes(StandardCharsets.UTF_8);
+        byte[] packetId = writeVarInt(0);
+        byte[] componentLength = writeVarInt(componentJson.length);
+
+        byte[] payload = new byte[packetId.length + componentLength.length + componentJson.length];
+        int offset = 0;
+        System.arraycopy(packetId, 0, payload, offset, packetId.length);
+        offset += packetId.length;
+        System.arraycopy(componentLength, 0, payload, offset, componentLength.length);
+        offset += componentLength.length;
+        System.arraycopy(componentJson, 0, payload, offset, componentJson.length);
+
+        byte[] packetLength = writeVarInt(payload.length);
+        byte[] packet = new byte[packetLength.length + payload.length];
+        System.arraycopy(packetLength, 0, packet, 0, packetLength.length);
+        System.arraycopy(payload, 0, packet, packetLength.length, payload.length);
+        return packet;
+    }
+
+    private String buildTextComponentJson(String text) {
+        return "{\"text\":\"" + escapeJson(text) + "\"}";
+    }
+
+    private String escapeJson(String text) {
+        StringBuilder builder = new StringBuilder(text.length() + 16);
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            switch (ch) {
+                case '\\' -> builder.append("\\\\");
+                case '"' -> builder.append("\\\"");
+                case '\b' -> builder.append("\\b");
+                case '\f' -> builder.append("\\f");
+                case '\n' -> builder.append("\\n");
+                case '\r' -> builder.append("\\r");
+                case '\t' -> builder.append("\\t");
+                default -> {
+                    if (ch < 0x20) {
+                        builder.append(String.format(Locale.ROOT, "\\u%04x", (int) ch));
+                    } else {
+                        builder.append(ch);
+                    }
+                }
+            }
+        }
+        return builder.toString();
+    }
+
+    private byte[] writeVarInt(int value) {
+        byte[] out = new byte[5];
+        int index = 0;
+        int remaining = value;
+
+        do {
+            int next = remaining & 0x7F;
+            remaining >>>= 7;
+            if (remaining != 0) {
+                next |= 0x80;
+            }
+            out[index++] = (byte) next;
+        } while (remaining != 0);
+
+        return Arrays.copyOf(out, index);
+    }
+
+    private String ipString(byte[] data, int offset, int len) throws IOException {
+        byte[] raw = Arrays.copyOfRange(data, offset, offset + len);
+        return InetAddress.getByAddress(raw).getHostAddress();
+    }
+
+    private int u16(byte[] data, int offset) {
+        return ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
+    }
+
+    /**
+     * 定时输出流量与连接统计，同时触发防刷状态清理。
+     */
+    /**
+     * Utility helpers for packet framing and passthrough traffic accounting.
+     */
+    private void addRawPassthroughStats(int bytes, TrafficStats stats) {
+        if (stats == null || bytes <= 0) {
+            return;
+        }
+        stats.addRaw(bytes);
+        stats.addZstd(bytes);
+    }
+
+    private byte[] concat(byte[] first, byte[] second) {
+        if (first == null || first.length == 0) {
+            return second == null ? new byte[0] : second;
+        }
+        if (second == null || second.length == 0) {
+            return first;
+        }
+
+        byte[] merged = new byte[first.length + second.length];
+        System.arraycopy(first, 0, merged, 0, first.length);
+        System.arraycopy(second, 0, merged, first.length, second.length);
+        return merged;
+    }
+
+    private void startStatsPrinter() {
+        long periodMs = Math.max(250L, cfg.statsInterval.toMillis());
+        AtomicLong prevRaw = new AtomicLong();
+        AtomicLong prevZstd = new AtomicLong();
+
+        statsTicker.scheduleAtFixedRate(() -> {
+            FloodGuard currentGuard = guard;
+            if (currentGuard != null) {
+                currentGuard.sweepExpired();
+            }
+
+            long raw = stats.rawBytes.get();
+            long zstd = stats.zstdBytes.get();
+            int conns = stats.activeConn.get();
+
+            long dr = raw - prevRaw.getAndSet(raw);
+            long dz = zstd - prevZstd.getAndSet(zstd);
+            long rawPerSec = (long) (dr * (1000.0 / periodMs));
+            long zstdPerSec = (long) (dz * (1000.0 / periodMs));
+            double ratio = raw <= 0 ? 0.0 : ((double) zstd * 100.0 / (double) raw);
+            latestHudSnapshot = new HudSnapshot(runtimeMode, cfg.listen.host, cfg.listen.port, raw, zstd, rawPerSec, zstdPerSec, ratio, conns);
+
+            String now = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+            LOGGER.info("[{}] Raw: {} ({}) | Zstd: {} ({}) | Ratio: {}% | Conns: {}",
+                now,
+                formatSize(raw),
+                formatRate(rawPerSec),
+                formatSize(zstd),
+                formatRate(zstdPerSec),
+                String.format(Locale.ROOT, "%.2f", ratio),
+                conns);
+        }, periodMs, periodMs, TimeUnit.MILLISECONDS);
+    }
+
+    private String formatSize(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        }
+        String[] units = {"KB", "MB", "GB", "TB"};
+        double v = bytes / 1024.0;
+        int idx = 0;
+        while (v >= 1024.0 && idx < units.length - 1) {
+            v /= 1024.0;
+            idx++;
+        }
+        return String.format(Locale.ROOT, "%.2f %s", v, units[idx]);
+    }
+
+    private String formatRate(long bytesPerSec) {
+        if (bytesPerSec < 1024) {
+            return bytesPerSec + "B/s";
+        }
+        String[] units = {"KB/s", "MB/s", "GB/s", "TB/s"};
+        double v = bytesPerSec / 1024.0;
+        int idx = 0;
+        while (v >= 1024.0 && idx < units.length - 1) {
+            v /= 1024.0;
+            idx++;
+        }
+        return String.format(Locale.ROOT, "%.1f%s", v, units[idx]);
+    }
+
+    /**
+     * 读取配置；若配置不存在则生成模板并提示用户编辑后重启。
+     */
+    private ProxyConfig loadOrCreateConfig(Path path, int mcServerPort, RuntimeMode mode) {
+        if (!Files.exists(path)) {
+            try {
+                Files.createDirectories(path.getParent());
+                String body = buildDefaultConfig(mcServerPort, mode);
+                Files.writeString(path, body, StandardCharsets.UTF_8);
+                LOGGER.info("[zstdnet-server] generated config: {}", path);
+                LOGGER.info("[zstdnet-server] default config enables auto_takeover=true; dedicated servers will keep server.properties server-port as the public entry, reassign the backend port automatically, and reject raw vanilla login on the shared entry.");
+            } catch (IOException e) {
+                LOGGER.error("[zstdnet-server] failed to create config {}: {}", path, e.toString());
+            }
+        }
+
+        Properties props = new Properties();
+        try (InputStream in = Files.newInputStream(path)) {
+            props.load(in);
+        } catch (IOException e) {
+            LOGGER.error("[zstdnet-server] failed reading config {}: {}", path, e.toString());
+            return null;
+        }
+        loadedConfigLastModified = readLastModified(path);
+
+        boolean enabled = Boolean.parseBoolean(props.getProperty("enabled", "false").trim());
+        boolean autoTakeover = Boolean.parseBoolean(props.getProperty("auto_takeover", "false").trim());
+        HostPort listen = HostPort.parse(props.getProperty("listen", "0.0.0.0:" + DEFAULT_LISTEN_PORT));
+        HostPort target = HostPort.parse(props.getProperty(
+            "target",
+            "127.0.0.1:" + DEFAULT_MINECRAFT_PORT
+        ));
+
+        int level = clamp(parseInt(props.getProperty("level"), DEFAULT_ZSTD_LEVEL), 1, 22);
+        int maxConn = parseInt(props.getProperty("max_conn_per_ip"), DEFAULT_MAX_CONN_PER_IP);
+        int maxReq = parseInt(props.getProperty("max_req_per_window"), DEFAULT_MAX_REQ_PER_WINDOW);
+        Duration window = parseDuration(props.getProperty("request_window"), Duration.ofSeconds(10));
+        Duration ban = parseDuration(props.getProperty("ban_duration"), DEFAULT_BAN_DURATION);
+        Duration statsInterval = parseDuration(props.getProperty("stats_interval"), Duration.ofSeconds(1));
+        Duration flushInterval = parseDuration(props.getProperty("flush_interval"), Duration.ofMillis(2));
+        Duration idleTimeout = parseDuration(props.getProperty("idle_timeout"), DEFAULT_IDLE_TIMEOUT);
+        long maxRatePerConnBps = parseLong(props.getProperty("max_rate_per_conn_bps"), 0L);
+        long maxRateGlobalBps = parseLong(props.getProperty("max_rate_global_bps"), 0L);
+        int burstBytes = parseInt(props.getProperty("burst_bytes"), DEFAULT_BURST_BYTES);
+        if (statsInterval.isZero() || statsInterval.isNegative()) {
+            statsInterval = Duration.ofSeconds(1);
+        }
+        if (flushInterval.isNegative()) {
+            flushInterval = Duration.ZERO;
+        }
+        if (idleTimeout.isNegative()) {
+            idleTimeout = Duration.ZERO;
+        }
+        if (maxRatePerConnBps < 0) {
+            maxRatePerConnBps = 0L;
+        }
+        if (maxRateGlobalBps < 0) {
+            maxRateGlobalBps = 0L;
+        }
+        if (burstBytes <= 0) {
+            burstBytes = DEFAULT_BURST_BYTES;
+        }
+
+        return new ProxyConfig(
+            enabled,
+            autoTakeover,
+            listen,
+            target,
+            level,
+            maxConn,
+            maxReq,
+            window,
+            ban,
+            statsInterval,
+            flushInterval,
+            idleTimeout,
+            maxRatePerConnBps,
+            maxRateGlobalBps,
+            burstBytes
+        );
+    }
+
+    /**
+     * 生成默认配置模板文本。
+     */
+    private String buildDefaultConfig(int mcServerPort, RuntimeMode mode) {
+        if (mode == RuntimeMode.DEDICATED) {
+            return buildDedicatedDefaultConfig();
+        }
+
+        return buildLanDefaultConfig(mcServerPort);
+    }
+
+    private String buildDedicatedDefaultConfig() {
+        return """
+            # ------------------------------------------------------------
+            # zstdnet 内置服务端配置（自动生成）
+            # ------------------------------------------------------------
+            # 1) 专用服默认建议保持 auto_takeover=true。
+            # 2) auto_takeover=true 时，公网入口跟随 server.properties 里的 server-port。
+            # 3) 默认只透传原版状态查询，不透传原版登录。
+            # 4) listen / target 仅在高级手动模式下需要额外填写。
+            # 5) 地址不要写成 127.0.0.1.（末尾带点会解析失败）。
+
+            # 是否启用内置 zstd 代理。
+            enabled=true
+
+            # 是否自动接管 server.properties 里的 server-port 作为公网入口。
+            auto_takeover=true
+
+            # 如需切回手动模式，可额外填写：
+            # listen=0.0.0.0:25565
+            # target=127.0.0.1:25566
+
+            # zstd 压缩等级（1-22，通常建议 3-9）。
+            level=${LEVEL}
+
+            # 单个 IP 最大并发连接数（<=0 表示关闭限制）。
+            max_conn_per_ip=${MAX_CONN}
+
+            # 单个 IP 在 request_window 内最大请求次数（<=0 表示关闭限制）。
+            max_req_per_window=${MAX_REQ}
+
+            # 请求计数时间窗口。
+            request_window=10s
+
+            # 超限后的封禁时长。
+            ban_duration=1m
+
+            # 统计日志输出间隔。
+            stats_interval=1s
+
+            # zstd flush 间隔，0ms 表示每次写入都 flush。
+            flush_interval=2ms
+
+            # idle read timeout for backend reads, 0 means disabled.
+            idle_timeout=0
+
+            # 单连接限速（字节/秒，0 表示关闭）。
+            max_rate_per_conn_bps=0
+
+            # 全局总限速（字节/秒，0 表示关闭）。
+            max_rate_global_bps=0
+
+            # 令牌桶突发容量（字节）。
+            burst_bytes=${BURST_BYTES}
+            """
+            .replace("${LEVEL}", String.valueOf(DEFAULT_ZSTD_LEVEL))
+            .replace("${MAX_CONN}", String.valueOf(DEFAULT_MAX_CONN_PER_IP))
+            .replace("${MAX_REQ}", String.valueOf(DEFAULT_MAX_REQ_PER_WINDOW))
+            .replace("${BURST_BYTES}", String.valueOf(DEFAULT_BURST_BYTES));
+    }
+
+    private String buildLanDefaultConfig(int mcServerPort) {
+        return """
+            # ------------------------------------------------------------
+            # zstdnet 内置服务端配置（自动生成）
+            # ------------------------------------------------------------
+            # 1) 专用服默认建议保持 auto_takeover=true。
+            # 2) auto_takeover=true 时，公网入口跟随 server.properties 里的 server-port。
+            # 3) 默认只透传原版状态查询，不透传原版登录。
+            # 4) listen / target 仍可作为解析结果或高级手动模式配置。
+            # 5) 地址不要写成 127.0.0.1.（末尾带点会解析失败）。
+
+            # 是否启用内置 zstd 代理。
+            enabled=true
+
+            # 是否自动接管 server.properties 里的 server-port 作为公网入口。
+            auto_takeover=true
+
+            # zstd 公网监听入口。
+            # auto_takeover=true 时会在启动时自动改写为当前公网入口。
+            listen=0.0.0.0:${LISTEN_PORT}
+
+            # 后端 Minecraft / Velocity 地址。
+            # auto_takeover=true 时会在启动时自动改写为自动分配的本地后端端口。
+            target=127.0.0.1:${TARGET_PORT}
+
+            # zstd 压缩等级（1-22，通常建议 3-9）。
+            level=${LEVEL}
+
+            # 单个 IP 最大并发连接数（<=0 表示关闭限制）。
+            max_conn_per_ip=${MAX_CONN}
+
+            # 单个 IP 在 request_window 内最大请求次数（<=0 表示关闭限制）。
+            max_req_per_window=${MAX_REQ}
+
+            # 请求计数时间窗口。
+            request_window=10s
+
+            # 超限后的封禁时长。
+            ban_duration=1m
+
+            # 统计日志输出间隔。
+            stats_interval=1s
+
+            # zstd flush 间隔，0ms 表示每次写入都 flush。
+            flush_interval=2ms
+
+            # idle read timeout for backend reads, 0 means disabled.
+            idle_timeout=0
+
+            # 单连接限速（字节/秒，0 表示关闭）。
+            max_rate_per_conn_bps=0
+
+            # 全局总限速（字节/秒，0 表示关闭）。
+            max_rate_global_bps=0
+
+            # 令牌桶突发容量（字节）。
+            burst_bytes=${BURST_BYTES}
+            """
+            .replace("${LISTEN_PORT}", String.valueOf(mcServerPort))
+            .replace("${TARGET_PORT}", String.valueOf(defaultAutoTargetPort(mcServerPort)))
+            .replace("${LEVEL}", String.valueOf(DEFAULT_ZSTD_LEVEL))
+            .replace("${MAX_CONN}", String.valueOf(DEFAULT_MAX_CONN_PER_IP))
+            .replace("${MAX_REQ}", String.valueOf(DEFAULT_MAX_REQ_PER_WINDOW))
+            .replace("${BURST_BYTES}", String.valueOf(DEFAULT_BURST_BYTES));
+    }
+
+    private int defaultAutoTargetPort(int publicPort) {
+        int candidate = publicPort + 1;
+        if (candidate <= 0 || candidate > 65535) {
+            return DEFAULT_MINECRAFT_PORT + 1;
+        }
+        return candidate;
+    }
+    private int parseInt(String raw, int fallback) {
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private long parseLong(String raw, long fallback) {
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private Duration parseDuration(String raw, Duration fallback) {
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        String text = raw.trim().toLowerCase(Locale.ROOT);
+        try {
+            if (text.endsWith("ms")) {
+                return Duration.ofMillis(Long.parseLong(text.substring(0, text.length() - 2)));
+            }
+            if (text.endsWith("s")) {
+                return Duration.ofSeconds(Long.parseLong(text.substring(0, text.length() - 1)));
+            }
+            if (text.endsWith("m")) {
+                return Duration.ofMinutes(Long.parseLong(text.substring(0, text.length() - 1)));
+            }
+            if (text.endsWith("h")) {
+                return Duration.ofHours(Long.parseLong(text.substring(0, text.length() - 1)));
+            }
+            if (text.endsWith("d")) {
+                return Duration.ofDays(Long.parseLong(text.substring(0, text.length() - 1)));
+            }
+            return Duration.ofSeconds(Long.parseLong(text));
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private void applyReadTimeout(Socket socket, Duration timeout) {
+        if (socket == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
+            return;
+        }
+        long timeoutMs = Math.max(1L, timeout.toMillis());
+        int bounded = (int) Math.min((long) Integer.MAX_VALUE, timeoutMs);
+        try {
+            socket.setSoTimeout(bounded);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private String sourceIp(SocketAddress address) {
+        if (address instanceof InetSocketAddress inet) {
+            InetAddress ip = inet.getAddress();
+            return ip != null ? ip.getHostAddress() : inet.getHostString();
+        }
+        return String.valueOf(address);
+    }
+
+    private boolean isRealPipeErr(Exception err) {
+        if (err == null || err instanceof EOFException) {
+            return false;
+        }
+        String msg = err.toString().toLowerCase(Locale.ROOT);
+        return !(msg.contains("broken pipe") || msg.contains("connection reset") || msg.contains("socket closed"));
+    }
+
+    private void closeWrite(Socket socket) {
+        try {
+            socket.shutdownOutput();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void closeSocket(Socket socket) {
+        try {
+            if (socket != null) {
+                socket.close();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void closeQuietly(ServerSocket socket) {
+        try {
+            if (socket != null) {
+                socket.close();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void shutdownQuietly(ExecutorService executor) {
+        if (executor == null) {
+            return;
+        }
+        executor.shutdownNow();
+    }
+
+    private long readLastModified(Path path) {
+        try {
+            return Files.exists(path) ? Files.getLastModifiedTime(path).toMillis() : Long.MIN_VALUE;
+        } catch (IOException ignored) {
+            return Long.MIN_VALUE;
+        }
+    }
+
+    /**
+     * PROXY protocol 解析结果模块。
+     */
+    private record ProxyInfo(boolean valid, String sourceIp, int sourcePort, String targetIp, int targetPort) {
+        static ProxyInfo invalid() {
+            return new ProxyInfo(false, null, 0, null, 0);
+        }
+    }
+
+    /**
+     * 服务端配置快照模块。
+     */
+    private enum ClientMode {
+        ZSTD,
+        RAW_STATUS,
+        RAW_LOGIN
+    }
+
+    private enum RuntimeMode {
+        DEDICATED,
+        LAN
+    }
+
+    record HudSnapshot(
+        RuntimeMode mode,
+        String listenHost,
+        int listenPort,
+        long rawBytes,
+        long zstdBytes,
+        long rawRate,
+        long zstdRate,
+        double ratioPercent,
+        int connections
+    ) {
+        String modeName() {
+            return mode.name();
+        }
+    }
+
+    private record DetectedClientMode(ClientMode mode, byte[] initialWireData) {
+        private static DetectedClientMode zstd() {
+            return new DetectedClientMode(ClientMode.ZSTD, null);
+        }
+    }
+
+    private record ProxyConfig(
+        boolean enabled,
+        boolean autoTakeover,
+        HostPort listen,
+        HostPort target,
+        int level,
+        int maxConnPerIp,
+        int maxReqPerWindow,
+        Duration window,
+        Duration banDuration,
+        Duration statsInterval,
+        Duration flushInterval,
+        Duration idleTimeout,
+        long maxRatePerConnBps,
+        long maxRateGlobalBps,
+        int burstBytes
+    ) {
+        private ProxyConfig withTarget(HostPort newTarget) {
+            return new ProxyConfig(
+                enabled,
+                autoTakeover,
+                listen,
+                newTarget,
+                level,
+                maxConnPerIp,
+                maxReqPerWindow,
+                window,
+                banDuration,
+                statsInterval,
+                flushInterval,
+                idleTimeout,
+                maxRatePerConnBps,
+                maxRateGlobalBps,
+                burstBytes
+            );
+        }
+
+        private ProxyConfig withEndpoints(HostPort newListen, HostPort newTarget) {
+            return new ProxyConfig(
+                enabled,
+                autoTakeover,
+                newListen,
+                newTarget,
+                level,
+                maxConnPerIp,
+                maxReqPerWindow,
+                window,
+                banDuration,
+                statsInterval,
+                flushInterval,
+                idleTimeout,
+                maxRatePerConnBps,
+                maxRateGlobalBps,
+                burstBytes
+            );
+        }
+    }
+
+    /**
+     * host:port 解析模块（支持 IPv6/默认端口/去尾点）。
+     */
+    private record HostPort(String host, int port) {
+        static HostPort parse(String raw) {
+            if (raw == null || raw.isBlank()) {
+                throw new IllegalArgumentException("empty host:port");
+            }
+            String value = raw.trim();
+
+            if (value.startsWith("[") && value.contains("]")) {
+                int end = value.indexOf(']');
+                String host = value.substring(1, end);
+                int port = DEFAULT_MINECRAFT_PORT;
+                if (end + 1 < value.length() && value.charAt(end + 1) == ':') {
+                    port = Integer.parseInt(value.substring(end + 2).trim());
+                }
+                return new HostPort(normalizeHost(host), port);
+            }
+
+            int lastColon = value.lastIndexOf(':');
+            int firstColon = value.indexOf(':');
+            if (lastColon > 0 && firstColon == lastColon) {
+                String host = value.substring(0, lastColon).trim();
+                int port = Integer.parseInt(value.substring(lastColon + 1).trim());
+                return new HostPort(normalizeHost(host), port);
+            }
+            return new HostPort(normalizeHost(value), DEFAULT_MINECRAFT_PORT);
+        }
+
+        InetSocketAddress toAddress() {
+            return new InetSocketAddress(host, port);
+        }
+
+        private static String normalizeHost(String host) {
+            String h = host.trim();
+            if (h.endsWith(".") && h.length() > 1) {
+                h = h.substring(0, h.length() - 1);
+            }
+            return h;
+        }
+    }
+
+    /**
+     * 流量统计模块（原始流量、压缩流量、活跃连接）。
+     */
+    private static final class TrafficStats {
+        private final AtomicLong rawBytes = new AtomicLong();
+        private final AtomicLong zstdBytes = new AtomicLong();
+        private final AtomicInteger activeConn = new AtomicInteger();
+
+        private void addRaw(long n) {
+            if (n > 0) {
+                rawBytes.addAndGet(n);
+            }
+        }
+
+        private void addZstd(long n) {
+            if (n > 0) {
+                zstdBytes.addAndGet(n);
+            }
+        }
+
+        private void addConn(int delta) {
+            activeConn.addAndGet(delta);
+        }
+    }
+
+    /**
+     * 防刷模块：
+     * - 限制每 IP 并发连接数
+     * - 限制窗口内请求次数并封禁
+     */
+    private static final class FloodGuard {
+        private final Map<String, GuardEntry> state = new ConcurrentHashMap<>();
+        private final ProxyConfig cfg;
+
+        private FloodGuard(ProxyConfig cfg) {
+            this.cfg = cfg;
+        }
+
+        private synchronized boolean begin(String ip) {
+            long now = System.currentTimeMillis();
+            GuardEntry entry = state.computeIfAbsent(ip, k -> new GuardEntry());
+            pruneRequests(entry, now);
+
+            if (entry.bannedUntilMs > now) {
+                return false;
+            }
+
+            if (cfg.maxReqPerWindow > 0 && !cfg.window.isZero() && !cfg.window.isNegative()) {
+                entry.requestsMs.addLast(now);
+                if (entry.requestsMs.size() > cfg.maxReqPerWindow) {
+                    entry.bannedUntilMs = now + cfg.banDuration.toMillis();
+                    return false;
+                }
+            }
+
+            if (cfg.maxConnPerIp > 0 && entry.activeConn >= cfg.maxConnPerIp) {
+                return false;
+            }
+
+            entry.activeConn++;
+            return true;
+        }
+
+        private synchronized void end(String ip) {
+            GuardEntry entry = state.get(ip);
+            if (entry == null) {
+                return;
+            }
+            if (entry.activeConn > 0) {
+                entry.activeConn--;
+            }
+            long now = System.currentTimeMillis();
+            pruneRequests(entry, now);
+            if (isRemovable(entry, now)) {
+                state.remove(ip);
+            }
+        }
+
+        private synchronized void sweepExpired() {
+            long now = System.currentTimeMillis();
+            state.entrySet().removeIf(e -> {
+                GuardEntry entry = e.getValue();
+                pruneRequests(entry, now);
+                return isRemovable(entry, now);
+            });
+        }
+
+        private void pruneRequests(GuardEntry entry, long now) {
+            if (cfg.window.isZero() || cfg.window.isNegative()) {
+                entry.requestsMs.clear();
+                return;
+            }
+            long cutoff = now - cfg.window.toMillis();
+            while (!entry.requestsMs.isEmpty() && entry.requestsMs.peekFirst() < cutoff) {
+                entry.requestsMs.removeFirst();
+            }
+        }
+
+        private boolean isRemovable(GuardEntry entry, long now) {
+            return entry.activeConn == 0 && entry.requestsMs.isEmpty() && entry.bannedUntilMs <= now;
+        }
+
+        private static final class GuardEntry {
+            private int activeConn;
+            private long bannedUntilMs;
+            private final Deque<Long> requestsMs = new ArrayDeque<>();
+        }
+    }
+
+    /**
+     * 统计输入字节数的包装流模块。
+     */
+    private static final class CountingInputStream extends InputStream {
+        private final InputStream delegate;
+        private final Counter counter;
+
+        private CountingInputStream(InputStream delegate, Counter counter) {
+            this.delegate = Objects.requireNonNull(delegate);
+            this.counter = Objects.requireNonNull(counter);
+        }
+
+        @Override
+        public int read() throws IOException {
+            int value = delegate.read();
+            if (value >= 0) {
+                counter.add(1);
+            }
+            return value;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int n = delegate.read(b, off, len);
+            if (n > 0) {
+                counter.add(n);
+            }
+            return n;
+        }
+    }
+
+    /**
+     * 统计输出字节数的包装流模块。
+     */
+    private static final class CountingOutputStream extends OutputStream {
+        private final OutputStream delegate;
+        private final Counter counter;
+
+        private CountingOutputStream(OutputStream delegate, Counter counter) {
+            this.delegate = Objects.requireNonNull(delegate);
+            this.counter = Objects.requireNonNull(counter);
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            delegate.write(b);
+            counter.add(1);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            delegate.write(b, off, len);
+            if (len > 0) {
+                counter.add(len);
+            }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            delegate.flush();
+        }
+    }
+
+    /**
+     * 令牌桶限速模块。
+     */
+    private static final class TokenBucketLimiter {
+        private final double rateBps;
+        private final double capacity;
+        private double tokens;
+        private long lastNanos;
+
+        private TokenBucketLimiter(long rateBps, long burstBytes) {
+            this.rateBps = Math.max(1L, rateBps);
+            this.capacity = Math.max(1L, burstBytes);
+            this.tokens = this.capacity;
+            this.lastNanos = System.nanoTime();
+        }
+
+        static TokenBucketLimiter create(long rateBps, long burstBytes) {
+            if (rateBps <= 0) {
+                return null;
+            }
+            long burst = burstBytes > 0 ? burstBytes : rateBps;
+            return new TokenBucketLimiter(rateBps, burst);
+        }
+
+        void waitBytes(int bytes) {
+            if (bytes <= 0) {
+                return;
+            }
+
+            double remaining = bytes;
+            while (remaining > 0) {
+                double chunk = Math.min(remaining, capacity);
+                waitChunk(chunk);
+                remaining -= chunk;
+            }
+        }
+
+        private void waitChunk(double need) {
+            while (true) {
+                long sleepNanos;
+                synchronized (this) {
+                    long now = System.nanoTime();
+                    double elapsedSec = (now - lastNanos) / 1_000_000_000.0;
+                    if (elapsedSec > 0) {
+                        tokens = Math.min(capacity, tokens + elapsedSec * rateBps);
+                    }
+                    lastNanos = now;
+
+                    if (tokens >= need) {
+                        tokens -= need;
+                        return;
+                    }
+
+                    double shortage = need - tokens;
+                    sleepNanos = (long) Math.ceil((shortage / rateBps) * 1_000_000_000.0);
+                }
+
+                if (sleepNanos <= 0) {
+                    continue;
+                }
+
+                long sleepMillis = sleepNanos / 1_000_000L;
+                int nanosPart = (int) (sleepNanos % 1_000_000L);
+                try {
+                    Thread.sleep(sleepMillis, nanosPart);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * 带限速控制的输出流模块。
+     */
+    private static final class RateLimitedOutputStream extends OutputStream {
+        private static final int CHUNK_SIZE = 16 * 1024;
+
+        private final OutputStream delegate;
+        private final TokenBucketLimiter perConnLimiter;
+        private final TokenBucketLimiter globalLimiter;
+
+        private RateLimitedOutputStream(
+            OutputStream delegate,
+            TokenBucketLimiter perConnLimiter,
+            TokenBucketLimiter globalLimiter
+        ) {
+            this.delegate = Objects.requireNonNull(delegate);
+            this.perConnLimiter = perConnLimiter;
+            this.globalLimiter = globalLimiter;
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            throttle(1);
+            delegate.write(b);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            int written = 0;
+            while (written < len) {
+                int chunk = Math.min(CHUNK_SIZE, len - written);
+                throttle(chunk);
+                delegate.write(b, off + written, chunk);
+                written += chunk;
+            }
+        }
+
+        @Override
+        public void flush() throws IOException {
+            delegate.flush();
+        }
+
+        private void throttle(int n) {
+            if (perConnLimiter != null) {
+                perConnLimiter.waitBytes(n);
+            }
+            if (globalLimiter != null) {
+                globalLimiter.waitBytes(n);
+            }
+        }
+    }
+
+    @FunctionalInterface
+    private interface Counter {
+        void add(long n);
+    }
+
+    /**
+     * 线程命名工厂模块，便于日志与诊断定位线程用途。
+     */
+    private record VarIntRead(int value, int next) {
+    }
+
+    private static final class NamedFactory implements ThreadFactory {
+        private final String prefix;
+        private final AtomicInteger index = new AtomicInteger(1);
+
+        private NamedFactory(String prefix) {
+            this.prefix = prefix;
+        }
+
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, prefix + "-" + index.getAndIncrement());
+            t.setDaemon(true);
+            return t;
+        }
+    }
+}
