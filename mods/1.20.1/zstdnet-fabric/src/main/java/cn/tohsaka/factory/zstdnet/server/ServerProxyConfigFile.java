@@ -32,7 +32,8 @@ import java.util.Properties;
 
 public final class ServerProxyConfigFile {
     private static final int DEFAULT_MINECRAFT_PORT = 25565;
-    private static final int DEFAULT_ZSTD_PORT = 35565;
+    private static final int DEFAULT_ZSTD_PORT = 25565;
+    private static final int DEFAULT_BACKEND_PORT = 25566;
     private static final String DEFAULT_LISTEN_HOST = "0.0.0.0";
 
     private ServerProxyConfigFile() {
@@ -78,6 +79,7 @@ public final class ServerProxyConfigFile {
         String lineSeparator = text.contains("\r\n") ? "\r\n" : "\n";
         List<String> lines = new ArrayList<>(List.of(text.split("\\R", -1)));
         boolean hasEnabled = false;
+        boolean hasAutoTakeover = false;
         boolean hasListen = false;
         boolean hasTarget = false;
 
@@ -90,6 +92,15 @@ public final class ServerProxyConfigFile {
             if (trimmed.startsWith("enabled=")) {
                 lines.set(i, "enabled=true");
                 hasEnabled = true;
+                continue;
+            }
+            if (trimmed.startsWith("auto_takeover=")) {
+                hasAutoTakeover = true;
+                continue;
+            }
+            if (trimmed.startsWith("allow_raw_login=")) {
+                lines.remove(i);
+                i--;
                 continue;
             }
             if (trimmed.startsWith("listen=")) {
@@ -106,6 +117,9 @@ public final class ServerProxyConfigFile {
         if (!hasEnabled) {
             lines.add("enabled=true");
         }
+        if (!hasAutoTakeover) {
+            lines.add("auto_takeover=false");
+        }
         if (!hasListen) {
             lines.add("listen=" + listenValue);
         }
@@ -121,8 +135,9 @@ public final class ServerProxyConfigFile {
         Path path = path();
         if (!Files.exists(path)) {
             props.setProperty("enabled", "true");
+            props.setProperty("auto_takeover", "true");
             props.setProperty("listen", "0.0.0.0:" + DEFAULT_ZSTD_PORT);
-            props.setProperty("target", "127.0.0.1:" + DEFAULT_MINECRAFT_PORT);
+            props.setProperty("target", "127.0.0.1:" + DEFAULT_BACKEND_PORT);
             return props;
         }
 
@@ -133,7 +148,7 @@ public final class ServerProxyConfigFile {
         return props;
     }
 
-    private static String parseHost(String listen, String fallback) {
+    static String parseHost(String listen, String fallback) {
         String raw = listen == null ? "" : listen.trim();
         if (raw.isEmpty()) {
             return fallback;
@@ -151,7 +166,7 @@ public final class ServerProxyConfigFile {
         return fallback;
     }
 
-    private static int parsePort(String listen, int fallback) {
+    static int parsePort(String listen, int fallback) {
         String raw = listen == null ? "" : listen.trim();
         try {
             if (raw.startsWith("[") && raw.contains("]")) {
@@ -175,6 +190,7 @@ public final class ServerProxyConfigFile {
         return """
             # zstdnet server config
             enabled=true
+            auto_takeover=true
             listen=%s
             target=%s
             """.formatted(listenValue, targetValue);

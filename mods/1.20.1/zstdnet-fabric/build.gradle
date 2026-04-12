@@ -57,11 +57,11 @@ loom {
     runs {
         client {
             client()
-            runDir = new File(externalProjectBuildDir, 'run')
+            runDir = "../../../../zstdnet-build/mods/${minecraft_version}/zstdnet-fabric/run"
         }
         server {
             server()
-            runDir = new File(externalProjectBuildDir, 'run')
+            runDir = "../../../../zstdnet-build/mods/${minecraft_version}/zstdnet-fabric/run"
             programArgs '--nogui'
         }
     }

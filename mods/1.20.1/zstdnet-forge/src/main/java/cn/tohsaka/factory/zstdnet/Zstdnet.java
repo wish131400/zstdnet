@@ -23,9 +23,9 @@ import cn.tohsaka.factory.zstdnet.client.ClientProxyPublisher;
 import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
 import com.mojang.logging.LogUtils;
-import net.minecraftforge.fml.common.Mod;
-import net.minecraftforge.fml.DistExecutor;
 import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.fml.common.Mod;
+import net.minecraftforge.fml.loading.FMLEnvironment;
 import org.slf4j.Logger;
 
 /**
@@ -44,7 +44,9 @@ public class Zstdnet {
      */
     public Zstdnet() {
         LanCompressionSync.init();
-        DistExecutor.safeRunWhenOn(Dist.CLIENT, () -> ClientProxyPublisher::init);
+        if (FMLEnvironment.dist == Dist.CLIENT) {
+            ClientProxyPublisher.init();
+        }
         ServerProxyBootstrap.init();
         LOGGER.info("zstdnet loaded");
     }

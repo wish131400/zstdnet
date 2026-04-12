@@ -37,7 +37,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Properties;
 
 public final class DedicatedServerAutoPort {
@@ -354,6 +353,7 @@ public final class DedicatedServerAutoPort {
         if (!hasTarget) {
             lines.add("target=" + DEFAULT_TARGET_HOST + ":" + targetPort);
         }
+
         Files.writeString(path, String.join(lineSeparator, lines), StandardCharsets.UTF_8);
     }
 

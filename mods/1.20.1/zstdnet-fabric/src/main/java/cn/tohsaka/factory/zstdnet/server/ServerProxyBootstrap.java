@@ -81,6 +81,16 @@ public final class ServerProxyBootstrap {
         if (!server.isDedicatedServer()) {
             return;
         }
+        DedicatedServerAutoPort.AutoPortPlan plan = DedicatedServerAutoPort.activePlan();
+        if (plan != null) {
+            LOGGER.info(
+                "[zstdnet-server] public entry is {}:{}, backend was reassigned to {}:{}",
+                plan.listenHost(),
+                plan.listenPort(),
+                plan.targetHost(),
+                plan.targetPort()
+            );
+        }
         RUNTIME.start(server.getPort());
     }
 
@@ -88,6 +98,7 @@ public final class ServerProxyBootstrap {
         publishedLanPort = -1;
         activeLanPort = -1;
         RUNTIME.stop();
+        DedicatedServerAutoPort.clear();
     }
 
     private static void onServerTick(MinecraftServer server) {

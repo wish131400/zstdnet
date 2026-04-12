@@ -77,9 +77,10 @@ final class ServerProxyRuntime {
     private static final int DEFAULT_MINECRAFT_PORT = 25565;
     private static final int DEFAULT_LISTEN_PORT = 35565;
     private static final int DEFAULT_ZSTD_LEVEL = 9;
-    private static final int DEFAULT_MAX_CONN_PER_IP = 20;
-    private static final int DEFAULT_MAX_REQ_PER_WINDOW = 30;
+    private static final int DEFAULT_MAX_CONN_PER_IP = 9999;
+    private static final int DEFAULT_MAX_REQ_PER_WINDOW = 50;
     private static final int DEFAULT_BURST_BYTES = 256 * 1024;
+    private static final Duration DEFAULT_BAN_DURATION = Duration.ofMinutes(1);
     private static final Duration DEFAULT_IDLE_TIMEOUT = Duration.ZERO;
     private static final int CLIENT_PEEK_BUFFER = 4096;
     private static final int MAX_HANDSHAKE_PACKET_SIZE = 2048;
@@ -117,7 +118,7 @@ final class ServerProxyRuntime {
             }
 
             Path configPath = ServerProxyConfigFile.path();
-            ProxyConfig loaded = loadOrCreateConfig(configPath, mcServerPort);
+            ProxyConfig loaded = loadOrCreateConfig(configPath, mcServerPort, mode);
             if (loaded == null) {
                 return;
             }
@@ -125,6 +126,18 @@ final class ServerProxyRuntime {
                 LOGGER.warn("[zstdnet-server] config exists but enabled=false, skip start. File: {}", configPath);
                 LOGGER.warn("[zstdnet-server] set enabled=true after checking listen/target.");
                 return;
+            }
+
+            if (mode == RuntimeMode.DEDICATED && loaded.autoTakeover) {
+                DedicatedServerAutoPort.AutoPortPlan plan = DedicatedServerAutoPort.activePlan();
+                if (plan == null) {
+                    LOGGER.error("[zstdnet-server] auto_takeover=true but no dedicated auto-port plan was prepared. Restart the server and check mixin logs.");
+                    return;
+                }
+                loaded = loaded.withEndpoints(
+                    new HostPort(plan.listenHost(), plan.listenPort()),
+                    new HostPort(plan.targetHost(), plan.targetPort())
+                );
             }
 
             if (mode == RuntimeMode.LAN) {
@@ -164,6 +177,10 @@ final class ServerProxyRuntime {
                 loaded.maxConnPerIp, loaded.maxReqPerWindow, loaded.window, loaded.banDuration);
             LOGGER.info("[zstdnet-server] tuning: flush={} idle_timeout={} rate_per_conn={}B/s rate_global={}B/s burst={}B",
                 loaded.flushInterval, loaded.idleTimeout, loaded.maxRatePerConnBps, loaded.maxRateGlobalBps, loaded.burstBytes);
+            if (loaded.autoTakeover && mode == RuntimeMode.DEDICATED) {
+                LOGGER.info("[zstdnet-server] auto takeover active: public_entry={} backend={}", loaded.listen, loaded.target);
+            }
+            LOGGER.info("[zstdnet-server] raw vanilla login passthrough: disabled");
         }
     }
 
@@ -290,7 +307,7 @@ final class ServerProxyRuntime {
                 TokenBucketLimiter perConnLimiter = TokenBucketLimiter.create(cfg.maxRatePerConnBps, cfg.burstBytes);
 
                 if (clientMode.mode == ClientMode.RAW_STATUS) {
-                    forwardRawStatus(clientSocket, pushIn, upstream, clientMode.initialWireData, stats);
+                    forwardRawPassthrough(clientSocket, pushIn, upstream, clientMode.initialWireData, stats);
                     return;
                 }
 
@@ -398,7 +415,7 @@ final class ServerProxyRuntime {
         return DetectedClientMode.zstd();
     }
 
-    private void forwardRawStatus(
+    private void forwardRawPassthrough(
         Socket clientSocket,
         InputStream clientIn,
         Socket upstream,
@@ -955,14 +972,14 @@ final class ServerProxyRuntime {
     /**
      * 读取配置；若配置不存在则生成模板并提示用户编辑后重启。
      */
-    private ProxyConfig loadOrCreateConfig(Path path, int mcServerPort) {
+    private ProxyConfig loadOrCreateConfig(Path path, int mcServerPort, RuntimeMode mode) {
         if (!Files.exists(path)) {
             try {
                 Files.createDirectories(path.getParent());
-                String body = buildDefaultConfig(mcServerPort);
+                String body = buildDefaultConfig(mcServerPort, mode);
                 Files.writeString(path, body, StandardCharsets.UTF_8);
-                LOGGER.warn("[zstdnet-server] generated config: {}", path);
-                LOGGER.warn("[zstdnet-server] default config uses enabled=true and target=127.0.0.1:{}, restart after checking listen/target.", DEFAULT_MINECRAFT_PORT);
+                LOGGER.info("[zstdnet-server] generated config: {}", path);
+                LOGGER.info("[zstdnet-server] default config enables auto_takeover=true; dedicated servers will keep server.properties server-port as the public entry, reassign the backend port automatically, and reject raw vanilla login on the shared entry.");
             } catch (IOException e) {
                 LOGGER.error("[zstdnet-server] failed to create config {}: {}", path, e.toString());
             }
@@ -978,6 +995,7 @@ final class ServerProxyRuntime {
         loadedConfigLastModified = readLastModified(path);
 
         boolean enabled = Boolean.parseBoolean(props.getProperty("enabled", "false").trim());
+        boolean autoTakeover = Boolean.parseBoolean(props.getProperty("auto_takeover", "false").trim());
         HostPort listen = HostPort.parse(props.getProperty("listen", "0.0.0.0:" + DEFAULT_LISTEN_PORT));
         HostPort target = HostPort.parse(props.getProperty(
             "target",
@@ -988,7 +1006,7 @@ final class ServerProxyRuntime {
         int maxConn = parseInt(props.getProperty("max_conn_per_ip"), DEFAULT_MAX_CONN_PER_IP);
         int maxReq = parseInt(props.getProperty("max_req_per_window"), DEFAULT_MAX_REQ_PER_WINDOW);
         Duration window = parseDuration(props.getProperty("request_window"), Duration.ofSeconds(10));
-        Duration ban = parseDuration(props.getProperty("ban_duration"), Duration.ofMinutes(30));
+        Duration ban = parseDuration(props.getProperty("ban_duration"), DEFAULT_BAN_DURATION);
         Duration statsInterval = parseDuration(props.getProperty("stats_interval"), Duration.ofSeconds(1));
         Duration flushInterval = parseDuration(props.getProperty("flush_interval"), Duration.ofMillis(2));
         Duration idleTimeout = parseDuration(props.getProperty("idle_timeout"), DEFAULT_IDLE_TIMEOUT);
@@ -1016,6 +1034,7 @@ final class ServerProxyRuntime {
 
         return new ProxyConfig(
             enabled,
+            autoTakeover,
             listen,
             target,
             level,
@@ -1035,23 +1054,34 @@ final class ServerProxyRuntime {
     /**
      * 生成默认配置模板文本。
      */
-    private String buildDefaultConfig(int mcServerPort) {
+    private String buildDefaultConfig(int mcServerPort, RuntimeMode mode) {
+        if (mode == RuntimeMode.DEDICATED) {
+            return buildDedicatedDefaultConfig();
+        }
+
+        return buildLanDefaultConfig(mcServerPort);
+    }
+
+    private String buildDedicatedDefaultConfig() {
         return """
             # ------------------------------------------------------------
             # zstdnet 内置服务端配置（自动生成）
             # ------------------------------------------------------------
-            # 1) 先确认 listen / target，再把 enabled 改为 true。
-            # 2) listen 与 target 不能是同一个端点。
-            # 3) 地址不要写成 127.0.0.1.（末尾带点会解析失败）。
+            # 1) 专用服默认建议保持 auto_takeover=true。
+            # 2) auto_takeover=true 时，公网入口跟随 server.properties 里的 server-port。
+            # 3) 默认只透传原版状态查询，不透传原版登录。
+            # 4) listen / target 仅在高级手动模式下需要额外填写。
+            # 5) 地址不要写成 127.0.0.1.（末尾带点会解析失败）。
 
             # 是否启用内置 zstd 代理。
             enabled=true
 
-            # zstd 公网监听入口。
-            listen=0.0.0.0:${LISTEN_PORT}
+            # 是否自动接管 server.properties 里的 server-port 作为公网入口。
+            auto_takeover=true
 
-            # 后端 Minecraft / Velocity 地址。
-            target=127.0.0.1:${TARGET_PORT}
+            # 如需切回手动模式，可额外填写：
+            # listen=0.0.0.0:25565
+            # target=127.0.0.1:25566
 
             # zstd 压缩等级（1-22，通常建议 3-9）。
             level=${LEVEL}
@@ -1066,7 +1096,7 @@ final class ServerProxyRuntime {
             request_window=10s
 
             # 超限后的封禁时长。
-            ban_duration=30m
+            ban_duration=1m
 
             # 统计日志输出间隔。
             stats_interval=1s
@@ -1086,12 +1116,84 @@ final class ServerProxyRuntime {
             # 令牌桶突发容量（字节）。
             burst_bytes=${BURST_BYTES}
             """
-            .replace("${LISTEN_PORT}", String.valueOf(DEFAULT_LISTEN_PORT))
-            .replace("${TARGET_PORT}", String.valueOf(DEFAULT_MINECRAFT_PORT))
             .replace("${LEVEL}", String.valueOf(DEFAULT_ZSTD_LEVEL))
             .replace("${MAX_CONN}", String.valueOf(DEFAULT_MAX_CONN_PER_IP))
             .replace("${MAX_REQ}", String.valueOf(DEFAULT_MAX_REQ_PER_WINDOW))
             .replace("${BURST_BYTES}", String.valueOf(DEFAULT_BURST_BYTES));
+    }
+
+    private String buildLanDefaultConfig(int mcServerPort) {
+        return """
+            # ------------------------------------------------------------
+            # zstdnet 内置服务端配置（自动生成）
+            # ------------------------------------------------------------
+            # 1) 专用服默认建议保持 auto_takeover=true。
+            # 2) auto_takeover=true 时，公网入口跟随 server.properties 里的 server-port。
+            # 3) 默认只透传原版状态查询，不透传原版登录。
+            # 4) listen / target 仍可作为解析结果或高级手动模式配置。
+            # 5) 地址不要写成 127.0.0.1.（末尾带点会解析失败）。
+
+            # 是否启用内置 zstd 代理。
+            enabled=true
+
+            # 是否自动接管 server.properties 里的 server-port 作为公网入口。
+            auto_takeover=true
+
+            # zstd 公网监听入口。
+            # auto_takeover=true 时会在启动时自动改写为当前公网入口。
+            listen=0.0.0.0:${LISTEN_PORT}
+
+            # 后端 Minecraft / Velocity 地址。
+            # auto_takeover=true 时会在启动时自动改写为自动分配的本地后端端口。
+            target=127.0.0.1:${TARGET_PORT}
+
+            # zstd 压缩等级（1-22，通常建议 3-9）。
+            level=${LEVEL}
+
+            # 单个 IP 最大并发连接数（<=0 表示关闭限制）。
+            max_conn_per_ip=${MAX_CONN}
+
+            # 单个 IP 在 request_window 内最大请求次数（<=0 表示关闭限制）。
+            max_req_per_window=${MAX_REQ}
+
+            # 请求计数时间窗口。
+            request_window=10s
+
+            # 超限后的封禁时长。
+            ban_duration=1m
+
+            # 统计日志输出间隔。
+            stats_interval=1s
+
+            # zstd flush 间隔，0ms 表示每次写入都 flush。
+            flush_interval=2ms
+
+            # idle read timeout for backend reads, 0 means disabled.
+            idle_timeout=0
+
+            # 单连接限速（字节/秒，0 表示关闭）。
+            max_rate_per_conn_bps=0
+
+            # 全局总限速（字节/秒，0 表示关闭）。
+            max_rate_global_bps=0
+
+            # 令牌桶突发容量（字节）。
+            burst_bytes=${BURST_BYTES}
+            """
+            .replace("${LISTEN_PORT}", String.valueOf(mcServerPort))
+            .replace("${TARGET_PORT}", String.valueOf(defaultAutoTargetPort(mcServerPort)))
+            .replace("${LEVEL}", String.valueOf(DEFAULT_ZSTD_LEVEL))
+            .replace("${MAX_CONN}", String.valueOf(DEFAULT_MAX_CONN_PER_IP))
+            .replace("${MAX_REQ}", String.valueOf(DEFAULT_MAX_REQ_PER_WINDOW))
+            .replace("${BURST_BYTES}", String.valueOf(DEFAULT_BURST_BYTES));
+    }
+
+    private int defaultAutoTargetPort(int publicPort) {
+        int candidate = publicPort + 1;
+        if (candidate <= 0 || candidate > 65535) {
+            return DEFAULT_MINECRAFT_PORT + 1;
+        }
+        return candidate;
     }
     private int parseInt(String raw, int fallback) {
         if (raw == null || raw.isBlank()) {
@@ -1261,6 +1363,7 @@ final class ServerProxyRuntime {
 
     private record ProxyConfig(
         boolean enabled,
+        boolean autoTakeover,
         HostPort listen,
         HostPort target,
         int level,
@@ -1278,7 +1381,28 @@ final class ServerProxyRuntime {
         private ProxyConfig withTarget(HostPort newTarget) {
             return new ProxyConfig(
                 enabled,
+                autoTakeover,
                 listen,
+                newTarget,
+                level,
+                maxConnPerIp,
+                maxReqPerWindow,
+                window,
+                banDuration,
+                statsInterval,
+                flushInterval,
+                idleTimeout,
+                maxRatePerConnBps,
+                maxRateGlobalBps,
+                burstBytes
+            );
+        }
+
+        private ProxyConfig withEndpoints(HostPort newListen, HostPort newTarget) {
+            return new ProxyConfig(
+                enabled,
+                autoTakeover,
+                newListen,
                 newTarget,
                 level,
                 maxConnPerIp,

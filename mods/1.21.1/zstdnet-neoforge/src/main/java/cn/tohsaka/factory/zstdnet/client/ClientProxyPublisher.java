@@ -51,6 +51,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.util.HttpUtil;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.config.ModConfig;
+import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
 import net.neoforged.neoforge.client.event.RenderGuiEvent;
@@ -89,6 +90,7 @@ public final class ClientProxyPublisher {
     private LocalZstdNet.ProxyHandle activeProxy;
     private LocalZstdNet.ProxyHandle activeSession;
     private boolean hudVisible = false;
+    private boolean singleplayerLanHintShown;
     private Object lastListEntry;
     private long lastListClickTime;
 
@@ -107,6 +109,7 @@ public final class ClientProxyPublisher {
         NeoForge.EVENT_BUS.addListener(INSTANCE::onClientLogout);
         NeoForge.EVENT_BUS.addListener(INSTANCE::onRenderGui);
         NeoForge.EVENT_BUS.addListener(INSTANCE::onScreenRender);
+        NeoForge.EVENT_BUS.addListener(INSTANCE::onClientTick);
         NeoForge.EVENT_BUS.addListener(INSTANCE::onRegisterClientCommands);
         LOGGER.info("zstdnet client runtime initialized");
     }
@@ -175,6 +178,22 @@ public final class ClientProxyPublisher {
         synchronized (stateLock) {
             closeActiveSessionLocked();
         }
+    }
+
+    private void onClientTick(ClientTickEvent.Post event) {
+        Minecraft minecraft = Minecraft.getInstance();
+        boolean inSingleplayerWorld = minecraft.player != null && minecraft.getSingleplayerServer() != null;
+        if (!inSingleplayerWorld) {
+            singleplayerLanHintShown = false;
+            return;
+        }
+        if (singleplayerLanHintShown) {
+            return;
+        }
+
+        sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_hint"));
+        sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_command_hint"));
+        singleplayerLanHintShown = true;
     }
 
     private void onRenderGui(RenderGuiEvent.Post event) {
@@ -600,7 +619,10 @@ public final class ClientProxyPublisher {
             sendClientMessage(Component.translatable("zstdnet.command.port.write_failed"));
             return 0;
         }
-        sendClientMessage(Component.translatable("zstdnet.command.port.zstd_set", port));
+        sendClientMessage(Component.translatable(
+            isLanPublished() ? "zstdnet.command.port.zstd_reloaded" : "zstdnet.command.port.zstd_set",
+            port
+        ));
         return 1;
     }
 
@@ -618,7 +640,10 @@ public final class ClientProxyPublisher {
             sendClientMessage(Component.translatable("zstdnet.command.port.write_failed"));
             return 0;
         }
-        sendClientMessage(Component.translatable("zstdnet.command.port.game_set", port));
+        sendClientMessage(Component.translatable(
+            isLanPublished() ? "zstdnet.command.port.game_set_reopen" : "zstdnet.command.port.game_set",
+            port
+        ));
         return 1;
     }
 
@@ -627,6 +652,11 @@ public final class ClientProxyPublisher {
         return minecraft.player != null
             && minecraft.getSingleplayerServer() != null
             && minecraft.player.hasPermissions(2);
+    }
+
+    private boolean isLanPublished() {
+        Minecraft minecraft = Minecraft.getInstance();
+        return minecraft.getSingleplayerServer() != null && minecraft.getSingleplayerServer().isPublished();
     }
 
     private ServerData resolveDirectJoinServer(String remoteAddr) {
