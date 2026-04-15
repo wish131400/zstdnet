@@ -196,12 +196,19 @@ mc.example.com:35565
 /zstdport show
 /zstdport game 25565
 /zstdport zstd 35565
+/zstdport voice 25565
+/zstdport zstdvoice 24455
 ```
 
 注意：
 
 - `/zstdport` 是客户端指令
-- 只有本地房主且有管理员权限时才能修改
+- `show` 可以查看当前配置
+- `voice` 修改 `voice_chat_target`，也就是后端语音端口
+- `zstdvoice` 修改 `voice_chat_listen`，也就是公网语音入口
+- 单机开房 / LAN 模式下，默认 `voice_chat_target` 是 `127.0.0.1:25565`
+- 专用服默认 `voice_chat_target` 仍然是 `127.0.0.1:24454`
+- `game`、`zstd`、`voice`、`zstdvoice` 只有本地房主且有管理员权限时才能修改
 - 专用服不会通过这个指令改服务器配置
 - 专用服请直接修改 `config/zstdnet-server.properties`
 
@@ -243,12 +250,21 @@ mc.example.com:35565
 
 有可能。
 
-客户端这边是通过界面接管连接流程实现的，如果多人游戏菜单或“对局域网开放”界面被其他模组大幅改写，理论上存在兼容性风险。
+如果多人游戏菜单或“对局域网开放”界面被其他模组大幅改写，理论上仍然存在兼容性风险。
+
+### Simple Voice Chat 这类语音模组能不能用？
+
+可以，但语音流量不会走 zstd 压缩，只会在服务端做原样 UDP 转发。
+
+- 如果 Simple Voice Chat 使用独立 UDP 端口，就必须显式填写 `voice_chat_listen`；`voice_chat_target` 可以留空让模组自动指向本机的 SVC 端口。
+- 如果语音 UDP 路由没有成功启动，游戏本身的 TCP 连接仍然可以正常工作，只是语音会离线。
+- 如果你想直接改 `zstdnet-server.properties` 里的语音转发项，可以用 `/zstdport voice <端口>` 修改后端语音端口，或用 `/zstdport zstdvoice <端口>` 修改公网语音入口。
 
 ## 配置文件
 
 - 客户端：`config/zstdnet-client.toml`
 - 服务端：`config/zstdnet-server.properties`
+- `zstdnet-server.properties` 会由模组自动维护；命令改端口或自动接管时，会按内置的带注释模板重新写回配置文件。
 
 **配置项说明：**
 
@@ -317,6 +333,21 @@ mc.example.com:35565
   - 单位是字节，相当于流量的"缓冲池"
   - 即使设置了限速，短时间内的突发流量也可以超过限制
 
+- `voice_chat_passthrough`：是否为 Simple Voice Chat 启用原样 UDP 转发（默认：true）
+  - 语音流量不会经过 zstd 压缩
+  - 设为 false 后将完全关闭额外的语音 UDP 路由处理
+
+- `voice_chat_listen`：语音的公网 UDP 入口（可选）
+  - 留空时，只有在 Simple Voice Chat 设置了 `port=-1`、语音与游戏共用同一 UDP 端口时，才会自动复用游戏的 UDP 入口
+  - 单机开房 / LAN 模式下，生成出来的默认值通常是 `0.0.0.0:24455`
+  - 独立语音端口模式下必须显式填写这里
+
+- `voice_chat_target`：语音的后端 UDP 目标（可选）
+  - 留空时，只有在 Simple Voice Chat 设置了 `port=-1`、语音与游戏共用同一 UDP 端口时，才会自动复用游戏的 UDP 入口
+  - 单机开房 / LAN 模式下，生成出来的默认值是 `127.0.0.1:25565`
+  - 专用服生成出来的默认值是 `127.0.0.1:24454`
+  - 独立语音端口模式下，若 `voice_chat_listen` 已填写，默认会指向 `127.0.0.1:<SVC端口>`
+
 ### 客户端配置文件 `zstdnet-client.toml` 内容
 
 ```toml
@@ -335,7 +366,6 @@ mc.example.com:35565
 
 ## 依赖
 
-- Minecraft Forge
 - zstd-jni
 
 ## License

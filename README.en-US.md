@@ -197,12 +197,19 @@ Used to view or change ports in singleplayer / LAN hosting scenarios:
 /zstdport show
 /zstdport game 25565
 /zstdport zstd 35565
+/zstdport voice 25565
+/zstdport zstdvoice 24455
 ```
 
 Notes:
 
 - `/zstdport` is a client-side command
-- Only the local host with admin permission can change the ports
+- `show` can view the current config
+- `voice` changes `voice_chat_target`, which is the backend voice port
+- `zstdvoice` changes `voice_chat_listen`, which is the public voice entry
+- In singleplayer/LAN hosting, the default `voice_chat_target` is `127.0.0.1:25565`
+- On dedicated servers, the default `voice_chat_target` remains `127.0.0.1:24454`
+- `game`, `zstd`, `voice`, and `zstdvoice` can only be changed by the local host with admin permission
 - This command does not modify dedicated server configs
 - For dedicated servers, edit `config/zstdnet-server.properties` directly
 
@@ -244,12 +251,21 @@ Some traffic simply does not compress well, or may already be encrypted, which r
 
 Possibly.
 
-On the client side, this mod works by hooking into the connection flow through the UI. If another mod heavily rewrites the multiplayer menu or the "Open to LAN" screen, compatibility issues are possible.
+UI-heavy menu rewrites can still cause compatibility issues.
+
+### What about Simple Voice Chat or other UDP-based voice mods?
+
+Simple Voice Chat audio is not compressed by zstd. ZstdNet only forwards the UDP packets as raw passthrough on the server side.
+
+- If Simple Voice Chat uses its own UDP port, you must set `voice_chat_listen` explicitly. `voice_chat_target` can stay blank and will default to the local SVC port.
+- If the UDP route cannot be armed, the game TCP path still works, but voice chat may stay offline.
+- If you want to edit the `voice` passthrough entries in `zstdnet-server.properties` directly, use `/zstdport voice <port>` for the backend voice port, or `/zstdport zstdvoice <port>` for the public voice entry.
 
 ## Configuration Files
 
 - Client: `config/zstdnet-client.toml`
 - Server: `config/zstdnet-server.properties`
+- `zstdnet-server.properties` is auto-maintained. When ports are changed by commands or auto takeover, the file is rewritten with the built-in commented template.
 
 **Configuration Item Explanation :**
 
@@ -314,6 +330,21 @@ On the client side, this mod works by hooking into the connection flow through t
   - Unit is bytes, acts as a "buffer pool" for traffic
   - Allows short-term burst traffic to exceed the limit even with rate limiting enabled
 
+- `voice_chat_passthrough`：Enable raw UDP passthrough for Simple Voice Chat (default: true)
+  - Voice traffic is forwarded without zstd compression
+  - Set to false to disable voice UDP route handling entirely
+
+- `voice_chat_listen`：Optional public UDP entry for voice chat
+  - Leave this blank only when Simple Voice Chat uses `port=-1`, meaning voice chat and the game share the same UDP port, so ZstdNet can reuse the game's public UDP entry
+  - In singleplayer/LAN mode, the generated default is usually `0.0.0.0:24455`
+  - In separate-port mode, this must be set explicitly
+
+- `voice_chat_target`：Optional backend UDP target for voice chat
+  - Leave this blank only when Simple Voice Chat uses `port=-1`, meaning voice chat and the game share the same UDP port, so ZstdNet can reuse the game's public UDP entry
+  - In singleplayer/LAN mode, the generated default is `127.0.0.1:25565`
+  - On dedicated servers, the generated default is `127.0.0.1:24454`
+  - In separate-port mode, when `voice_chat_listen` is set, it defaults to `127.0.0.1:<SVC port>`
+
 ### Client Configuration File `zstdnet-client.toml` Content
 
 ```toml
@@ -332,7 +363,6 @@ On the client side, this mod works by hooking into the connection flow through t
 
 ## Dependencies
 
-- Minecraft Forge
 - zstd-jni
 
 ## License

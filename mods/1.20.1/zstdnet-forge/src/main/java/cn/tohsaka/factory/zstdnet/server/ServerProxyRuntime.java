@@ -30,6 +30,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PushbackInputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -42,9 +44,11 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Deque;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -77,6 +81,11 @@ final class ServerProxyRuntime {
     };
     private static final int DEFAULT_MINECRAFT_PORT = 25565;
     private static final int DEFAULT_LISTEN_PORT = 35565;
+    private static final int MIN_PORT = 1;
+    private static final int MAX_PORT = 65535;
+    private static final String DEFAULT_LISTEN_HOST = "0.0.0.0";
+    private static final int DEFAULT_VOICE_CHAT_PORT = 24454;
+    private static final int DEFAULT_VOICE_CHAT_LISTEN_PORT = 24455;
     private static final int DEFAULT_ZSTD_LEVEL = 9;
     private static final int DEFAULT_MAX_CONN_PER_IP = 9999;
     private static final int DEFAULT_MAX_REQ_PER_WINDOW = 50;
@@ -100,6 +109,7 @@ final class ServerProxyRuntime {
     private RuntimeMode runtimeMode;
     private volatile HudSnapshot latestHudSnapshot;
     private volatile long loadedConfigLastModified = Long.MIN_VALUE;
+    private List<UdpForwarder> udpForwarders = List.of();
 
     /**
      * 启动运行时。
@@ -143,6 +153,7 @@ final class ServerProxyRuntime {
 
             if (mode == RuntimeMode.LAN) {
                 loaded = loaded.withTarget(new HostPort("127.0.0.1", mcServerPort));
+                loaded = loaded.withLanVoiceDefaults(mcServerPort);
             }
 
             try {
@@ -170,6 +181,8 @@ final class ServerProxyRuntime {
             acceptThread.setDaemon(true);
             acceptThread.start();
 
+            startUdpForwarders(loaded);
+
             LOGGER.info("[zstdnet-server] started: mode={} listen={} target={}", mode.name().toLowerCase(Locale.ROOT), loaded.listen, loaded.target);
             if (mode == RuntimeMode.LAN) {
                 LOGGER.info("[zstdnet-server] LAN host detected. Point your tunnel to {} instead of the raw LAN port {}.", loaded.listen, mcServerPort);
@@ -194,6 +207,7 @@ final class ServerProxyRuntime {
                 return;
             }
             running = false;
+            stopUdpForwarders();
             closeQuietly(listener);
             listener = null;
             if (acceptThread != null) {
@@ -980,7 +994,7 @@ final class ServerProxyRuntime {
                 String body = buildDefaultConfig(mcServerPort, mode);
                 Files.writeString(path, body, StandardCharsets.UTF_8);
                 LOGGER.info("[zstdnet-server] generated config: {}", path);
-                LOGGER.info("[zstdnet-server] default config enables auto_takeover=true; dedicated servers will keep server.properties server-port as the public entry, reassign the backend port automatically, and reject raw vanilla login on the shared entry.");
+                LOGGER.info("[zstdnet-server] 已生成默认配置：专用服会保留 server.properties 里的 server-port 作为公网入口，自动改用本地空闲端口作为后端，并拒绝原版直连登录。");
             } catch (IOException e) {
                 LOGGER.error("[zstdnet-server] failed to create config {}: {}", path, e.toString());
             }
@@ -1002,6 +1016,9 @@ final class ServerProxyRuntime {
             "target",
             "127.0.0.1:" + DEFAULT_MINECRAFT_PORT
         ));
+        boolean voiceChatPassthrough = Boolean.parseBoolean(props.getProperty("voice_chat_passthrough", "true").trim());
+        String voiceChatListen = props.getProperty("voice_chat_listen", "").trim();
+        String voiceChatTarget = props.getProperty("voice_chat_target", "").trim();
 
         int level = clamp(parseInt(props.getProperty("level"), DEFAULT_ZSTD_LEVEL), 1, 22);
         int maxConn = parseInt(props.getProperty("max_conn_per_ip"), DEFAULT_MAX_CONN_PER_IP);
@@ -1038,6 +1055,9 @@ final class ServerProxyRuntime {
             autoTakeover,
             listen,
             target,
+            voiceChatPassthrough,
+            voiceChatListen,
+            voiceChatTarget,
             level,
             maxConn,
             maxReq,
@@ -1084,6 +1104,15 @@ final class ServerProxyRuntime {
             # listen=0.0.0.0:25565
             # target=127.0.0.1:25566
 
+            # Simple Voice Chat 的原样 UDP 转发。
+            voice_chat_passthrough=true
+
+            # 语音聊天的公网 UDP 入口；LAN 默认跟随当前游戏 UDP 端口。
+            voice_chat_listen=0.0.0.0:${VOICE_PORT}
+
+            # 语音聊天的后端 UDP 目标；LAN 默认指向当前游戏 UDP 端口。
+            voice_chat_target=127.0.0.1:${VOICE_PORT}
+
             # zstd 压缩等级（1-22，通常建议 3-9）。
             level=${LEVEL}
 
@@ -1105,7 +1134,7 @@ final class ServerProxyRuntime {
             # zstd flush 间隔，0ms 表示每次写入都 flush。
             flush_interval=2ms
 
-            # idle read timeout for backend reads, 0 means disabled.
+            # 后端读取空闲超时，0 表示关闭。
             idle_timeout=0
 
             # 单连接限速（字节/秒，0 表示关闭）。
@@ -1147,6 +1176,15 @@ final class ServerProxyRuntime {
             # 一般保持为本地游戏端口即可。
             target=127.0.0.1:${TARGET_PORT}
 
+            # Simple Voice Chat 的原样 UDP 转发。
+            voice_chat_passthrough=true
+
+            # 语音聊天的公网 UDP 入口；默认使用 24455。
+            voice_chat_listen=0.0.0.0:24455
+
+            # 语音聊天的后端 UDP 目标；默认指向本机 25565。
+            voice_chat_target=127.0.0.1:25565
+
             # zstd 压缩等级（1-22，通常建议 3-9）。
             level=${LEVEL}
 
@@ -1168,7 +1206,7 @@ final class ServerProxyRuntime {
             # zstd flush 间隔，0ms 表示每次写入都 flush。
             flush_interval=2ms
 
-            # idle read timeout for backend reads, 0 means disabled.
+            # 后端读取空闲超时，0 表示关闭。
             idle_timeout=0
 
             # 单连接限速（字节/秒，0 表示关闭）。
@@ -1182,6 +1220,7 @@ final class ServerProxyRuntime {
             """
             .replace("${LISTEN_PORT}", String.valueOf(mcServerPort))
             .replace("${TARGET_PORT}", String.valueOf(defaultAutoTargetPort(mcServerPort)))
+            .replace("${VOICE_PORT}", String.valueOf(mcServerPort))
             .replace("${LEVEL}", String.valueOf(DEFAULT_ZSTD_LEVEL))
             .replace("${MAX_CONN}", String.valueOf(DEFAULT_MAX_CONN_PER_IP))
             .replace("${MAX_REQ}", String.valueOf(DEFAULT_MAX_REQ_PER_WINDOW))
@@ -1195,6 +1234,208 @@ final class ServerProxyRuntime {
         }
         return candidate;
     }
+
+    private VoiceChatPassthroughDecision resolveVoiceChatPassthrough(ProxyConfig config) {
+        Path svcConfig = simpleVoiceChatConfigPath();
+        Integer simpleVoiceChatPort = readSimpleVoiceChatPort(svcConfig);
+        return resolveVoiceChatPassthrough(
+            config.listen,
+            config.target,
+            config.voiceChatPassthrough,
+            config.voiceChatListen,
+            config.voiceChatTarget,
+            simpleVoiceChatPort,
+            svcConfig.toString()
+        );
+    }
+
+    static VoiceChatPassthroughDecision resolveVoiceChatPassthrough(
+        HostPort gameListen,
+        HostPort gameTarget,
+        boolean voiceChatPassthrough,
+        String configuredListen,
+        String configuredTarget,
+        Integer simpleVoiceChatPort,
+        String simpleVoiceChatSource
+    ) {
+        if (!voiceChatPassthrough) {
+            return VoiceChatPassthroughDecision.disabled("voice chat UDP passthrough disabled by config");
+        }
+        if (gameListen == null || gameTarget == null) {
+            return VoiceChatPassthroughDecision.disabled("game UDP route is unavailable");
+        }
+
+        boolean samePortMode = simpleVoiceChatPort != null && simpleVoiceChatPort == -1;
+        HostPort target;
+        try {
+            target = parseOptionalHostPort(configuredTarget);
+        } catch (IllegalArgumentException e) {
+            return VoiceChatPassthroughDecision.disabled("invalid voice_chat_target: " + e.getMessage());
+        }
+        if (target == null) {
+            if (simpleVoiceChatPort == null) {
+                return VoiceChatPassthroughDecision.disabled(
+                    "voice_chat_target is blank and Simple Voice Chat config was not found at " + simpleVoiceChatSource
+                );
+            }
+            if (samePortMode) {
+                target = gameTarget;
+            } else if (simpleVoiceChatPort >= 1 && simpleVoiceChatPort <= 65535) {
+                target = new HostPort("127.0.0.1", simpleVoiceChatPort);
+            } else {
+                return VoiceChatPassthroughDecision.disabled("invalid Simple Voice Chat port " + simpleVoiceChatPort);
+            }
+        }
+
+        HostPort listen;
+        try {
+            listen = parseOptionalHostPort(configuredListen);
+        } catch (IllegalArgumentException e) {
+            return VoiceChatPassthroughDecision.disabled("invalid voice_chat_listen: " + e.getMessage());
+        }
+        if (listen == null) {
+            if (simpleVoiceChatPort == null) {
+                listen = new HostPort(gameListen.host(), target.port());
+            } else if (samePortMode) {
+                listen = gameListen;
+            } else {
+                return VoiceChatPassthroughDecision.disabled(
+                    "Simple Voice Chat uses a separate port, so voice_chat_listen must be set explicitly"
+                );
+            }
+        }
+
+        if (listen.equals(gameListen) && target.equals(gameTarget)) {
+            return VoiceChatPassthroughDecision.reuseGameRoute("voice chat UDP reuses the built-in game UDP route");
+        }
+
+        if (listen.port() == target.port() && isLocalHost(target.host())) {
+            HostPort adjustedListen = chooseAlternateVoiceChatListen(listen, target);
+            if (!adjustedListen.equals(listen)) {
+                LOGGER.warn(
+                    "[zstdnet-server] voice chat listen {} collides with local target {}; using {} instead.",
+                    listen,
+                    target,
+                    adjustedListen
+                );
+                listen = adjustedListen;
+            }
+        }
+
+        return VoiceChatPassthroughDecision.route(new UdpRoute("simple_voice_chat", listen, target));
+    }
+
+    private static HostPort chooseAlternateVoiceChatListen(HostPort listen, HostPort target) {
+        int preferred = target.port() >= MAX_PORT ? MIN_PORT : target.port() + 1;
+        int port = findFreeUdpPort(listen.host(), preferred, listen.port(), target.port());
+        return port == listen.port() ? listen : new HostPort(listen.host(), port);
+    }
+
+    private static int findFreeUdpPort(String host, int preferredPort, int... reservedPorts) {
+        String hostToProbe = host == null || host.isBlank() ? DEFAULT_LISTEN_HOST : host.trim();
+        int start = Math.max(MIN_PORT, Math.min(MAX_PORT, preferredPort));
+
+        for (int port = start; port <= MAX_PORT; port++) {
+            if (!isReservedPort(port, reservedPorts) && isUdpBindable(hostToProbe, port)) {
+                return port;
+            }
+        }
+        for (int port = MIN_PORT; port < start; port++) {
+            if (!isReservedPort(port, reservedPorts) && isUdpBindable(hostToProbe, port)) {
+                return port;
+            }
+        }
+
+        throw new IllegalStateException("no free UDP port available for voice chat passthrough");
+    }
+
+    private static boolean isReservedPort(int port, int... reservedPorts) {
+        if (reservedPorts == null) {
+            return false;
+        }
+        for (int reserved : reservedPorts) {
+            if (reserved == port) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isUdpBindable(String host, int port) {
+        try (DatagramSocket socket = new DatagramSocket(null)) {
+            socket.setReuseAddress(false);
+            InetSocketAddress address;
+            if (host == null || host.isBlank() || "0.0.0.0".equals(host) || "::".equals(host)) {
+                address = new InetSocketAddress(port);
+            } else {
+                address = new InetSocketAddress(InetAddress.getByName(host), port);
+            }
+            socket.bind(address);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isLocalHost(String host) {
+        if (host == null || host.isBlank()) {
+            return true;
+        }
+        String normalized = host.trim().toLowerCase(Locale.ROOT);
+        return normalized.equals("localhost")
+            || normalized.equals("127.0.0.1")
+            || normalized.startsWith("127.")
+            || normalized.equals("::1")
+            || normalized.equals("0.0.0.0")
+            || normalized.equals("::");
+    }
+
+    private Integer readSimpleVoiceChatPort(Path configPath) {
+        if (configPath == null || !Files.exists(configPath)) {
+            return null;
+        }
+
+        Properties props = new Properties();
+        try (InputStream in = Files.newInputStream(configPath)) {
+            props.load(in);
+        } catch (IOException e) {
+            LOGGER.warn("[zstdnet-server] failed reading Simple Voice Chat config {}: {}", configPath, e.toString());
+            return null;
+        }
+        String rawPort = props.getProperty("port");
+        Integer parsedPort = parseSimpleVoiceChatPort(rawPort);
+        if (parsedPort == null && rawPort != null && !rawPort.isBlank()) {
+            LOGGER.warn("[zstdnet-server] invalid Simple Voice Chat port '{}' in {}", rawPort, configPath);
+        }
+        return parsedPort;
+    }
+
+    static Integer parseSimpleVoiceChatPort(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static HostPort parseOptionalHostPort(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return HostPort.parse(raw.trim());
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException(raw.trim(), e);
+        }
+    }
+
+    private static Path simpleVoiceChatConfigPath() {
+        return FMLPaths.GAMEDIR.get().resolve("config").resolve("voicechat").resolve("voicechat-server.properties");
+    }
+
     private int parseInt(String raw, int fallback) {
         if (raw == null || raw.isBlank()) {
             return fallback;
@@ -1366,6 +1607,9 @@ final class ServerProxyRuntime {
         boolean autoTakeover,
         HostPort listen,
         HostPort target,
+        boolean voiceChatPassthrough,
+        String voiceChatListen,
+        String voiceChatTarget,
         int level,
         int maxConnPerIp,
         int maxReqPerWindow,
@@ -1384,6 +1628,9 @@ final class ServerProxyRuntime {
                 autoTakeover,
                 listen,
                 newTarget,
+                voiceChatPassthrough,
+                voiceChatListen,
+                voiceChatTarget,
                 level,
                 maxConnPerIp,
                 maxReqPerWindow,
@@ -1404,6 +1651,9 @@ final class ServerProxyRuntime {
                 autoTakeover,
                 newListen,
                 newTarget,
+                voiceChatPassthrough,
+                voiceChatListen,
+                voiceChatTarget,
                 level,
                 maxConnPerIp,
                 maxReqPerWindow,
@@ -1418,12 +1668,82 @@ final class ServerProxyRuntime {
             );
         }
 
+        private ProxyConfig withLanVoiceDefaults(int lanPort) {
+            String effectiveVoiceListen = voiceChatListen;
+            String effectiveVoiceTarget = voiceChatTarget;
+            if (isDefaultVoiceChatListen(voiceChatListen)) {
+                effectiveVoiceListen = DEFAULT_LISTEN_HOST + ":" + lanPort;
+            }
+            if (isDefaultVoiceChatTarget(voiceChatTarget)) {
+                effectiveVoiceTarget = "127.0.0.1:" + lanPort;
+            }
+            return new ProxyConfig(
+                enabled,
+                autoTakeover,
+                listen,
+                target,
+                voiceChatPassthrough,
+                effectiveVoiceListen,
+                effectiveVoiceTarget,
+                level,
+                maxConnPerIp,
+                maxReqPerWindow,
+                window,
+                banDuration,
+                statsInterval,
+                flushInterval,
+                idleTimeout,
+                maxRatePerConnBps,
+                maxRateGlobalBps,
+                burstBytes
+            );
+        }
+
+        private static boolean isDefaultVoiceChatListen(String raw) {
+            if (raw == null || raw.isBlank()) {
+                return true;
+            }
+            try {
+                return HostPort.parse(raw).equals(new HostPort(DEFAULT_LISTEN_HOST, DEFAULT_VOICE_CHAT_LISTEN_PORT));
+            } catch (Exception ignored) {
+                return false;
+            }
+        }
+
+        private static boolean isDefaultVoiceChatTarget(String raw) {
+            if (raw == null || raw.isBlank()) {
+                return true;
+            }
+            try {
+                return HostPort.parse(raw).equals(new HostPort("127.0.0.1", DEFAULT_VOICE_CHAT_PORT));
+            } catch (Exception ignored) {
+                return false;
+            }
+        }
+
     }
 
     /**
      * host:port 解析模块（支持 IPv6/默认端口/去尾点）。
      */
-    private record HostPort(String host, int port) {
+    static record UdpRoute(String label, HostPort listen, HostPort target) {
+    }
+
+    static record VoiceChatPassthroughDecision(UdpRoute route, boolean reuseGameRoute, String reason) {
+        static VoiceChatPassthroughDecision disabled(String reason) {
+            return new VoiceChatPassthroughDecision(null, false, reason);
+        }
+
+        static VoiceChatPassthroughDecision reuseGameRoute(String reason) {
+            return new VoiceChatPassthroughDecision(null, true, reason);
+        }
+
+        static VoiceChatPassthroughDecision route(UdpRoute route) {
+            return new VoiceChatPassthroughDecision(route, false, null);
+        }
+    }
+
+    static record HostPort(String host, int port) {
         static HostPort parse(String raw) {
             if (raw == null || raw.isBlank()) {
                 throw new IllegalArgumentException("empty host:port");
@@ -1763,6 +2083,223 @@ final class ServerProxyRuntime {
     @FunctionalInterface
     private interface Counter {
         void add(long n);
+    }
+
+    private void startUdpForwarders(ProxyConfig config) {
+        List<UdpRoute> routes = buildUdpRoutes(config);
+        List<UdpForwarder> started = new ArrayList<>();
+        for (UdpRoute route : routes) {
+            try {
+                UdpForwarder forwarder = new UdpForwarder(route);
+                forwarder.start();
+                started.add(forwarder);
+                LOGGER.info("[zstdnet-server] UDP route armed [{}]: {} -> {}", route.label(), route.listen(), route.target());
+            } catch (Exception e) {
+                LOGGER.warn("[zstdnet-server] UDP route skipped [{}] {} -> {}: {}", route.label(), route.listen(), route.target(), e.toString());
+            }
+        }
+        this.udpForwarders = started;
+    }
+
+    private List<UdpRoute> buildUdpRoutes(ProxyConfig config) {
+        List<UdpRoute> routes = new ArrayList<>();
+        routes.add(new UdpRoute("game", config.listen, config.target));
+
+        VoiceChatPassthroughDecision voiceChat = resolveVoiceChatPassthrough(config);
+        if (voiceChat.reuseGameRoute()) {
+            LOGGER.info("[zstdnet-server] voice chat UDP passthrough reuses the built-in game UDP route.");
+            return routes;
+        }
+        if (voiceChat.route() != null) {
+            routes.add(voiceChat.route());
+            return routes;
+        }
+
+        if (config.voiceChatPassthrough) {
+            LOGGER.warn("[zstdnet-server] voice chat UDP passthrough not armed: {}", voiceChat.reason());
+        } else {
+            LOGGER.info("[zstdnet-server] voice chat UDP passthrough disabled.");
+        }
+        return routes;
+    }
+
+    private void stopUdpForwarders() {
+        List<UdpForwarder> forwarders = this.udpForwarders;
+        this.udpForwarders = List.of();
+        for (UdpForwarder forwarder : forwarders) {
+            try {
+                forwarder.stop();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private static final class UdpForwarder {
+        private static final int UDP_BUF_SIZE = 65535;
+        private static final long SESSION_TIMEOUT_MS = 60_000L;
+
+        private final UdpRoute route;
+        private volatile boolean running;
+        private DatagramSocket serverSocket;
+        private Thread forwardThread;
+        private final Map<SocketAddress, UdpSession> sessions = new ConcurrentHashMap<>();
+
+        UdpForwarder(UdpRoute route) {
+            this.route = route;
+        }
+
+        void start() throws IOException {
+            serverSocket = new DatagramSocket(null);
+            serverSocket.setReuseAddress(true);
+            serverSocket.bind(route.listen().toAddress());
+            serverSocket.setSoTimeout(1000);
+            running = true;
+
+            forwardThread = new Thread(this::forwardLoop, "zstdsrv-udp-fwd-" + route.label());
+            forwardThread.setDaemon(true);
+            forwardThread.start();
+        }
+
+        void stop() {
+            running = false;
+            if (serverSocket != null) {
+                serverSocket.close();
+            }
+            for (UdpSession session : sessions.values()) {
+                session.close();
+            }
+            sessions.clear();
+            if (forwardThread != null) {
+                try {
+                    forwardThread.join(1000);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        private void forwardLoop() {
+            byte[] buf = new byte[UDP_BUF_SIZE];
+            InetSocketAddress targetAddr = route.target().toAddress();
+            long lastSweep = System.currentTimeMillis();
+
+            while (running) {
+                try {
+                    DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                    try {
+                        serverSocket.receive(packet);
+                    } catch (SocketTimeoutException ignored) {
+                        sweepIfNeeded(lastSweep);
+                        lastSweep = System.currentTimeMillis();
+                        continue;
+                    }
+
+                    SocketAddress clientAddr = packet.getSocketAddress();
+                    UdpSession session = sessions.computeIfAbsent(clientAddr, k -> createSession(k, targetAddr));
+                    if (session == null) {
+                        continue;
+                    }
+                    session.lastActivity = System.currentTimeMillis();
+
+                    byte[] data = new byte[packet.getLength()];
+                    System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
+                    DatagramPacket forward = new DatagramPacket(data, data.length, targetAddr);
+                    session.socket.send(forward);
+
+                    long now = System.currentTimeMillis();
+                    if (now - lastSweep > 10_000L) {
+                        sweepIfNeeded(lastSweep);
+                        lastSweep = now;
+                    }
+                } catch (IOException e) {
+                    if (running) {
+                        LOGGER.debug("[zstdnet-server] UDP forward error [{}]: {}", route.label(), e.toString());
+                    }
+                }
+            }
+        }
+
+        private UdpSession createSession(SocketAddress clientAddr, InetSocketAddress targetAddr) {
+            try {
+                DatagramSocket clientSocket = new DatagramSocket();
+                clientSocket.setSoTimeout(1000);
+                UdpSession session = new UdpSession(clientSocket, clientAddr);
+
+                Thread returnThread = new Thread(() -> returnLoop(session), "zstdsrv-udp-ret-" + clientAddr);
+                returnThread.setDaemon(true);
+                returnThread.start();
+                session.returnThread = returnThread;
+                return session;
+            } catch (IOException e) {
+                LOGGER.debug("[zstdnet-server] UDP session create failed [{}] for {}: {}", route.label(), clientAddr, e.toString());
+                return null;
+            }
+        }
+
+        private void returnLoop(UdpSession session) {
+            byte[] buf = new byte[UDP_BUF_SIZE];
+            while (running && !session.socket.isClosed()) {
+                try {
+                    DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                    try {
+                        session.socket.receive(packet);
+                    } catch (SocketTimeoutException ignored) {
+                        if (System.currentTimeMillis() - session.lastActivity > SESSION_TIMEOUT_MS) {
+                            break;
+                        }
+                        continue;
+                    }
+                    session.lastActivity = System.currentTimeMillis();
+
+                    byte[] data = new byte[packet.getLength()];
+                    System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
+                    DatagramPacket returnPacket = new DatagramPacket(data, data.length, (InetSocketAddress) session.clientAddr);
+                    serverSocket.send(returnPacket);
+                } catch (IOException e) {
+                    if (running && !session.socket.isClosed()) {
+                        LOGGER.debug("[zstdnet-server] UDP return error [{}] for {}: {}", route.label(), session.clientAddr, e.toString());
+                    }
+                    break;
+                }
+            }
+            sessions.remove(session.clientAddr);
+            session.close();
+        }
+
+        private void sweepIfNeeded(long lastSweep) {
+            long now = System.currentTimeMillis();
+            if (now - lastSweep < 10_000L) {
+                return;
+            }
+            sessions.entrySet().removeIf(entry -> {
+                UdpSession s = entry.getValue();
+                if (now - s.lastActivity > SESSION_TIMEOUT_MS) {
+                    s.close();
+                    return true;
+                }
+                return false;
+            });
+        }
+
+        private static final class UdpSession {
+            final DatagramSocket socket;
+            final SocketAddress clientAddr;
+            volatile long lastActivity;
+            volatile Thread returnThread;
+
+            UdpSession(DatagramSocket socket, SocketAddress clientAddr) {
+                this.socket = socket;
+                this.clientAddr = clientAddr;
+                this.lastActivity = System.currentTimeMillis();
+            }
+
+            void close() {
+                try {
+                    socket.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
     }
 
     /**

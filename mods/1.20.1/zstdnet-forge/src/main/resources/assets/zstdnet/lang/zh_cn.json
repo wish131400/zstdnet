@@ -6,7 +6,7 @@
   "zstdnet.share_to_lan.port_unavailable": "Zstd 端口已被占用",
   "zstdnet.share_to_lan.write_failed": "开放局域网前写入 zstdnet-server.properties 失败。",
   "zstdnet.singleplayer.lan_hint": "在启动局域网服务器时，请设置好你要开放的 Zstd（公网端口）和游戏端口（随机的也行）即可。",
-  "zstdnet.singleplayer.lan_command_hint": "如果使用高级联机 Mod 无法显示 Zstd 的 UI，可以使用指令 /zstdport game <端口> 和 /zstdport zstd <端口> 设置端口。",
+  "zstdnet.singleplayer.lan_command_hint": "如果使用高级联机 Mod 无法显示 Zstd 的 UI，可以使用指令 /zstdport game <端口>、/zstdport zstd <端口>、/zstdport voice <端口> 或 /zstdport zstdvoice <端口> 设置端口。",
   "zstdnet.command.hud.status": "ZstdNet HUD 当前为 %s。使用 /zstdhud on|off|toggle 切换",
   "zstdnet.command.hud.enabled": "ZstdNet HUD 已启用。",
   "zstdnet.command.hud.disabled": "ZstdNet HUD 已关闭。",
@@ -28,5 +28,10 @@
   "zstdnet.command.port.zstd_reloaded": "Zstd 已重载端口：%s。",
   "zstdnet.command.port.game_set": "已将游戏端口设置为 %s。",
   "zstdnet.command.port.game_set_reopen": "已将游戏端口设置为 %s。当前世界已开放局域网，需要重新开放局域网后才会完全生效。",
+  "zstdnet.command.port.voice_status": "当前语音公网入口为 %s，后端语音端口为 %s。",
+  "zstdnet.command.port.voice_target_set": "已将后端语音端口设置为 %s。",
+  "zstdnet.command.port.voice_listen_set": "已将语音公网入口设置为 %s。",
+  "zstdnet.command.voice.no_permission": "只有拥有管理员权限的本地房主才能修改 ZstdNet 配置。",
+  "zstdnet.command.voice.write_failed": "写入 zstdnet-server.properties 失败。",
   "zstdnet.command.port.write_failed": "写入 zstdnet-server.properties 失败。"
 }

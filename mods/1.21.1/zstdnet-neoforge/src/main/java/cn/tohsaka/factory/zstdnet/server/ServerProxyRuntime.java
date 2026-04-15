@@ -1144,7 +1144,7 @@ final class ServerProxyRuntime {
             # auto_takeover=true 时会在启动时自动改写为当前公网入口。
             listen=0.0.0.0:${LISTEN_PORT}
 
-            # 后端 Minecraft / Velocity 地址。
+            # 后端 Minecraft
             # auto_takeover=true 时会在启动时自动改写为自动分配的本地后端端口。
             target=127.0.0.1:${TARGET_PORT}
 
