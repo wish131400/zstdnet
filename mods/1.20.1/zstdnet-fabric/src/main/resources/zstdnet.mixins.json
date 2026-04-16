@@ -10,6 +10,7 @@
     "ServerGamePacketListenerImplAccessor"
   ],
   "client": [
+    "ConnectScreenMixin",
     "DirectJoinServerScreenMixin",
     "JoinMultiplayerScreenMixin",
     "ShareToLanScreenMixin"

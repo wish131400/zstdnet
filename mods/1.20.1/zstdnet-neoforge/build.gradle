@@ -27,6 +27,11 @@ sourceSets {
             srcDir '../zstdnet-forge/src/main/java'
         }
     }
+    test {
+        java {
+            srcDir '../zstdnet-forge/src/test/java'
+        }
+    }
 }
 
 minecraft {
@@ -52,20 +57,34 @@ minecraft {
 }
 
 repositories {
+    mavenCentral()
+    all { repository ->
+        if (repository instanceof org.gradle.api.artifacts.repositories.MavenArtifactRepository && repository.url.toString().contains('maven.neoforged.net')) {
+            repository.content {
+                includeGroupByRegex 'net\\..*'
+                includeGroupByRegex 'cpw\\..*'
+            }
+        }
+    }
     maven {
         url = 'https://maven.neoforged.net/releases'
     }
-    mavenCentral()
 }
 
 dependencies {
     minecraft "net.neoforged:forge:${neo_version}"
     implementation 'com.github.luben:zstd-jni:1.5.7-7'
     jarJar 'com.github.luben:zstd-jni:[1.5.7-7,1.5.7-7]'
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
 }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
 }
 
 processResources {

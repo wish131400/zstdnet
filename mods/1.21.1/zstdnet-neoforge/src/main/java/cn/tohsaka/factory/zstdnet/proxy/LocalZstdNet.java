@@ -21,8 +21,8 @@ package cn.tohsaka.factory.zstdnet.proxy;
 
 import com.github.luben.zstd.ZstdInputStream;
 import com.github.luben.zstd.ZstdOutputStream;
-import com.mojang.logging.LogUtils;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.EOFException;
 import java.io.IOException;
@@ -43,7 +43,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class LocalZstdNet {
-    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final Logger LOGGER = LoggerFactory.getLogger(LocalZstdNet.class);
     private static final AtomicInteger WORKER_SEQ = new AtomicInteger(1);
     private static final AtomicInteger ACCEPT_SEQ = new AtomicInteger(1);
     private static final ExecutorService WORKERS = Executors.newCachedThreadPool(r -> {

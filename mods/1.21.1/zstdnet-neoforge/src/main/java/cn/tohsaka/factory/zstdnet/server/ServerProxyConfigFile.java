@@ -19,6 +19,8 @@
 
 package cn.tohsaka.factory.zstdnet.server;
 
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.fml.loading.FMLEnvironment;
 import net.neoforged.fml.loading.FMLPaths;
 
 import java.io.IOException;
@@ -26,15 +28,41 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Properties;
+import java.util.Set;
 
 public final class ServerProxyConfigFile {
     private static final int DEFAULT_MINECRAFT_PORT = 25565;
     private static final int DEFAULT_ZSTD_PORT = 25565;
     private static final int DEFAULT_BACKEND_PORT = 25566;
+    private static final int DEFAULT_VOICE_CHAT_PORT = 24454;
+    private static final int DEFAULT_VOICE_CHAT_LISTEN_PORT = 24455;
+    private static final int MIN_PORT = 1;
+    private static final int MAX_PORT = 65535;
     private static final String DEFAULT_LISTEN_HOST = "0.0.0.0";
+    private static final String DEFAULT_TARGET_HOST = "127.0.0.1";
+    private static final String DEFAULT_VOICE_CHAT_LISTEN = DEFAULT_LISTEN_HOST + ":" + DEFAULT_VOICE_CHAT_LISTEN_PORT;
+    private static final Set<String> KNOWN_KEYS = Set.of(
+        "enabled",
+        "auto_takeover",
+        "listen",
+        "target",
+        "voice_chat_passthrough",
+        "voice_chat_listen",
+        "voice_chat_target",
+        "level",
+        "max_conn_per_ip",
+        "max_req_per_window",
+        "request_window",
+        "ban_duration",
+        "stats_interval",
+        "flush_interval",
+        "idle_timeout",
+        "max_rate_per_conn_bps",
+        "max_rate_global_bps",
+        "burst_bytes"
+    );
 
     private ServerProxyConfigFile() {
     }
@@ -51,6 +79,14 @@ public final class ServerProxyConfigFile {
         return parsePort(loadProperties().getProperty("target", "127.0.0.1:" + DEFAULT_MINECRAFT_PORT), DEFAULT_MINECRAFT_PORT);
     }
 
+    public static int readVoiceListenPort() {
+        return parsePort(loadProperties().getProperty("voice_chat_listen", DEFAULT_VOICE_CHAT_LISTEN), DEFAULT_VOICE_CHAT_LISTEN_PORT);
+    }
+
+    public static int readVoiceTargetPort() {
+        return parsePort(loadProperties().getProperty("voice_chat_target", defaultVoiceChatTarget()), defaultVoiceChatTargetPort());
+    }
+
     public static void writeListenPort(int port) throws IOException {
         writePorts(port, null);
     }
@@ -59,75 +95,65 @@ public final class ServerProxyConfigFile {
         writePorts(null, port);
     }
 
+    public static void writeVoiceTargetPort(int port) throws IOException {
+        writeVoicePorts(null, port);
+    }
+
+    public static void writeVoiceListenPort(int port) throws IOException {
+        writeVoicePorts(port, null);
+    }
+
     public static void writePorts(Integer listenPort, Integer targetPort) throws IOException {
-        Properties props = loadProperties();
-        String currentListen = props.getProperty("listen", "0.0.0.0:" + DEFAULT_ZSTD_PORT);
-        String currentTarget = props.getProperty("target", "127.0.0.1:" + DEFAULT_MINECRAFT_PORT);
         Path path = path();
+        Properties props = normalizeProperties(loadProperties());
         Files.createDirectories(path.getParent());
 
+        String currentListen = props.getProperty("listen", DEFAULT_LISTEN_HOST + ":" + DEFAULT_ZSTD_PORT);
+        String currentTarget = props.getProperty("target", DEFAULT_TARGET_HOST + ":" + DEFAULT_MINECRAFT_PORT);
         String listenHost = parseHost(currentListen, DEFAULT_LISTEN_HOST);
-        String targetHost = parseHost(currentTarget, "127.0.0.1");
+        String targetHost = parseHost(currentTarget, DEFAULT_TARGET_HOST);
         String listenValue = listenHost + ":" + (listenPort != null ? listenPort : parsePort(currentListen, DEFAULT_ZSTD_PORT));
         String targetValue = targetHost + ":" + (targetPort != null ? targetPort : parsePort(currentTarget, DEFAULT_MINECRAFT_PORT));
-        if (!Files.exists(path)) {
-            Files.writeString(path, defaultConfigBody(listenValue, targetValue), StandardCharsets.UTF_8);
-            return;
-        }
+        props.setProperty("enabled", "true");
+        props.putIfAbsent("auto_takeover", "false");
+        props.setProperty("listen", listenValue);
+        props.setProperty("target", targetValue);
+        writeConfigWithComments(path, props, detectLineSeparator(path));
+    }
 
-        String text = Files.readString(path, StandardCharsets.UTF_8);
-        String lineSeparator = text.contains("\r\n") ? "\r\n" : "\n";
-        List<String> lines = new ArrayList<>(List.of(text.split("\\R", -1)));
-        boolean hasEnabled = false;
-        boolean hasAutoTakeover = false;
-        boolean hasListen = false;
-        boolean hasTarget = false;
+    public static void writeVoicePorts(Integer listenPort, Integer targetPort) throws IOException {
+        Path path = path();
+        Properties props = normalizeProperties(loadProperties());
+        Files.createDirectories(path.getParent());
 
-        for (int i = 0; i < lines.size(); i++) {
-            String line = lines.get(i);
-            String trimmed = line.trim();
-            if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("!")) {
-                continue;
-            }
-            if (trimmed.startsWith("enabled=")) {
-                lines.set(i, "enabled=true");
-                hasEnabled = true;
-                continue;
-            }
-            if (trimmed.startsWith("auto_takeover=")) {
-                hasAutoTakeover = true;
-                continue;
-            }
-            if (trimmed.startsWith("allow_raw_login=")) {
-                lines.remove(i);
-                i--;
-                continue;
-            }
-            if (trimmed.startsWith("listen=")) {
-                lines.set(i, "listen=" + listenValue);
-                hasListen = true;
-                continue;
-            }
-            if (trimmed.startsWith("target=")) {
-                lines.set(i, "target=" + targetValue);
-                hasTarget = true;
-            }
-        }
+        String currentListen = props.getProperty("voice_chat_listen", DEFAULT_VOICE_CHAT_LISTEN);
+        String currentTarget = props.getProperty("voice_chat_target", defaultVoiceChatTarget());
+        String listenHost = parseHost(currentListen, DEFAULT_LISTEN_HOST);
+        String targetHost = parseHost(currentTarget, DEFAULT_TARGET_HOST);
+        int resolvedTargetPort = targetPort != null ? targetPort : parsePort(currentTarget, DEFAULT_VOICE_CHAT_PORT);
+        int resolvedListenPort = listenPort != null ? listenPort : parsePort(currentListen, DEFAULT_VOICE_CHAT_LISTEN_PORT);
+        String listenValue = listenHost + ":" + resolvedListenPort;
+        String targetValue = targetHost + ":" + resolvedTargetPort;
+        props.setProperty("voice_chat_passthrough", "true");
+        props.setProperty("voice_chat_listen", listenValue);
+        props.setProperty("voice_chat_target", targetValue);
+        writeConfigWithComments(path, props, detectLineSeparator(path));
+    }
 
-        if (!hasEnabled) {
-            lines.add("enabled=true");
-        }
-        if (!hasAutoTakeover) {
-            lines.add("auto_takeover=false");
-        }
-        if (!hasListen) {
-            lines.add("listen=" + listenValue);
-        }
-        if (!hasTarget) {
-            lines.add("target=" + targetValue);
-        }
+    public static void writeResolvedAutoTakeoverConfig(
+        String listenHost,
+        int listenPort,
+        int targetPort
+    ) throws IOException {
+        Path path = path();
+        Properties props = normalizeProperties(loadProperties());
+        Files.createDirectories(path.getParent());
 
-        Files.writeString(path, String.join(lineSeparator, lines), StandardCharsets.UTF_8);
+        props.setProperty("enabled", "true");
+        props.setProperty("auto_takeover", "true");
+        props.setProperty("listen", parseHost(listenHost, DEFAULT_LISTEN_HOST) + ":" + listenPort);
+        props.setProperty("target", DEFAULT_TARGET_HOST + ":" + targetPort);
+        writeConfigWithComments(path, props, detectLineSeparator(path));
     }
 
     private static Properties loadProperties() {
@@ -138,6 +164,9 @@ public final class ServerProxyConfigFile {
             props.setProperty("auto_takeover", "true");
             props.setProperty("listen", "0.0.0.0:" + DEFAULT_ZSTD_PORT);
             props.setProperty("target", "127.0.0.1:" + DEFAULT_BACKEND_PORT);
+            props.setProperty("voice_chat_passthrough", "true");
+            props.setProperty("voice_chat_listen", DEFAULT_VOICE_CHAT_LISTEN);
+            props.setProperty("voice_chat_target", defaultVoiceChatTarget());
             return props;
         }
 
@@ -146,6 +175,158 @@ public final class ServerProxyConfigFile {
         } catch (IOException ignored) {
         }
         return props;
+    }
+
+    private static Properties normalizeProperties(Properties rawProps) {
+        Properties props = new Properties();
+        if (rawProps != null) {
+            props.putAll(rawProps);
+        }
+
+        props.remove("allow_raw_login");
+        props.putIfAbsent("enabled", "true");
+        props.putIfAbsent("auto_takeover", "true");
+        props.putIfAbsent("listen", DEFAULT_LISTEN_HOST + ":" + DEFAULT_ZSTD_PORT);
+        props.putIfAbsent("target", DEFAULT_TARGET_HOST + ":" + DEFAULT_BACKEND_PORT);
+        props.putIfAbsent("voice_chat_passthrough", "true");
+        props.putIfAbsent("voice_chat_listen", DEFAULT_VOICE_CHAT_LISTEN);
+        props.putIfAbsent("voice_chat_target", defaultVoiceChatTarget());
+        props.putIfAbsent("level", "9");
+        props.putIfAbsent("max_conn_per_ip", "9999");
+        props.putIfAbsent("max_req_per_window", "50");
+        props.putIfAbsent("request_window", "10s");
+        props.putIfAbsent("ban_duration", "1m");
+        props.putIfAbsent("stats_interval", "1s");
+        props.putIfAbsent("flush_interval", "2ms");
+        props.putIfAbsent("idle_timeout", "0");
+        props.putIfAbsent("max_rate_per_conn_bps", "0");
+        props.putIfAbsent("max_rate_global_bps", "0");
+        props.putIfAbsent("burst_bytes", "262144");
+        return props;
+    }
+
+    private static String detectLineSeparator(Path path) throws IOException {
+        if (!Files.exists(path)) {
+            return System.lineSeparator();
+        }
+        String text = Files.readString(path, StandardCharsets.UTF_8);
+        return text.contains("\r\n") ? "\r\n" : "\n";
+    }
+
+    private static int defaultVoiceChatTargetPort() {
+        return FMLEnvironment.dist == Dist.CLIENT ? DEFAULT_MINECRAFT_PORT : DEFAULT_VOICE_CHAT_PORT;
+    }
+
+    private static String defaultVoiceChatTarget() {
+        return DEFAULT_TARGET_HOST + ":" + defaultVoiceChatTargetPort();
+    }
+
+    private static void writeConfigWithComments(Path path, Properties rawProps, String lineSeparator) throws IOException {
+        Properties props = normalizeProperties(rawProps);
+        StringBuilder builder = new StringBuilder(1024);
+        appendLine(builder, "# ------------------------------------------------------------", lineSeparator);
+        appendLine(builder, "# zstdnet 内置服务端配置（自动维护）", lineSeparator);
+        appendLine(builder, "# 命令改端口和自动接管时，都会按这份带注释模板重新写回。", lineSeparator);
+        appendLine(builder, "# 这样即使配置被更新，说明文字也会保留。", lineSeparator);
+        appendLine(builder, "# ------------------------------------------------------------", lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 是否启用内置 zstd 代理。", lineSeparator);
+        appendLine(builder, "enabled=" + props.getProperty("enabled"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 是否自动接管当前对外公开的游戏端口。", lineSeparator);
+        appendLine(builder, "# 专用服开启后，会把 server.properties 的 server-port 作为公网入口，", lineSeparator);
+        appendLine(builder, "# 再把真正的后端游戏端口自动挪到别的本地端口。", lineSeparator);
+        appendLine(builder, "auto_takeover=" + props.getProperty("auto_takeover"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# zstd 公网监听入口。示例：0.0.0.0:25565", lineSeparator);
+        appendLine(builder, "listen=" + props.getProperty("listen"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 后端 Minecraft 目标地址。示例：127.0.0.1:25566", lineSeparator);
+        appendLine(builder, "target=" + props.getProperty("target"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 是否透传 Simple Voice Chat 的 UDP。", lineSeparator);
+        appendLine(builder, "voice_chat_passthrough=" + props.getProperty("voice_chat_passthrough"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 语音聊天的公网 UDP 入口。留空时，单机 / LAN 会跟随当前开放端口；写了值就按配置走。", lineSeparator);
+        appendLine(builder, "# /zstdport zstdvoice 会修改这个值。", lineSeparator);
+        appendLine(builder, "voice_chat_listen=" + props.getProperty("voice_chat_listen"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 语音聊天的后端 UDP 目标。留空时，单机 / LAN 会指向当前 LAN 端口；写了值就按配置走。", lineSeparator);
+        appendLine(builder, "# 专用服留空时默认指向本机 24454。", lineSeparator);
+        appendLine(builder, "# /zstdport voice 会修改这个值。", lineSeparator);
+        appendLine(builder, "voice_chat_target=" + props.getProperty("voice_chat_target"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# zstd 压缩等级（-5..22，通常 3..9 就够用）。", lineSeparator);
+        appendLine(builder, "level=" + props.getProperty("level"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 单个 IP 的最大并发连接数。0 表示不限制。", lineSeparator);
+        appendLine(builder, "max_conn_per_ip=" + props.getProperty("max_conn_per_ip"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 单个 IP 在 request_window 内允许的最大请求次数。<=0 表示不限制。", lineSeparator);
+        appendLine(builder, "max_req_per_window=" + props.getProperty("max_req_per_window"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 请求计数时间窗口。", lineSeparator);
+        appendLine(builder, "request_window=" + props.getProperty("request_window"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 超限后的封禁时长。", lineSeparator);
+        appendLine(builder, "ban_duration=" + props.getProperty("ban_duration"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 运行时统计日志输出间隔。0 表示关闭周期统计。", lineSeparator);
+        appendLine(builder, "stats_interval=" + props.getProperty("stats_interval"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# zstd flush 间隔。0 或 0ms 表示每次写入都 flush。", lineSeparator);
+        appendLine(builder, "flush_interval=" + props.getProperty("flush_interval"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 后端空闲超时。0 表示关闭超时。", lineSeparator);
+        appendLine(builder, "idle_timeout=" + props.getProperty("idle_timeout"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 单连接带宽限制，单位字节/秒。0 表示不限制。", lineSeparator);
+        appendLine(builder, "max_rate_per_conn_bps=" + props.getProperty("max_rate_per_conn_bps"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 全局总带宽限制，单位字节/秒。0 表示不限制。", lineSeparator);
+        appendLine(builder, "max_rate_global_bps=" + props.getProperty("max_rate_global_bps"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 令牌桶突发容量，单位字节。", lineSeparator);
+        appendLine(builder, "burst_bytes=" + props.getProperty("burst_bytes"), lineSeparator);
+
+        LinkedHashSet<String> extraKeys = new LinkedHashSet<>();
+        for (String key : rawProps.stringPropertyNames()) {
+            if (!KNOWN_KEYS.contains(key) && !"allow_raw_login".equals(key)) {
+                extraKeys.add(key);
+            }
+        }
+
+        if (!extraKeys.isEmpty()) {
+            appendLine(builder, "", lineSeparator);
+            appendLine(builder, "# 从旧配置中保留下来的额外自定义字段。", lineSeparator);
+            for (String key : extraKeys) {
+                appendLine(builder, key + "=" + rawProps.getProperty(key, ""), lineSeparator);
+            }
+        }
+
+        Files.writeString(path, builder.toString(), StandardCharsets.UTF_8);
+    }
+
+    private static void appendLine(StringBuilder builder, String line, String lineSeparator) {
+        builder.append(line).append(lineSeparator);
     }
 
     static String parseHost(String listen, String fallback) {
@@ -186,13 +367,4 @@ public final class ServerProxyConfigFile {
         return fallback;
     }
 
-    private static String defaultConfigBody(String listenValue, String targetValue) {
-        return """
-            # zstdnet server config
-            enabled=true
-            auto_takeover=true
-            listen=%s
-            target=%s
-            """.formatted(listenValue, targetValue);
-    }
 }

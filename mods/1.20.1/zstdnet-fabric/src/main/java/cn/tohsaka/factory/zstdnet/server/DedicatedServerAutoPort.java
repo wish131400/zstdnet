@@ -37,6 +37,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Properties;
 
 public final class DedicatedServerAutoPort {
@@ -296,65 +297,7 @@ public final class DedicatedServerAutoPort {
         int listenPort,
         int targetPort
     ) throws IOException {
-        Path path = ServerProxyConfigFile.path();
-        Files.createDirectories(path.getParent());
-
-        String text = Files.exists(path)
-            ? Files.readString(path, StandardCharsets.UTF_8)
-            : buildDefaultBody();
-        String lineSeparator = text.contains("\r\n") ? "\r\n" : "\n";
-        List<String> lines = new ArrayList<>(List.of(text.split("\\R", -1)));
-        boolean hasEnabled = false;
-        boolean hasAutoTakeover = false;
-        boolean hasListen = false;
-        boolean hasTarget = false;
-
-        for (int i = 0; i < lines.size(); i++) {
-            String line = lines.get(i);
-            String trimmed = line.trim();
-            if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("!")) {
-                continue;
-            }
-            if (trimmed.startsWith("enabled=")) {
-                lines.set(i, "enabled=true");
-                hasEnabled = true;
-                continue;
-            }
-            if (trimmed.startsWith("auto_takeover=")) {
-                lines.set(i, "auto_takeover=true");
-                hasAutoTakeover = true;
-                continue;
-            }
-            if (trimmed.startsWith("allow_raw_login=")) {
-                lines.remove(i);
-                i--;
-                continue;
-            }
-            if (trimmed.startsWith("listen=")) {
-                lines.set(i, "listen=" + listenHost + ":" + listenPort);
-                hasListen = true;
-                continue;
-            }
-            if (trimmed.startsWith("target=")) {
-                lines.set(i, "target=" + DEFAULT_TARGET_HOST + ":" + targetPort);
-                hasTarget = true;
-            }
-        }
-
-        if (!hasEnabled) {
-            lines.add("enabled=true");
-        }
-        if (!hasAutoTakeover) {
-            lines.add("auto_takeover=true");
-        }
-        if (!hasListen) {
-            lines.add("listen=" + listenHost + ":" + listenPort);
-        }
-        if (!hasTarget) {
-            lines.add("target=" + DEFAULT_TARGET_HOST + ":" + targetPort);
-        }
-
-        Files.writeString(path, String.join(lineSeparator, lines), StandardCharsets.UTF_8);
+        ServerProxyConfigFile.writeResolvedAutoTakeoverConfig(listenHost, listenPort, targetPort);
     }
 
     private static void persistCompressionThreshold(int publicPort) {
@@ -396,26 +339,6 @@ public final class DedicatedServerAutoPort {
         } catch (IOException e) {
             LOGGER.warn("[zstdnet-server] failed persisting server.properties compression threshold: {}", e.toString());
         }
-    }
-
-    private static String buildDefaultBody() {
-        return """
-            # zstdnet server config
-            # dedicated default: keep auto_takeover=true and let ZstdNet resolve listen/target automatically
-            enabled=true
-            auto_takeover=true
-            level=9
-            max_conn_per_ip=9999
-            max_req_per_window=50
-            request_window=10s
-            ban_duration=1m
-            stats_interval=1s
-            flush_interval=2ms
-            idle_timeout=0
-            max_rate_per_conn_bps=0
-            max_rate_global_bps=0
-            burst_bytes=262144
-            """;
     }
 
     record AutoPortPlan(

@@ -1,8 +1,7 @@
-# ZstdNet 文档
+# ZstdNet 文档（AI总结）
 
 - English: [README.en-US.md](README.en-US.md)
 - 中文: [README.zh-CN.md](README.zh-CN.md)
-- 视频教程: [ZstdNet 教程]( https://b23.tv/ab11URR )
 
 ## 省流版
 

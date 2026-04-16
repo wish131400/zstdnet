@@ -22,7 +22,7 @@
   "zstdnet.hud.mode.auto": "自动",
   "zstdnet.hud.mode.raw": "原始",
   "zstdnet.hud.mode.zstd": "Zstd",
-  "zstdnet.command.port.status": "当前 Zstd 端口为 %s，游戏端口为 %s。",
+  "zstdnet.command.port.status": "当前客户端 Zstd 端口为 %s，游戏端口为 %s。",
   "zstdnet.command.port.no_permission": "只有拥有管理员权限的本地房主才能修改 ZstdNet 端口。",
   "zstdnet.command.port.zstd_set": "已将 Zstd 端口设置为 %s。",
   "zstdnet.command.port.zstd_reloaded": "Zstd 已重载端口：%s。",

@@ -1,12 +1,12 @@
 {
   "zstdnet.share_to_lan.backend_port": "Backend Port",
   "zstdnet.share_to_lan.zstd_port": "Zstd Port",
-  "zstdnet.share_to_lan.port_help": "Top field: backend LAN port, bottom field: zstd tunnel port",
+  "zstdnet.share_to_lan.port_help": "Left: backend LAN port, Right: zstd tunnel port",
   "zstdnet.share_to_lan.port_invalid": "Zstd port must be between 1024 and 65535",
   "zstdnet.share_to_lan.port_unavailable": "Zstd port is already in use",
   "zstdnet.share_to_lan.write_failed": "Failed to update zstdnet-server.properties before opening LAN.",
   "zstdnet.singleplayer.lan_hint": "Before opening your world to LAN, set the Zstd public port and the game port first. The game port may also be random.",
-  "zstdnet.singleplayer.lan_command_hint": "If an advanced LAN mod does not show the Zstd UI, use /zstdport game <port> and /zstdport zstd <port> to set the ports.",
+  "zstdnet.singleplayer.lan_command_hint": "If an advanced LAN mod does not show the Zstd UI, use /zstdport game <port>, /zstdport zstd <port>, /zstdport voice <port>, or /zstdport zstdvoice <port> to set the ports.",
   "zstdnet.command.hud.status": "ZstdNet HUD is %s. Use /zstdhud on|off|toggle",
   "zstdnet.command.hud.enabled": "ZstdNet HUD enabled.",
   "zstdnet.command.hud.disabled": "ZstdNet HUD disabled.",
@@ -28,5 +28,10 @@
   "zstdnet.command.port.zstd_reloaded": "Zstd reloaded on port: %s.",
   "zstdnet.command.port.game_set": "Set backend game port to %s.",
   "zstdnet.command.port.game_set_reopen": "Set backend game port to %s. The world is already published to LAN, so reopen LAN for the change to fully take effect.",
+  "zstdnet.command.port.voice_status": "Current voice public entry: %s, backend voice port: %s.",
+  "zstdnet.command.port.voice_target_set": "Set backend voice port to %s.",
+  "zstdnet.command.port.voice_listen_set": "Set voice public entry to %s.",
+  "zstdnet.command.voice.no_permission": "Only the local host with admin permission can change ZstdNet config.",
+  "zstdnet.command.voice.write_failed": "Failed to write zstdnet-server.properties.",
   "zstdnet.command.port.write_failed": "Failed to write zstdnet-server.properties."
 }

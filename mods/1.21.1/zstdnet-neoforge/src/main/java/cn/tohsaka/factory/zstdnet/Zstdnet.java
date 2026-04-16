@@ -22,13 +22,13 @@ package cn.tohsaka.factory.zstdnet;
 import cn.tohsaka.factory.zstdnet.client.ClientProxyPublisher;
 import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
-import com.mojang.logging.LogUtils;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.loading.FMLEnvironment;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 模组主入口。
@@ -39,7 +39,7 @@ import org.slf4j.Logger;
 public class Zstdnet {
     public static final String MODID = "zstdnet";
 
-    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final Logger LOGGER = LoggerFactory.getLogger(Zstdnet.class);
 
     /**
      * 模组加载时注册客户端与服务端功能。

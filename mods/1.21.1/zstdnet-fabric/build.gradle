@@ -51,6 +51,8 @@ dependencies {
 
     implementation 'com.github.luben:zstd-jni:1.5.7-7'
     include 'com.github.luben:zstd-jni:1.5.7-7'
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
 }
 
 loom {
@@ -69,6 +71,10 @@ loom {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+test {
+    useJUnitPlatform()
 }
 
 processResources {

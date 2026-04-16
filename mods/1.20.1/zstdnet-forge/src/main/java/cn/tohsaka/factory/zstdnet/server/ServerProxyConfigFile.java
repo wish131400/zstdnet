@@ -253,13 +253,13 @@ public final class ServerProxyConfigFile {
         appendLine(builder, "voice_chat_passthrough=" + props.getProperty("voice_chat_passthrough"), lineSeparator);
         appendLine(builder, "", lineSeparator);
 
-        appendLine(builder, "# 语音聊天的公网 UDP 入口。", lineSeparator);
+        appendLine(builder, "# 语音聊天的公网 UDP 入口。留空时，单机 / LAN 会跟随当前开放端口；写了值就按配置走。", lineSeparator);
         appendLine(builder, "# /zstdport zstdvoice 会修改这个值。", lineSeparator);
         appendLine(builder, "voice_chat_listen=" + props.getProperty("voice_chat_listen"), lineSeparator);
         appendLine(builder, "", lineSeparator);
 
-        appendLine(builder, "# 语音聊天的后端 UDP 目标。", lineSeparator);
-        appendLine(builder, "# 客户端默认指向本机 25565，专用服默认指向本机 24454。", lineSeparator);
+        appendLine(builder, "# 语音聊天的后端 UDP 目标。留空时，单机 / LAN 会指向当前 LAN 端口；写了值就按配置走。", lineSeparator);
+        appendLine(builder, "# 专用服留空时默认指向本机 24454。", lineSeparator);
         appendLine(builder, "# /zstdport voice 会修改这个值。", lineSeparator);
         appendLine(builder, "voice_chat_target=" + props.getProperty("voice_chat_target"), lineSeparator);
         appendLine(builder, "", lineSeparator);

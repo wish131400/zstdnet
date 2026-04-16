@@ -20,12 +20,13 @@
 package cn.tohsaka.factory.zstdnet.client;
 
 import cn.tohsaka.factory.zstdnet.ClientConfig;
+import cn.tohsaka.factory.zstdnet.coremod.ConnectScreenHooks;
 import cn.tohsaka.factory.zstdnet.proxy.LocalZstdNet;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyConfigFile;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
-import com.mojang.logging.LogUtils;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
@@ -58,6 +59,7 @@ import net.neoforged.neoforge.client.event.RenderGuiEvent;
 import net.neoforged.neoforge.client.event.ScreenEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.List;
@@ -74,7 +76,7 @@ public final class ClientProxyPublisher {
     private static final int MAX_PORT = 65535;
     private static final int PORT_TEXT_NORMAL = 14737632;
     private static final int PORT_TEXT_INVALID = 16733525;
-    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final Logger LOGGER = LoggerFactory.getLogger(ClientProxyPublisher.class);
     private static final ClientProxyPublisher INSTANCE = new ClientProxyPublisher();
     private static final Component BACKEND_PORT_LABEL = Component.translatable("zstdnet.share_to_lan.backend_port");
     private static final Component ZSTD_PORT_LABEL = Component.translatable("zstdnet.share_to_lan.zstd_port");
@@ -161,6 +163,9 @@ public final class ClientProxyPublisher {
     }
 
     private void onScreenOpening(ScreenEvent.Opening event) {
+        if (event.getNewScreen() instanceof ConnectScreen) {
+            adoptInterceptedProxy();
+        }
         if (event.getCurrentScreen() instanceof ConnectScreen && event.getNewScreen() != null) {
             releaseActiveProxyListener();
         }
@@ -168,6 +173,7 @@ public final class ClientProxyPublisher {
 
     private void onClientLogin(ClientPlayerNetworkEvent.LoggingIn event) {
         synchronized (stateLock) {
+            adoptInterceptedProxyLocked();
             if (activeProxy != null) {
                 activeSession = activeProxy;
             }
@@ -282,25 +288,47 @@ public final class ClientProxyPublisher {
                 .then(Commands.literal("off").executes(context -> setHudVisible(context, false)))
                 .then(Commands.literal("toggle").executes(this::toggleHudVisible))
         );
-        event.getDispatcher().register(
-            Commands.literal("zstdport")
-                .executes(this::showPortStatus)
-                .then(Commands.literal("show").executes(this::showPortStatus))
-                .then(
-                    Commands.literal("zstd")
-                        .then(
-                            Commands.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
-                                .executes(this::setZstdPort)
-                        )
-                )
-                .then(
-                    Commands.literal("game")
-                        .then(
-                            Commands.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
-                                .executes(this::setGamePort)
-                        )
-                )
-        );
+        event.getDispatcher().register(buildPortCommand("zstdport"));
+    }
+
+    private LiteralArgumentBuilder<CommandSourceStack> buildPortCommand(String literal) {
+        return Commands.literal(literal)
+            .executes(this::showPortStatus)
+            .then(Commands.literal("show").executes(this::showPortStatus))
+            .then(
+                Commands.literal("zstd")
+                    .requires(source -> canEditPortConfig())
+                    .then(
+                        Commands.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
+                            .executes(this::setZstdPort)
+                    )
+            )
+            .then(
+                Commands.literal("game")
+                    .requires(source -> canEditPortConfig())
+                    .then(
+                        Commands.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
+                            .executes(this::setGamePort)
+                    )
+            )
+            .then(buildVoiceTargetBranch("voice"))
+            .then(buildVoiceListenBranch("zstdvoice"));
+    }
+
+    private LiteralArgumentBuilder<CommandSourceStack> buildVoiceTargetBranch(String literal) {
+        return Commands.literal(literal)
+            .requires(source -> canEditPortConfig())
+            .executes(this::showVoicePortStatus)
+            .then(Commands.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
+                .executes(this::setVoicePort));
+    }
+
+    private LiteralArgumentBuilder<CommandSourceStack> buildVoiceListenBranch(String literal) {
+        return Commands.literal(literal)
+            .requires(source -> canEditPortConfig())
+            .executes(this::showVoicePortStatus)
+            .then(Commands.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
+                .executes(this::setVoiceListenPort));
     }
 
     private void onKeyPressed(ScreenEvent.KeyPressed.Pre event) {
@@ -489,6 +517,7 @@ public final class ClientProxyPublisher {
         serverData.ip = remoteAddr;
         String localAddr = "127.0.0.1:" + proxy.localPort();
         LOGGER.info("zstdnet: {} -> {} via local {}", safe(serverData.name), remoteAddr, localAddr);
+        ConnectScreenHooks.setBypass(true);
         ConnectScreen.startConnecting(parent, Minecraft.getInstance(), ServerAddress.parseString(localAddr), serverData, false, null);
         return true;
     }
@@ -524,6 +553,24 @@ public final class ClientProxyPublisher {
         synchronized (stateLock) {
             closeActiveProxyLocked();
         }
+    }
+
+    private void adoptInterceptedProxy() {
+        synchronized (stateLock) {
+            adoptInterceptedProxyLocked();
+        }
+    }
+
+    private void adoptInterceptedProxyLocked() {
+        LocalZstdNet.ProxyHandle intercepted = ConnectScreenHooks.takeProxy();
+        if (intercepted == null) {
+            return;
+        }
+
+        closeActiveProxyLocked();
+        closeActiveSessionLocked();
+        activeProxy = intercepted;
+        LOGGER.info("zstdnet: adopted intercepted programmatic proxy on local {}", intercepted.localPort());
     }
 
     private void releaseActiveProxyListener() {
@@ -605,6 +652,15 @@ public final class ClientProxyPublisher {
         return 1;
     }
 
+    private int showVoicePortStatus(CommandContext<CommandSourceStack> context) {
+        sendClientMessage(Component.translatable(
+            "zstdnet.command.port.voice_status",
+            ServerProxyConfigFile.readVoiceListenPort(),
+            ServerProxyConfigFile.readVoiceTargetPort()
+        ));
+        return 1;
+    }
+
     private int setZstdPort(CommandContext<CommandSourceStack> context) {
         if (!canEditPortConfig()) {
             sendClientMessage(Component.translatable("zstdnet.command.port.no_permission"));
@@ -612,6 +668,11 @@ public final class ClientProxyPublisher {
         }
 
         int port = IntegerArgumentType.getInteger(context, "port");
+        int currentPort = ServerProxyConfigFile.readListenPort();
+        if (port != currentPort && !HttpUtil.isPortAvailable(port)) {
+            sendClientMessage(ZSTD_PORT_UNAVAILABLE);
+            return 0;
+        }
         try {
             ServerProxyConfigFile.writeListenPort(port);
         } catch (IOException e) {
@@ -643,6 +704,48 @@ public final class ClientProxyPublisher {
         sendClientMessage(Component.translatable(
             isLanPublished() ? "zstdnet.command.port.game_set_reopen" : "zstdnet.command.port.game_set",
             port
+        ));
+        return 1;
+    }
+
+    private int setVoicePort(CommandContext<CommandSourceStack> context) {
+        if (!canEditPortConfig()) {
+            sendClientMessage(Component.translatable("zstdnet.command.voice.no_permission"));
+            return 0;
+        }
+
+        int port = IntegerArgumentType.getInteger(context, "port");
+        try {
+            ServerProxyConfigFile.writeVoiceTargetPort(port);
+        } catch (IOException e) {
+            LOGGER.error("zstdnet: failed to update voice target port {}", port, e);
+            sendClientMessage(Component.translatable("zstdnet.command.voice.write_failed"));
+            return 0;
+        }
+        sendClientMessage(Component.translatable(
+            "zstdnet.command.port.voice_target_set",
+            ServerProxyConfigFile.readVoiceTargetPort()
+        ));
+        return 1;
+    }
+
+    private int setVoiceListenPort(CommandContext<CommandSourceStack> context) {
+        if (!canEditPortConfig()) {
+            sendClientMessage(Component.translatable("zstdnet.command.voice.no_permission"));
+            return 0;
+        }
+
+        int port = IntegerArgumentType.getInteger(context, "port");
+        try {
+            ServerProxyConfigFile.writeVoiceListenPort(port);
+        } catch (IOException e) {
+            LOGGER.error("zstdnet: failed to update voice listen port {}", port, e);
+            sendClientMessage(Component.translatable("zstdnet.command.voice.write_failed"));
+            return 0;
+        }
+        sendClientMessage(Component.translatable(
+            "zstdnet.command.port.voice_listen_set",
+            ServerProxyConfigFile.readVoiceListenPort()
         ));
         return 1;
     }

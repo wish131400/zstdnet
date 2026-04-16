@@ -20,7 +20,6 @@
 package cn.tohsaka.factory.zstdnet.server;
 
 import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
-import com.mojang.logging.LogUtils;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -30,6 +29,7 @@ import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -42,7 +42,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 监听 Forge 服务器生命周期，在专用服启动/停止时控制内置 zstd 代理运行时。
  */
 public final class ServerProxyBootstrap {
-    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final Logger LOGGER = LoggerFactory.getLogger(ServerProxyBootstrap.class);
     private static final AtomicBoolean INITIALIZED = new AtomicBoolean(false);
     private static final ServerProxyRuntime RUNTIME = new ServerProxyRuntime();
     private static volatile int publishedLanPort = -1;

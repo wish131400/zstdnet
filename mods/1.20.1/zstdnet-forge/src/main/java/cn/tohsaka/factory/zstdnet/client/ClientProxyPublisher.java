@@ -672,6 +672,11 @@ public final class ClientProxyPublisher {
         }
 
         int port = IntegerArgumentType.getInteger(context, "port");
+        int currentPort = ServerProxyConfigFile.readListenPort();
+        if (port != currentPort && !HttpUtil.isPortAvailable(port)) {
+            sendClientMessage(ZSTD_PORT_UNAVAILABLE);
+            return 0;
+        }
         try {
             ServerProxyConfigFile.writeListenPort(port);
         } catch (IOException e) {

@@ -20,11 +20,13 @@
 package cn.tohsaka.factory.zstdnet.client;
 
 import cn.tohsaka.factory.zstdnet.ClientConfig;
+import cn.tohsaka.factory.zstdnet.coremod.ConnectScreenHooks;
 import cn.tohsaka.factory.zstdnet.proxy.LocalZstdNet;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyConfigFile;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.logging.LogUtils;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
@@ -158,29 +160,58 @@ public final class ClientProxyPublisher {
                 .then(ClientCommandManager.literal("off").executes(context -> setHudVisible(context, false)))
                 .then(ClientCommandManager.literal("toggle").executes(this::toggleHudVisible))
         );
-        dispatcher.register(
-            ClientCommandManager.literal("zstdport")
-                .executes(this::showPortStatus)
-                .then(ClientCommandManager.literal("show").executes(this::showPortStatus))
-                .then(
-                    ClientCommandManager.literal("zstd")
-                        .then(
-                            ClientCommandManager.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
-                                .executes(this::setZstdPort)
-                        )
-                )
-                .then(
-                    ClientCommandManager.literal("game")
-                        .then(
-                            ClientCommandManager.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
-                                .executes(this::setGamePort)
-                        )
-                )
-        );
+        dispatcher.register(buildPortCommand("zstdport"));
+    }
+
+    private LiteralArgumentBuilder<FabricClientCommandSource> buildPortCommand(String literal) {
+        return ClientCommandManager.literal(literal)
+            .executes(this::showPortStatus)
+            .then(ClientCommandManager.literal("show").executes(this::showPortStatus))
+            .then(
+                ClientCommandManager.literal("zstd")
+                    .requires(source -> canEditPortConfig())
+                    .then(
+                        ClientCommandManager.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
+                            .executes(this::setZstdPort)
+                    )
+            )
+            .then(
+                ClientCommandManager.literal("game")
+                    .requires(source -> canEditPortConfig())
+                    .then(
+                        ClientCommandManager.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
+                            .executes(this::setGamePort)
+                    )
+            )
+            .then(buildVoiceTargetBranch("voice"))
+            .then(buildVoiceListenBranch("zstdvoice"));
+    }
+
+    private LiteralArgumentBuilder<FabricClientCommandSource> buildVoiceTargetBranch(String literal) {
+        return ClientCommandManager.literal(literal)
+            .requires(source -> canEditPortConfig())
+            .executes(this::showVoicePortStatus)
+            .then(
+                ClientCommandManager.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
+                    .executes(this::setVoicePort)
+            );
+    }
+
+    private LiteralArgumentBuilder<FabricClientCommandSource> buildVoiceListenBranch(String literal) {
+        return ClientCommandManager.literal(literal)
+            .requires(source -> canEditPortConfig())
+            .executes(this::showVoicePortStatus)
+            .then(
+                ClientCommandManager.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
+                    .executes(this::setVoiceListenPort)
+            );
     }
 
     private void onClientTick(Minecraft minecraft) {
         Screen currentScreen = minecraft.screen;
+        if (currentScreen instanceof ConnectScreen && currentScreen != lastObservedScreen) {
+            adoptInterceptedProxy();
+        }
         if (lastObservedScreen instanceof ConnectScreen && currentScreen != lastObservedScreen) {
             releaseActiveProxyListener();
         }
@@ -202,6 +233,7 @@ public final class ClientProxyPublisher {
 
     private void onClientLogin() {
         synchronized (stateLock) {
+            adoptInterceptedProxyLocked();
             if (activeProxy != null) {
                 activeSession = activeProxy;
             }
@@ -522,6 +554,7 @@ public final class ClientProxyPublisher {
         serverData.ip = remoteAddr;
         String localAddr = "127.0.0.1:" + proxy.localPort();
         LOGGER.info("zstdnet: {} -> {} via local {}", safe(serverData.name), remoteAddr, localAddr);
+        ConnectScreenHooks.setBypass(true);
         ConnectScreen.startConnecting(parent, Minecraft.getInstance(), ServerAddress.parseString(localAddr), serverData, false);
         return true;
     }
@@ -557,6 +590,24 @@ public final class ClientProxyPublisher {
         synchronized (stateLock) {
             closeActiveProxyLocked();
         }
+    }
+
+    private void adoptInterceptedProxy() {
+        synchronized (stateLock) {
+            adoptInterceptedProxyLocked();
+        }
+    }
+
+    private void adoptInterceptedProxyLocked() {
+        LocalZstdNet.ProxyHandle intercepted = ConnectScreenHooks.takeProxy();
+        if (intercepted == null) {
+            return;
+        }
+
+        closeActiveProxyLocked();
+        closeActiveSessionLocked();
+        activeProxy = intercepted;
+        LOGGER.info("zstdnet: adopted intercepted programmatic proxy on local {}", intercepted.localPort());
     }
 
     private void releaseActiveProxyListener() {
@@ -638,6 +689,15 @@ public final class ClientProxyPublisher {
         return 1;
     }
 
+    private int showVoicePortStatus(CommandContext<FabricClientCommandSource> context) {
+        sendClientMessage(Component.translatable(
+            "zstdnet.command.port.voice_status",
+            ServerProxyConfigFile.readVoiceListenPort(),
+            ServerProxyConfigFile.readVoiceTargetPort()
+        ));
+        return 1;
+    }
+
     private int setZstdPort(CommandContext<FabricClientCommandSource> context) {
         if (!canEditPortConfig()) {
             sendClientMessage(Component.translatable("zstdnet.command.port.no_permission"));
@@ -645,6 +705,11 @@ public final class ClientProxyPublisher {
         }
 
         int port = IntegerArgumentType.getInteger(context, "port");
+        int currentPort = ServerProxyConfigFile.readListenPort();
+        if (port != currentPort && !HttpUtil.isPortAvailable(port)) {
+            sendClientMessage(ZSTD_PORT_UNAVAILABLE);
+            return 0;
+        }
         try {
             ServerProxyConfigFile.writeListenPort(port);
         } catch (IOException e) {
@@ -676,6 +741,48 @@ public final class ClientProxyPublisher {
         sendClientMessage(Component.translatable(
             isLanPublished() ? "zstdnet.command.port.game_set_reopen" : "zstdnet.command.port.game_set",
             port
+        ));
+        return 1;
+    }
+
+    private int setVoicePort(CommandContext<FabricClientCommandSource> context) {
+        if (!canEditPortConfig()) {
+            sendClientMessage(Component.translatable("zstdnet.command.voice.no_permission"));
+            return 0;
+        }
+
+        int port = IntegerArgumentType.getInteger(context, "port");
+        try {
+            ServerProxyConfigFile.writeVoiceTargetPort(port);
+        } catch (IOException e) {
+            LOGGER.error("zstdnet: failed to update voice target port {}", port, e);
+            sendClientMessage(Component.translatable("zstdnet.command.voice.write_failed"));
+            return 0;
+        }
+        sendClientMessage(Component.translatable(
+            "zstdnet.command.port.voice_target_set",
+            ServerProxyConfigFile.readVoiceTargetPort()
+        ));
+        return 1;
+    }
+
+    private int setVoiceListenPort(CommandContext<FabricClientCommandSource> context) {
+        if (!canEditPortConfig()) {
+            sendClientMessage(Component.translatable("zstdnet.command.voice.no_permission"));
+            return 0;
+        }
+
+        int port = IntegerArgumentType.getInteger(context, "port");
+        try {
+            ServerProxyConfigFile.writeVoiceListenPort(port);
+        } catch (IOException e) {
+            LOGGER.error("zstdnet: failed to update voice listen port {}", port, e);
+            sendClientMessage(Component.translatable("zstdnet.command.voice.write_failed"));
+            return 0;
+        }
+        sendClientMessage(Component.translatable(
+            "zstdnet.command.port.voice_listen_set",
+            ServerProxyConfigFile.readVoiceListenPort()
         ));
         return 1;
     }

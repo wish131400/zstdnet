@@ -1179,11 +1179,11 @@ final class ServerProxyRuntime {
             # Simple Voice Chat 的原样 UDP 转发。
             voice_chat_passthrough=true
 
-            # 语音聊天的公网 UDP 入口；默认使用 24455。
-            voice_chat_listen=0.0.0.0:24455
+            # 语音聊天的公网 UDP 入口；留空时跟随当前 LAN 端口，填写后按配置值生效。
+            voice_chat_listen=
 
-            # 语音聊天的后端 UDP 目标；默认指向本机 25565。
-            voice_chat_target=127.0.0.1:25565
+            # 语音聊天的后端 UDP 目标；留空时指向本机当前 LAN 端口，填写后按配置值生效。
+            voice_chat_target=
 
             # zstd 压缩等级（1-22，通常建议 3-9）。
             level=${LEVEL}
@@ -1700,25 +1700,11 @@ final class ServerProxyRuntime {
         }
 
         private static boolean isDefaultVoiceChatListen(String raw) {
-            if (raw == null || raw.isBlank()) {
-                return true;
-            }
-            try {
-                return HostPort.parse(raw).equals(new HostPort(DEFAULT_LISTEN_HOST, DEFAULT_VOICE_CHAT_LISTEN_PORT));
-            } catch (Exception ignored) {
-                return false;
-            }
+            return raw == null || raw.isBlank();
         }
 
         private static boolean isDefaultVoiceChatTarget(String raw) {
-            if (raw == null || raw.isBlank()) {
-                return true;
-            }
-            try {
-                return HostPort.parse(raw).equals(new HostPort("127.0.0.1", DEFAULT_VOICE_CHAT_PORT));
-            } catch (Exception ignored) {
-                return false;
-            }
+            return raw == null || raw.isBlank();
         }
 
     }

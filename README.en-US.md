@@ -335,12 +335,10 @@ Simple Voice Chat audio is not compressed by zstd. ZstdNet only forwards the UDP
   - Set to false to disable voice UDP route handling entirely
 
 - `voice_chat_listen`：Optional public UDP entry for voice chat
-  - Leave this blank only when Simple Voice Chat uses `port=-1`, meaning voice chat and the game share the same UDP port, so ZstdNet can reuse the game's public UDP entry
   - In singleplayer/LAN mode, the generated default is usually `0.0.0.0:24455`
   - In separate-port mode, this must be set explicitly
 
 - `voice_chat_target`：Optional backend UDP target for voice chat
-  - Leave this blank only when Simple Voice Chat uses `port=-1`, meaning voice chat and the game share the same UDP port, so ZstdNet can reuse the game's public UDP entry
   - In singleplayer/LAN mode, the generated default is `127.0.0.1:25565`
   - On dedicated servers, the generated default is `127.0.0.1:24454`
   - In separate-port mode, when `voice_chat_listen` is set, it defaults to `127.0.0.1:<SVC port>`

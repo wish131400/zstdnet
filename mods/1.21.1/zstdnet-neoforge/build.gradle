@@ -47,6 +47,14 @@ neoForge {
 
 repositories {
     mavenCentral()
+    all { repository ->
+        if (repository instanceof org.gradle.api.artifacts.repositories.MavenArtifactRepository && repository.url.toString().contains('maven.neoforged.net')) {
+            repository.content {
+                includeGroupByRegex 'net\\..*'
+                includeGroupByRegex 'cpw\\..*'
+            }
+        }
+    }
 }
 
 dependencies {
@@ -57,10 +65,17 @@ dependencies {
         }
     }
     additionalRuntimeClasspath 'com.github.luben:zstd-jni:1.5.7-7'
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.slf4j:slf4j-api:2.0.9'
 }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
 }
 
 processResources {

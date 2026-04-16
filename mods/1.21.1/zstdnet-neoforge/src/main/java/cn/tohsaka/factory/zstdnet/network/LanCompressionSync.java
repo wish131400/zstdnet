@@ -20,7 +20,6 @@
 package cn.tohsaka.factory.zstdnet.network;
 
 import cn.tohsaka.factory.zstdnet.Zstdnet;
-import com.mojang.logging.LogUtils;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.RegistryFriendlyByteBuf;
@@ -35,11 +34,12 @@ import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.handling.IPayloadContext;
 import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class LanCompressionSync {
     public static final int LAN_THRESHOLD = 1048576;
 
-    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final Logger LOGGER = LoggerFactory.getLogger(LanCompressionSync.class);
     private static final String PROTOCOL_VERSION = "1";
     private static final AtomicBoolean INITIALIZED = new AtomicBoolean(false);
 
