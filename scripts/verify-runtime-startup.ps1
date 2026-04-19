@@ -124,10 +124,17 @@ function Invoke-TargetCheck {
     }
 
     Set-Content -Path (Join-Path $runDir 'eula.txt') -Value 'eula=true'
+    $onlineMode = if ($Target.ContainsKey('onlineMode')) { [bool]$Target.onlineMode } else { $false }
+    $expectedThreshold = if ($onlineMode) { '256' } else { '1048576' }
+    $expectedLog = if ($onlineMode) {
+        'keeping dedicated network-compression-threshold unchanged because server.properties has online-mode=true.'
+    } else {
+        'forced dedicated network-compression-threshold=1048576'
+    }
     @(
         'motd=ZstdNet startup check'
         "server-port=$($Target.publicPort)"
-        'online-mode=false'
+        "online-mode=$($onlineMode.ToString().ToLowerInvariant())"
         'enable-rcon=false'
         'enable-query=false'
         'broadcast-console-to-ops=false'
@@ -183,7 +190,7 @@ function Invoke-TargetCheck {
         'auto takeover armed',
         'public entry is',
         'server.properties port is now the public entry; backend port was reassigned automatically.',
-        'forced dedicated network-compression-threshold=1048576'
+        $expectedLog
     )) {
         if ($stdout -notmatch [regex]::Escape($needle)) {
             $failures.Add("missing log: $needle")
@@ -202,8 +209,8 @@ function Invoke-TargetCheck {
         $failures.Add("server.properties server-port should stay on public port $($Target.publicPort), actual $($serverProps['server-port'])")
     }
 
-    if (($serverProps['network-compression-threshold']) -ne '1048576') {
-        $failures.Add('server.properties network-compression-threshold was not forced to 1048576')
+    if (($serverProps['network-compression-threshold']) -ne $expectedThreshold) {
+        $failures.Add("server.properties network-compression-threshold should be $expectedThreshold, actual $($serverProps['network-compression-threshold'])")
     }
 
     foreach ($required in @('enabled', 'auto_takeover', 'listen', 'target')) {
@@ -225,6 +232,7 @@ function Invoke-TargetCheck {
 
     [pscustomobject]@{
         Name                = $Target.name
+        OnlineMode          = $onlineMode
         PublicPort          = $Target.publicPort
         BackendPort         = $backendBindPort
         CompressionThreshold= $serverProps['network-compression-threshold']
@@ -245,49 +253,104 @@ $gradleHome = Join-Path $buildRoot 'tools\gradle-8.8\bin\gradle.bat'
 
 $targets = @(
     @{
-        name = 'forge-1.20.1'
+        name = 'forge-1.20.1 offline'
         projectDir = Join-Path $repoRoot 'mods\1.20.1\zstdnet-forge'
         projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-forge-startup-check'
         runDir = Join-Path $buildRoot 'mods\1.20.1\zstdnet-forge\run'
         publicPort = 25565
         gradleBat = $gradleHome
         javaHome = 'C:\Program Files\Java\jdk-17'
+        onlineMode = $false
     },
     @{
-        name = 'neoforge-1.20.1'
+        name = 'neoforge-1.20.1 offline'
         projectDir = Join-Path $repoRoot 'mods\1.20.1\zstdnet-neoforge'
         projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-neoforge-1.20.1-startup-check'
         runDir = Join-Path $buildRoot 'mods\1.20.1\zstdnet-neoforge\run'
         publicPort = 25575
         gradleBat = $gradleHome
         javaHome = 'C:\Program Files\Java\jdk-17'
+        onlineMode = $false
     },
     @{
-        name = 'neoforge-1.21.1'
+        name = 'neoforge-1.21.1 offline'
         projectDir = Join-Path $repoRoot 'mods\1.21.1\zstdnet-neoforge'
         projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-neoforge-1.21.1-startup-check'
         runDir = Join-Path $buildRoot 'mods\1.21.1\zstdnet-neoforge\run'
         publicPort = 25585
         gradleBat = $gradleHome
         javaHome = 'C:\Program Files\Java\jdk-21'
+        onlineMode = $false
     },
     @{
-        name = 'fabric-1.20.1'
+        name = 'fabric-1.20.1 offline'
         projectDir = Join-Path $repoRoot 'mods\1.20.1\zstdnet-fabric'
         projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-fabric-1.20.1-startup-check'
         runDir = Join-Path $buildRoot 'mods\1.20.1\zstdnet-fabric\run'
         publicPort = 25595
         gradleBat = $gradleHome
         javaHome = 'C:\Program Files\Java\jdk-17'
+        onlineMode = $false
     },
     @{
-        name = 'fabric-1.21.1'
+        name = 'fabric-1.21.1 offline'
         projectDir = Join-Path $repoRoot 'mods\1.21.1\zstdnet-fabric'
         projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-fabric-1.21.1-startup-check'
         runDir = Join-Path $buildRoot 'mods\1.21.1\zstdnet-fabric\run'
         publicPort = 25605
         gradleBat = $gradleHome
         javaHome = 'C:\Program Files\Java\jdk-21'
+        onlineMode = $false
+    },
+    @{
+        name = 'forge-1.20.1 online'
+        projectDir = Join-Path $repoRoot 'mods\1.20.1\zstdnet-forge'
+        projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-forge-startup-check'
+        runDir = Join-Path $buildRoot 'mods\1.20.1\zstdnet-forge\run'
+        publicPort = 25565
+        gradleBat = $gradleHome
+        javaHome = 'C:\Program Files\Java\jdk-17'
+        onlineMode = $true
+    },
+    @{
+        name = 'neoforge-1.20.1 online'
+        projectDir = Join-Path $repoRoot 'mods\1.20.1\zstdnet-neoforge'
+        projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-neoforge-1.20.1-startup-check'
+        runDir = Join-Path $buildRoot 'mods\1.20.1\zstdnet-neoforge\run'
+        publicPort = 25575
+        gradleBat = $gradleHome
+        javaHome = 'C:\Program Files\Java\jdk-17'
+        onlineMode = $true
+    },
+    @{
+        name = 'neoforge-1.21.1 online'
+        projectDir = Join-Path $repoRoot 'mods\1.21.1\zstdnet-neoforge'
+        projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-neoforge-1.21.1-startup-check'
+        runDir = Join-Path $buildRoot 'mods\1.21.1\zstdnet-neoforge\run'
+        publicPort = 25585
+        gradleBat = $gradleHome
+        javaHome = 'C:\Program Files\Java\jdk-21'
+        onlineMode = $true
+    },
+    @{
+        name = 'fabric-1.20.1 online'
+        projectDir = Join-Path $repoRoot 'mods\1.20.1\zstdnet-fabric'
+        projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-fabric-1.20.1-startup-check'
+        runDir = Join-Path $buildRoot 'mods\1.20.1\zstdnet-fabric\run'
+        publicPort = 25595
+        gradleBat = $gradleHome
+        javaHome = 'C:\Program Files\Java\jdk-17'
+        onlineMode = $true
+    },
+    @{
+        name = 'fabric-1.21.1 online'
+        projectDir = Join-Path $repoRoot 'mods\1.21.1\zstdnet-fabric'
+        projectCacheDir = Join-Path $buildRoot 'cache\project-cache\zstdnet-fabric-1.21.1-startup-check'
+        runDir = Join-Path $buildRoot 'mods\1.21.1\zstdnet-fabric\run'
+        publicPort = 25605
+        gradleBat = $gradleHome
+        javaHome = 'C:\Program Files\Java\jdk-21'
+        onlineMode = $true
     }
 )
 
@@ -311,7 +374,7 @@ $env:JAVA_HOME = $originalJavaHome
 $env:Path = $originalPath
 
 $failed = $results | Where-Object { -not $_.Passed }
-$results | Format-Table Name, Passed, PublicPort, BackendPort, CompressionThreshold, Listen, Target -AutoSize
+$results | Format-Table Name, OnlineMode, Passed, PublicPort, BackendPort, CompressionThreshold, Listen, Target -AutoSize
 
 if ($failed) {
     foreach ($item in $failed) {
