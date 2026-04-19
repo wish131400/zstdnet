@@ -70,18 +70,20 @@ public final class DedicatedServerAutoPort {
             return current;
         }
 
+        boolean shouldForceCompressionThreshold = shouldForceCompressionThreshold();
+
         if (!config.autoTakeover) {
             activePlan = null;
-            DedicatedServerProperties rewritten = rewriteProperties(current, null);
+            DedicatedServerProperties rewritten = rewriteProperties(current, null, shouldForceCompressionThreshold);
             if (rewritten == null) {
                 LOGGER.error("[zstdnet-server] failed to force dedicated compression threshold. Keeping current server.properties values.");
                 return current;
             }
             if (!replaceSettingsProperties(server, rewritten)) {
-                LOGGER.warn("[zstdnet-server] dedicated compression threshold was forced in returned properties, but DedicatedServerSettings cache could not be updated.");
+                LOGGER.warn("[zstdnet-server] dedicated server properties were rewritten in returned properties, but DedicatedServerSettings cache could not be updated.");
             }
-            persistCompressionThreshold(normalizePort(server.getPort() > 0 ? server.getPort() : current.serverPort, DEFAULT_PUBLIC_PORT));
-            LOGGER.info("[zstdnet-server] forced dedicated network-compression-threshold={} for built-in zstd proxy.", ZSTD_COMPRESSION_THRESHOLD);
+            persistCompressionThreshold(normalizePort(server.getPort() > 0 ? server.getPort() : current.serverPort, DEFAULT_PUBLIC_PORT), shouldForceCompressionThreshold);
+            logCompressionThresholdDecision(shouldForceCompressionThreshold);
             return rewritten;
         }
 
@@ -94,7 +96,7 @@ public final class DedicatedServerAutoPort {
             activePlan = null;
             return current;
         }
-        DedicatedServerProperties rewritten = rewriteProperties(current, backendPort);
+        DedicatedServerProperties rewritten = rewriteProperties(current, backendPort, shouldForceCompressionThreshold);
         if (rewritten == null) {
             LOGGER.error("[zstdnet-server] auto takeover could not rewrite dedicated server properties. Falling back to manual mode.");
             activePlan = null;
@@ -118,7 +120,7 @@ public final class DedicatedServerAutoPort {
         } catch (IOException e) {
             LOGGER.warn("[zstdnet-server] failed to persist resolved auto takeover config: {}", e.toString());
         }
-        persistCompressionThreshold(publicPort);
+        persistCompressionThreshold(publicPort, shouldForceCompressionThreshold);
 
         LOGGER.info(
             "[zstdnet-server] auto takeover armed: public_entry={}:{} backend={}:{}",
@@ -128,8 +130,23 @@ public final class DedicatedServerAutoPort {
             backendPort
         );
         LOGGER.info("[zstdnet-server] server.properties port is now the public entry; backend port was reassigned automatically.");
-        LOGGER.info("[zstdnet-server] forced dedicated network-compression-threshold={} for built-in zstd proxy.", ZSTD_COMPRESSION_THRESHOLD);
+        logCompressionThresholdDecision(shouldForceCompressionThreshold);
         return rewritten;
+    }
+
+    private static boolean shouldForceCompressionThreshold() {
+        Path path = Path.of("server.properties");
+        if (!Files.exists(path)) {
+            return true;
+        }
+        Properties props = new Properties();
+        try (var in = Files.newInputStream(path)) {
+            props.load(in);
+        } catch (IOException e) {
+            LOGGER.warn("[zstdnet-server] failed reading {} while checking online-mode: {}", path, e.toString());
+            return true;
+        }
+        return !parseBoolean(props.getProperty("online-mode"), true);
     }
 
     static AutoPortPlan activePlan() {
@@ -219,7 +236,11 @@ public final class DedicatedServerAutoPort {
         }
     }
 
-    private static DedicatedServerProperties rewriteProperties(DedicatedServerProperties current, Integer backendPort) {
+    private static DedicatedServerProperties rewriteProperties(
+        DedicatedServerProperties current,
+        Integer backendPort,
+        boolean forceCompressionThreshold
+    ) {
         try {
             Properties base = extractProperties(current);
             Properties copy = new Properties();
@@ -227,7 +248,9 @@ public final class DedicatedServerAutoPort {
             if (backendPort != null) {
                 copy.setProperty("server-port", String.valueOf(backendPort));
             }
-            copy.setProperty("network-compression-threshold", String.valueOf(ZSTD_COMPRESSION_THRESHOLD));
+            if (forceCompressionThreshold) {
+                copy.setProperty("network-compression-threshold", String.valueOf(ZSTD_COMPRESSION_THRESHOLD));
+            }
             return new DedicatedServerProperties(copy);
         } catch (Exception e) {
             LOGGER.warn("[zstdnet-server] failed to clone DedicatedServerProperties: {}", e.toString());
@@ -300,7 +323,7 @@ public final class DedicatedServerAutoPort {
         ServerProxyConfigFile.writeResolvedAutoTakeoverConfig(listenHost, listenPort, targetPort);
     }
 
-    private static void persistCompressionThreshold(int publicPort) {
+    private static void persistCompressionThreshold(int publicPort, boolean forceCompressionThreshold) {
         Path path = Path.of("server.properties");
         if (!Files.exists(path)) {
             return;
@@ -322,7 +345,7 @@ public final class DedicatedServerAutoPort {
                     hasServerPort = true;
                     continue;
                 }
-                if (trimmed.startsWith("network-compression-threshold=")) {
+                if (forceCompressionThreshold && trimmed.startsWith("network-compression-threshold=")) {
                     lines.set(i, "network-compression-threshold=" + ZSTD_COMPRESSION_THRESHOLD);
                     hasCompression = true;
                 }
@@ -331,7 +354,7 @@ public final class DedicatedServerAutoPort {
             if (!hasServerPort) {
                 lines.add("server-port=" + publicPort);
             }
-            if (!hasCompression) {
+            if (forceCompressionThreshold && !hasCompression) {
                 lines.add("network-compression-threshold=" + ZSTD_COMPRESSION_THRESHOLD);
             }
 
@@ -339,6 +362,14 @@ public final class DedicatedServerAutoPort {
         } catch (IOException e) {
             LOGGER.warn("[zstdnet-server] failed persisting server.properties compression threshold: {}", e.toString());
         }
+    }
+
+    private static void logCompressionThresholdDecision(boolean forceCompressionThreshold) {
+        if (forceCompressionThreshold) {
+            LOGGER.info("[zstdnet-server] forced dedicated network-compression-threshold={} for built-in zstd proxy.", ZSTD_COMPRESSION_THRESHOLD);
+            return;
+        }
+        LOGGER.info("[zstdnet-server] keeping dedicated network-compression-threshold unchanged because server.properties has online-mode=true.");
     }
 
     record AutoPortPlan(
