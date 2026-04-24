@@ -2,6 +2,8 @@
 
 - English: [README.en-US.md](README.en-US.md)
 - 中文: [README.zh-CN.md](README.zh-CN.md)
+- (本项目自V1.3.8版本不在发布新版本jar在github，请前往curseforge下载)
+- (Starting from version V1.3.8, this project will no longer release new version JAR files on GitHub. Please go to CurseForge to download.)
 
 ## 省流版
 
