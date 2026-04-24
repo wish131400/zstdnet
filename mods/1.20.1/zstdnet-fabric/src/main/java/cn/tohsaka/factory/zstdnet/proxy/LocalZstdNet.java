@@ -28,13 +28,18 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketAddress;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -44,8 +49,10 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public final class LocalZstdNet {
     private static final Logger LOGGER = LogUtils.getLogger();
+    private static final int UDP_BUF_SIZE = 65535;
     private static final AtomicInteger WORKER_SEQ = new AtomicInteger(1);
     private static final AtomicInteger ACCEPT_SEQ = new AtomicInteger(1);
+    private static final AtomicInteger UDP_SEQ = new AtomicInteger(1);
     private static final ExecutorService WORKERS = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "zstdnet-worker-" + WORKER_SEQ.getAndIncrement());
         t.setDaemon(true);
@@ -99,7 +106,21 @@ public final class LocalZstdNet {
         acceptThread.setDaemon(true);
         acceptThread.start();
 
-        return new ProxyHandle(listener, running, acceptThread, resolvedMode, remoteHost, remotePort, stats);
+        UdpForwarder udpForwarder = startUdpForwarder(remoteHost, remotePort, listener.getLocalPort());
+
+        return new ProxyHandle(listener, running, acceptThread, udpForwarder, resolvedMode, remoteHost, remotePort, stats);
+    }
+
+    private static UdpForwarder startUdpForwarder(String remoteHost, int remotePort, int localPort) {
+        try {
+            UdpForwarder forwarder = new UdpForwarder(remoteHost, remotePort, localPort);
+            forwarder.start();
+            LOGGER.info("zstdnet: UDP passthrough armed 127.0.0.1:{} -> {}:{}", localPort, remoteHost, remotePort);
+            return forwarder;
+        } catch (IOException e) {
+            LOGGER.warn("zstdnet: UDP passthrough disabled on 127.0.0.1:{} -> {}:{}: {}", localPort, remoteHost, remotePort, e.toString());
+            return null;
+        }
     }
 
     private static Mode resolveMode(String remoteHost, int remotePort, Mode requestedMode) {
@@ -624,6 +645,170 @@ public final class LocalZstdNet {
     private record VarIntRead(int value, int next) {
     }
 
+    private static final class UdpForwarder {
+        private static final long SESSION_IDLE_TIMEOUT_MS = 60_000L;
+
+        private final String remoteHost;
+        private final int remotePort;
+        private final int localPort;
+        private final AtomicBoolean running = new AtomicBoolean();
+        private final Map<SocketAddress, UdpSession> sessions = new ConcurrentHashMap<>();
+        private DatagramSocket localSocket;
+        private InetSocketAddress target;
+        private Thread forwardThread;
+
+        private UdpForwarder(String remoteHost, int remotePort, int localPort) {
+            this.remoteHost = remoteHost;
+            this.remotePort = remotePort;
+            this.localPort = localPort;
+        }
+
+        private void start() throws IOException {
+            localSocket = new DatagramSocket(null);
+            localSocket.setReuseAddress(true);
+            localSocket.bind(new InetSocketAddress("127.0.0.1", localPort));
+
+            target = new InetSocketAddress(remoteHost, remotePort);
+            running.set(true);
+
+            forwardThread = new Thread(this::forwardLoop, "zstdnet-udp-fwd-" + UDP_SEQ.getAndIncrement() + "-" + remoteHost + ":" + remotePort);
+            forwardThread.setDaemon(true);
+            forwardThread.start();
+        }
+
+        private void stop() {
+            running.set(false);
+            if (localSocket != null) {
+                localSocket.close();
+            }
+            sessions.values().forEach(UdpSession::stop);
+            sessions.clear();
+            joinQuietly(forwardThread);
+        }
+
+        private void forwardLoop() {
+            byte[] buf = new byte[UDP_BUF_SIZE];
+
+            while (running.get()) {
+                try {
+                    DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                    localSocket.receive(packet);
+
+                    byte[] data = new byte[packet.getLength()];
+                    System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
+                    sessionFor(packet.getSocketAddress()).send(data);
+                    cleanupExpiredSessions();
+                } catch (SocketException e) {
+                    if (running.get()) {
+                        LOGGER.debug("zstdnet: UDP passthrough forward socket closed: {}", e.toString());
+                    }
+                    return;
+                } catch (IOException e) {
+                    if (running.get()) {
+                        LOGGER.debug("zstdnet: UDP passthrough forward error: {}", e.toString());
+                    }
+                }
+            }
+        }
+
+        private UdpSession sessionFor(SocketAddress clientAddress) throws IOException {
+            UdpSession existing = sessions.get(clientAddress);
+            if (existing != null) {
+                return existing;
+            }
+
+            UdpSession created = new UdpSession(clientAddress);
+            UdpSession raced = sessions.putIfAbsent(clientAddress, created);
+            if (raced != null) {
+                created.stop();
+                return raced;
+            }
+
+            created.start();
+            return created;
+        }
+
+        private void cleanupExpiredSessions() {
+            long now = System.currentTimeMillis();
+            sessions.entrySet().removeIf(entry -> {
+                UdpSession session = entry.getValue();
+                if (now - session.lastActivityMs() <= SESSION_IDLE_TIMEOUT_MS) {
+                    return false;
+                }
+                session.stop();
+                return true;
+            });
+        }
+
+        private final class UdpSession {
+            private final SocketAddress clientAddress;
+            private final DatagramSocket upstreamSocket;
+            private volatile long lastActivityMs = System.currentTimeMillis();
+            private Thread returnThread;
+
+            private UdpSession(SocketAddress clientAddress) throws SocketException {
+                this.clientAddress = clientAddress;
+                this.upstreamSocket = new DatagramSocket();
+            }
+
+            private void start() {
+                returnThread = new Thread(this::returnLoop, "zstdnet-udp-ret-" + UDP_SEQ.getAndIncrement() + "-" + remoteHost + ":" + remotePort);
+                returnThread.setDaemon(true);
+                returnThread.start();
+            }
+
+            private void send(byte[] data) throws IOException {
+                lastActivityMs = System.currentTimeMillis();
+                upstreamSocket.send(new DatagramPacket(data, data.length, target));
+            }
+
+            private long lastActivityMs() {
+                return lastActivityMs;
+            }
+
+            private void stop() {
+                upstreamSocket.close();
+                joinQuietly(returnThread);
+            }
+
+            private void returnLoop() {
+                byte[] buf = new byte[UDP_BUF_SIZE];
+
+                while (running.get() && !upstreamSocket.isClosed()) {
+                    try {
+                        DatagramPacket packet = new DatagramPacket(buf, buf.length);
+                        upstreamSocket.receive(packet);
+                        lastActivityMs = System.currentTimeMillis();
+
+                        byte[] data = new byte[packet.getLength()];
+                        System.arraycopy(packet.getData(), packet.getOffset(), data, 0, packet.getLength());
+                        localSocket.send(new DatagramPacket(data, data.length, clientAddress));
+                    } catch (SocketException e) {
+                        if (running.get()) {
+                            LOGGER.debug("zstdnet: UDP passthrough return socket closed: {}", e.toString());
+                        }
+                        return;
+                    } catch (IOException e) {
+                        if (running.get()) {
+                            LOGGER.debug("zstdnet: UDP passthrough return error: {}", e.toString());
+                        }
+                    }
+                }
+            }
+        }
+
+        private void joinQuietly(Thread thread) {
+            if (thread == null) {
+                return;
+            }
+            try {
+                thread.join(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
     public record HostPort(String host, int port) {
         public static HostPort parse(String raw) {
             if (raw == null || raw.isBlank()) {
@@ -657,6 +842,7 @@ public final class LocalZstdNet {
         private final ServerSocket listener;
         private final AtomicBoolean running;
         private final Thread acceptThread;
+        private final UdpForwarder udpForwarder;
         private final Mode mode;
         private final String remoteHost;
         private final int remotePort;
@@ -666,6 +852,7 @@ public final class LocalZstdNet {
             ServerSocket listener,
             AtomicBoolean running,
             Thread acceptThread,
+            UdpForwarder udpForwarder,
             Mode mode,
             String remoteHost,
             int remotePort,
@@ -674,6 +861,7 @@ public final class LocalZstdNet {
             this.listener = listener;
             this.running = running;
             this.acceptThread = acceptThread;
+            this.udpForwarder = udpForwarder;
             this.mode = mode;
             this.remoteHost = remoteHost;
             this.remotePort = remotePort;
@@ -700,8 +888,7 @@ public final class LocalZstdNet {
             return stats.snapshot(mode, remoteHost, remotePort);
         }
 
-        @Override
-        public void close() {
+        public void closeListener() {
             running.set(false);
             try {
                 listener.close();
@@ -712,6 +899,15 @@ public final class LocalZstdNet {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+
+        @Override
+        public void close() {
+            running.set(false);
+            if (udpForwarder != null) {
+                udpForwarder.stop();
+            }
+            closeListener();
         }
     }
 
