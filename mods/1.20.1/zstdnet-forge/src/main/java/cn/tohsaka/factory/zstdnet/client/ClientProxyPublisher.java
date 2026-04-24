@@ -583,7 +583,7 @@ public final class ClientProxyPublisher {
                 return;
             }
             try {
-                activeProxy.close();
+                activeProxy.closeListener();
             } catch (Exception ignored) {
             }
         }
