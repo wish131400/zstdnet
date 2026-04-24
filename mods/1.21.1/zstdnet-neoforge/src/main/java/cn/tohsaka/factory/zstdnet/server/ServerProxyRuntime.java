@@ -1129,7 +1129,7 @@ final class ServerProxyRuntime {
             ban_duration=1m
 
             # 统计日志输出间隔。
-            stats_interval=1s
+            stats_interval=10s
 
             # zstd flush 间隔，0ms 表示每次写入都 flush。
             flush_interval=2ms
@@ -1201,7 +1201,7 @@ final class ServerProxyRuntime {
             ban_duration=1m
 
             # 统计日志输出间隔。
-            stats_interval=1s
+            stats_interval=10s
 
             # zstd flush 间隔，0ms 表示每次写入都 flush。
             flush_interval=2ms
