@@ -16,6 +16,7 @@ It is especially suitable for:
 - Supports both dedicated servers and LAN worlds hosted from singleplayer
 - Includes a HUD so you can check whether the connection is using zstd and view live traffic stats in-game
 - Supports vanilla status ping passthrough so the server list can still query the server normally
+- The client-side local proxy also provides raw UDP passthrough on the same local port, for compatibility with mods such as Sable / Create Aeronautics that depend on Minecraft same-port UDP
 
 ## Real-World Results
 
@@ -118,6 +119,8 @@ In other words:
 - ZstdNet decompresses/compresses traffic and forwards it internally
 
 If you also use FRP, HAProxy, NAT traversal, or any other forwarding layer, make sure your public entry ultimately forwards to `listen`. Do not forward directly to the vanilla game port, or zstd will be bypassed.
+
+If your modpack includes Sable / Create Aeronautics or any other mod that depends on same-port UDP, make sure the forwarding layer also forwards both TCP and UDP on the same port. ZstdNet listens on both TCP and UDP at the client-side local address `127.0.0.1:<local proxy port>` and forwards UDP packets unchanged to the same remote port; if your public tunnel only forwards TCP, Sable may fall back to its slower TCP pipeline.
 
 With the default config, dedicated servers no longer need manual port planning. ZstdNet will read `server-port`, keep it as the public entry, and automatically move the backend to another free local port.
 
