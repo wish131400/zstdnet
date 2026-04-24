@@ -105,6 +105,8 @@ processResources {
 }
 
 jar {
+    archiveClassifier = 'slim'
+
     manifest {
         attributes([
             'Specification-Title'    : mod_id,
@@ -116,4 +118,16 @@ jar {
             'Automatic-Module-Name'  : "${mod_group_id}.${mod_id}"
         ])
     }
+}
+
+tasks.named('jarJar') {
+    archiveClassifier = ''
+}
+
+tasks.register('deleteSlimJar', Delete) {
+    delete tasks.named('jar').flatMap { it.archiveFile }
+}
+
+tasks.named('build') {
+    finalizedBy tasks.named('deleteSlimJar')
 }

@@ -16,7 +16,7 @@ def externalProjectBuildDir = new File(externalBuildRoot, "mods/${minecraft_vers
 layout.buildDirectory.set(externalProjectBuildDir)
 
 base {
-    archivesName = "zstdent-${minecraft_version}forge"
+    archivesName = "zstdnet-${minecraft_version}-forge"
 }
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
@@ -77,6 +77,8 @@ processResources {
 }
 
 jar {
+    archiveClassifier = 'slim'
+
     manifest {
         attributes([
                 'Specification-Title'     : mod_id,
@@ -87,4 +89,16 @@ jar {
                 'Implementation-Vendor'   : 'tohsaka'
         ])
     }
+}
+
+tasks.named('jarJar') {
+    archiveClassifier = ''
+}
+
+tasks.register('deleteSlimJar', Delete) {
+    delete tasks.named('jar').flatMap { it.archiveFile }
+}
+
+tasks.named('build') {
+    finalizedBy tasks.named('deleteSlimJar')
 }
