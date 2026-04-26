@@ -97,6 +97,17 @@ public final class LocalZstdNet {
         listener.bind(new InetSocketAddress("127.0.0.1", 0));
 
         Mode resolvedMode = resolveMode(remoteHost, remotePort, requestedMode);
+        LOGGER.info(
+            "zstdnet: TCP local proxy armed {} -> {}:{} (status {}:{}, presented {}:{}, mode {})",
+            listener.getLocalSocketAddress(),
+            remoteHost,
+            remotePort,
+            statusHost,
+            statusPort,
+            presentedHost,
+            presentedPort,
+            resolvedMode
+        );
         AtomicBoolean running = new AtomicBoolean(true);
         ProxyStats stats = new ProxyStats();
         Thread acceptThread = new Thread(
@@ -184,9 +195,23 @@ public final class LocalZstdNet {
         Mode mode,
         ProxyStats stats
     ) {
+        LOGGER.info(
+            "zstdnet: TCP accept loop waiting on {} for {}:{} (mode {})",
+            listener.getLocalSocketAddress(),
+            remoteHost,
+            remotePort,
+            mode
+        );
         while (running.get()) {
             try {
                 Socket localClient = listener.accept();
+                LOGGER.info(
+                    "zstdnet: TCP accepted local client {} -> {} for {}:{}",
+                    localClient.getRemoteSocketAddress(),
+                    localClient.getLocalSocketAddress(),
+                    remoteHost,
+                    remotePort
+                );
                 WORKERS.execute(() -> handleConnection(
                     localClient,
                     remoteHost,
@@ -225,6 +250,12 @@ public final class LocalZstdNet {
         try {
             localClient.setTcpNoDelay(true);
             localClient.setSoTimeout(5000);
+            LOGGER.info(
+                "zstdnet: waiting for Minecraft handshake from {} for {}:{}",
+                localClient.getRemoteSocketAddress(),
+                remoteHost,
+                remotePort
+            );
             byte[] handshake = readPacketWithRetry(localClient.getInputStream(), 5000);
             if (handshake.length == 0) {
                 LOGGER.warn("zstdnet: handshake timeout from {} for {}:{}", localClient.getRemoteSocketAddress(), remoteHost, remotePort);
@@ -236,6 +267,16 @@ public final class LocalZstdNet {
             byte[] rewrittenHandshake = rewriteHandshakeDestination(handshake, presentedHost, presentedPort);
             Integer nextState = extractHandshakeNextState(handshake);
             boolean isStatus = nextState != null && nextState == 1;
+            LOGGER.info(
+                "zstdnet: Minecraft handshake received from {} for {}:{} nextState={} mode={} status={} firstPacketBytes={}",
+                localClient.getRemoteSocketAddress(),
+                remoteHost,
+                remotePort,
+                nextState,
+                mode,
+                isStatus,
+                handshake.length
+            );
 
             if (isStatus) {
                 handleRawConnection(localClient, statusHost, statusPort, rewrittenHandshake, stats);
@@ -248,7 +289,14 @@ public final class LocalZstdNet {
                 handleZstdConnection(localClient, remoteHost, remotePort, level, rewrittenHandshake, stats);
             }
         } catch (Exception e) {
-            LOGGER.debug("zstdnet: proxy pipe closed: {}", e.toString());
+            LOGGER.warn(
+                "zstdnet: local proxy failed for {} while targeting {}:{}: {}",
+                localClient.getRemoteSocketAddress(),
+                remoteHost,
+                remotePort,
+                e.toString(),
+                e
+            );
             closeQuietly(localClient);
         }
     }
@@ -261,9 +309,20 @@ public final class LocalZstdNet {
         ProxyStats stats
     ) throws Exception {
         try (Socket client = localClient; Socket upstream = new Socket()) {
+            LOGGER.info(
+                "zstdnet: opening RAW upstream {} -> {}:{}",
+                client.getRemoteSocketAddress(),
+                remoteHost,
+                remotePort
+            );
             upstream.connect(new InetSocketAddress(remoteHost, remotePort), 5000);
             upstream.setTcpNoDelay(true);
             upstream.setSoTimeout(0);
+            LOGGER.info(
+                "zstdnet: RAW upstream connected local {} -> remote {}",
+                upstream.getLocalSocketAddress(),
+                upstream.getRemoteSocketAddress()
+            );
 
             OutputStream upstreamOut = new CountingOutputStream(upstream.getOutputStream(), stats::addClientToServerRawPassthrough);
             writePacket(upstreamOut, firstPacket);
@@ -309,10 +368,23 @@ public final class LocalZstdNet {
         byte[] firstPacket,
         ProxyStats stats
     ) throws Exception {
+        AndroidZstdNativeLoader.prepare(LOGGER);
         try (Socket client = localClient; Socket upstream = new Socket()) {
+            LOGGER.info(
+                "zstdnet: opening ZSTD upstream {} -> {}:{} level {}",
+                client.getRemoteSocketAddress(),
+                remoteHost,
+                remotePort,
+                level
+            );
             upstream.connect(new InetSocketAddress(remoteHost, remotePort), 5000);
             upstream.setTcpNoDelay(true);
             upstream.setSoTimeout(0);
+            LOGGER.info(
+                "zstdnet: ZSTD upstream connected local {} -> remote {}",
+                upstream.getLocalSocketAddress(),
+                upstream.getRemoteSocketAddress()
+            );
 
             Future<?> upstreamWriter = WORKERS.submit(() -> {
                 try (ZstdOutputStream zstdOut = new ZstdOutputStream(
@@ -889,7 +961,15 @@ public final class LocalZstdNet {
         }
 
         public void closeListener() {
-            running.set(false);
+            int localPort = localPort();
+            boolean wasRunning = running.getAndSet(false);
+            LOGGER.info(
+                "zstdnet: closing TCP listener 127.0.0.1:{} -> {}:{} (wasRunning={})",
+                localPort,
+                remoteHost,
+                remotePort,
+                wasRunning
+            );
             try {
                 listener.close();
             } catch (IOException ignored) {
