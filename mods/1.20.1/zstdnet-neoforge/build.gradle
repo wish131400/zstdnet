@@ -88,6 +88,8 @@ tasks.named('test', Test).configure {
 }
 
 processResources {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
     def replaceProperties = [
         mod_id      : mod_id,
         mod_name    : mod_name,
