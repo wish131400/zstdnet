@@ -583,6 +583,10 @@ public final class ClientProxyPublisher {
                 return;
             }
             try {
+                LOGGER.info(
+                    "zstdnet: releasing local proxy TCP listener on 127.0.0.1:{} while keeping active session resources",
+                    activeProxy.localPort()
+                );
                 activeProxy.closeListener();
             } catch (Exception ignored) {
             }
