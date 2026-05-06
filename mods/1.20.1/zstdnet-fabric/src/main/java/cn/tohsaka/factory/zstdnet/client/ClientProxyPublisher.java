@@ -89,7 +89,7 @@ public final class ClientProxyPublisher {
 
     private LocalZstdNet.ProxyHandle activeProxy;
     private LocalZstdNet.ProxyHandle activeSession;
-    private boolean hudVisible;
+    private boolean hudVisible = false;
     private boolean singleplayerLanHintShown;
     private Object lastListEntry;
     private long lastListClickTime;
