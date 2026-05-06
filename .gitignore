@@ -1,4 +1,4 @@
-﻿# common
+# common
 *.log
 *.tmp
 
@@ -13,3 +13,9 @@ bin/
 
 # go
 *.exe
+
+# external build cache (managed outside repo)
+zstdnet-build/
+
+# runtime / debug logs from local mod testing
+mods/**/logs/
