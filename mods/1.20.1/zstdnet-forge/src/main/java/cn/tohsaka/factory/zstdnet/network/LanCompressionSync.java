@@ -42,8 +42,8 @@ public final class LanCompressionSync {
     private static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
         new ResourceLocation(Zstdnet.MODID, "lan_compression"),
         () -> PROTOCOL_VERSION,
-        PROTOCOL_VERSION::equals,
-        PROTOCOL_VERSION::equals
+        version -> NetworkRegistry.ABSENT.equals(version) || NetworkRegistry.ACCEPTVANILLA.equals(version) || PROTOCOL_VERSION.equals(version),
+        version -> NetworkRegistry.ABSENT.equals(version) || NetworkRegistry.ACCEPTVANILLA.equals(version) || PROTOCOL_VERSION.equals(version)
     );
 
     private static boolean initialized;
@@ -76,6 +76,7 @@ public final class LanCompressionSync {
     }
 
     public static void requestCompressionUpgrade(ServerPlayer player) {
+        init();
         CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), new PrepareMessage(LAN_THRESHOLD));
         LOGGER.info(
             "[zstdnet-server] requested LAN compression threshold {} for {}.",

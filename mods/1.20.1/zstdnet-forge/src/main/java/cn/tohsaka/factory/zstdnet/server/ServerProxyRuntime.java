@@ -19,6 +19,14 @@
 
 package cn.tohsaka.factory.zstdnet.server;
 
+import cn.tohsaka.factory.zstdnet.core.io.CountingInputStream;
+import cn.tohsaka.factory.zstdnet.core.io.CountingOutputStream;
+import cn.tohsaka.factory.zstdnet.core.protocol.ByteArrayOps;
+import cn.tohsaka.factory.zstdnet.core.protocol.PacketIo;
+import cn.tohsaka.factory.zstdnet.core.protocol.VarIntCodec;
+import cn.tohsaka.factory.zstdnet.core.protocol.VarIntRead;
+import cn.tohsaka.factory.zstdnet.core.limit.TokenBucketLimiter;
+import cn.tohsaka.factory.zstdnet.core.stats.TrafficStats;
 import com.github.luben.zstd.ZstdInputStream;
 import com.github.luben.zstd.ZstdOutputStream;
 import com.mojang.logging.LogUtils;
@@ -401,16 +409,16 @@ final class ServerProxyRuntime {
             return DetectedClientMode.zstd();
         }
 
-        byte[] firstPacket = extractPacketPayload(firstPacketWire);
+        byte[] firstPacket = PacketIo.extractPacketPayload(firstPacketWire);
         Integer nextState = extractHandshakeNextState(firstPacket);
         if (nextState != null && nextState == 1) {
             byte[] secondPacketWire = tryReadPacketWire(in, 1500);
             if (secondPacketWire != null && secondPacketWire.length > 0) {
-                byte[] secondPacket = extractPacketPayload(secondPacketWire);
+                byte[] secondPacket = PacketIo.extractPacketPayload(secondPacketWire);
                 if (isStatusRequestPacket(secondPacket)) {
                     return new DetectedClientMode(
                         ClientMode.RAW_STATUS,
-                        concat(firstPacketWire, secondPacketWire)
+                        ByteArrayOps.concat(firstPacketWire, secondPacketWire)
                     );
                 }
                 in.unread(secondPacketWire);
@@ -418,9 +426,9 @@ final class ServerProxyRuntime {
         } else if (nextState != null && nextState == 2) {
             byte[] secondPacketWire = tryReadPacketWire(in, 1500);
             if (secondPacketWire != null && secondPacketWire.length > 0) {
-                byte[] secondPacket = extractPacketPayload(secondPacketWire);
+                byte[] secondPacket = PacketIo.extractPacketPayload(secondPacketWire);
                 if (isLoginStartPacket(secondPacket)) {
-                    return new DetectedClientMode(ClientMode.RAW_LOGIN, concat(firstPacketWire, secondPacketWire));
+                    return new DetectedClientMode(ClientMode.RAW_LOGIN, ByteArrayOps.concat(firstPacketWire, secondPacketWire));
                 }
                 in.unread(secondPacketWire);
             }
@@ -594,11 +602,11 @@ final class ServerProxyRuntime {
             return ProxyInfo.invalid();
         }
 
-        byte[] fixed = readFully(in, 4);
+        byte[] fixed = PacketIo.readFully(in, 4);
         int verCmd = fixed[0] & 0xFF;
         int famProto = fixed[1] & 0xFF;
         int payloadLen = ((fixed[2] & 0xFF) << 8) | (fixed[3] & 0xFF);
-        byte[] payload = readFully(in, payloadLen);
+        byte[] payload = PacketIo.readFully(in, payloadLen);
 
         int version = (verCmd & 0xF0) >> 4;
         int command = verCmd & 0x0F;
@@ -670,17 +678,17 @@ final class ServerProxyRuntime {
                 }
 
                 prefix[prefixLength++] = (byte) next;
-                VarIntRead packetLength = readVarInt(prefix, 0, prefixLength);
+                VarIntRead packetLength = VarIntCodec.read(prefix, 0, prefixLength);
                 if (packetLength == null) {
                     continue;
                 }
 
-                if (packetLength.value <= 0 || packetLength.value > MAX_HANDSHAKE_PACKET_SIZE) {
+                if (packetLength.value() <= 0 || packetLength.value() > MAX_HANDSHAKE_PACKET_SIZE) {
                     in.unread(prefix, 0, prefixLength);
                     return null;
                 }
 
-                byte[] payload = readFully(in, packetLength.value);
+                byte[] payload = PacketIo.readFully(in, packetLength.value());
                 byte[] packet = new byte[prefixLength + payload.length];
                 System.arraycopy(prefix, 0, packet, 0, prefixLength);
                 System.arraycopy(payload, 0, packet, prefixLength, payload.length);
@@ -695,27 +703,6 @@ final class ServerProxyRuntime {
         return new byte[0];
     }
 
-    private byte[] readFully(InputStream in, int len) throws IOException {
-        byte[] out = new byte[len];
-        int off = 0;
-        while (off < len) {
-            int n = in.read(out, off, len - off);
-            if (n < 0) {
-                throw new EOFException("unexpected EOF");
-            }
-            off += n;
-        }
-        return out;
-    }
-
-    private byte[] extractPacketPayload(byte[] packetWire) throws IOException {
-        VarIntRead packetLength = readVarInt(packetWire, 0, packetWire.length);
-        if (packetLength == null || packetLength.value < 0 || packetLength.next + packetLength.value > packetWire.length) {
-            throw new IOException("invalid packet payload");
-        }
-        return Arrays.copyOfRange(packetWire, packetLength.next, packetLength.next + packetLength.value);
-    }
-
     private boolean isStatusRequestPacket(byte[] payload) {
         return payload != null && payload.length == 1 && payload[0] == 0;
     }
@@ -725,18 +712,18 @@ final class ServerProxyRuntime {
             return false;
         }
 
-        VarIntRead packetId = readVarInt(payload, 0, payload.length);
-        if (packetId == null || packetId.value != 0) {
+        VarIntRead packetId = VarIntCodec.read(payload, 0, payload.length);
+        if (packetId == null || packetId.value() != 0) {
             return false;
         }
 
-        VarIntRead nameLength = readVarInt(payload, packetId.next, payload.length);
-        if (nameLength == null || nameLength.value < 1 || nameLength.value > 16) {
+        VarIntRead nameLength = VarIntCodec.read(payload, packetId.next(), payload.length);
+        if (nameLength == null || nameLength.value() < 1 || nameLength.value() > 16) {
             return false;
         }
 
-        int nameStart = nameLength.next;
-        int nameEnd = nameStart + nameLength.value;
+        int nameStart = nameLength.next();
+        int nameEnd = nameStart + nameLength.value();
         if (nameEnd > payload.length) {
             return false;
         }
@@ -756,53 +743,32 @@ final class ServerProxyRuntime {
     }
 
     private Integer extractHandshakeNextState(byte[] handshakePayload) {
-        VarIntRead packetId = readVarInt(handshakePayload, 0, handshakePayload.length);
-        if (packetId == null || packetId.value != 0) {
+        VarIntRead packetId = VarIntCodec.read(handshakePayload, 0, handshakePayload.length);
+        if (packetId == null || packetId.value() != 0) {
             return null;
         }
 
-        VarIntRead protocol = readVarInt(handshakePayload, packetId.next, handshakePayload.length);
+        VarIntRead protocol = VarIntCodec.read(handshakePayload, packetId.next(), handshakePayload.length);
         if (protocol == null) {
             return null;
         }
 
-        VarIntRead hostLength = readVarInt(handshakePayload, protocol.next, handshakePayload.length);
-        if (hostLength == null || hostLength.value < 0) {
+        VarIntRead hostLength = VarIntCodec.read(handshakePayload, protocol.next(), handshakePayload.length);
+        if (hostLength == null || hostLength.value() < 0) {
             return null;
         }
 
-        int afterHost = hostLength.next + hostLength.value;
+        int afterHost = hostLength.next() + hostLength.value();
         int afterPort = afterHost + 2;
         if (afterPort > handshakePayload.length) {
             return null;
         }
 
-        VarIntRead nextState = readVarInt(handshakePayload, afterPort, handshakePayload.length);
-        if (nextState == null || (nextState.value != 1 && nextState.value != 2)) {
+        VarIntRead nextState = VarIntCodec.read(handshakePayload, afterPort, handshakePayload.length);
+        if (nextState == null || (nextState.value() != 1 && nextState.value() != 2)) {
             return null;
         }
-        return nextState.value;
-    }
-
-    private VarIntRead readVarInt(byte[] data, int start, int endExclusive) {
-        int value = 0;
-        int position = 0;
-        int index = start;
-
-        while (index < endExclusive) {
-            int next = data[index++] & 0xFF;
-            value |= (next & 0x7F) << position;
-            if ((next & 0x80) == 0) {
-                return new VarIntRead(value, index);
-            }
-
-            position += 7;
-            if (position > 28) {
-                return null;
-            }
-        }
-
-        return null;
+        return nextState.value();
     }
 
     private void sendLoginDisconnect(Socket clientSocket, String message) {
@@ -822,8 +788,8 @@ final class ServerProxyRuntime {
 
     private byte[] buildLoginDisconnectPacket(String message) throws IOException {
         byte[] componentJson = buildTextComponentJson(message).getBytes(StandardCharsets.UTF_8);
-        byte[] packetId = writeVarInt(0);
-        byte[] componentLength = writeVarInt(componentJson.length);
+        byte[] packetId = VarIntCodec.encode(0);
+        byte[] componentLength = VarIntCodec.encode(componentJson.length);
 
         byte[] payload = new byte[packetId.length + componentLength.length + componentJson.length];
         int offset = 0;
@@ -833,7 +799,7 @@ final class ServerProxyRuntime {
         offset += componentLength.length;
         System.arraycopy(componentJson, 0, payload, offset, componentJson.length);
 
-        byte[] packetLength = writeVarInt(payload.length);
+        byte[] packetLength = VarIntCodec.encode(payload.length);
         byte[] packet = new byte[packetLength.length + payload.length];
         System.arraycopy(packetLength, 0, packet, 0, packetLength.length);
         System.arraycopy(payload, 0, packet, packetLength.length, payload.length);
@@ -868,23 +834,6 @@ final class ServerProxyRuntime {
         return builder.toString();
     }
 
-    private byte[] writeVarInt(int value) {
-        byte[] out = new byte[5];
-        int index = 0;
-        int remaining = value;
-
-        do {
-            int next = remaining & 0x7F;
-            remaining >>>= 7;
-            if (remaining != 0) {
-                next |= 0x80;
-            }
-            out[index++] = (byte) next;
-        } while (remaining != 0);
-
-        return Arrays.copyOf(out, index);
-    }
-
     private String ipString(byte[] data, int offset, int len) throws IOException {
         byte[] raw = Arrays.copyOfRange(data, offset, offset + len);
         return InetAddress.getByAddress(raw).getHostAddress();
@@ -906,20 +855,6 @@ final class ServerProxyRuntime {
         }
         stats.addRaw(bytes);
         stats.addZstd(bytes);
-    }
-
-    private byte[] concat(byte[] first, byte[] second) {
-        if (first == null || first.length == 0) {
-            return second == null ? new byte[0] : second;
-        }
-        if (second == null || second.length == 0) {
-            return first;
-        }
-
-        byte[] merged = new byte[first.length + second.length];
-        System.arraycopy(first, 0, merged, 0, first.length);
-        System.arraycopy(second, 0, merged, first.length, second.length);
-        return merged;
     }
 
     private void startStatsPrinter() {
@@ -1770,31 +1705,6 @@ final class ServerProxyRuntime {
     }
 
     /**
-     * 流量统计模块（原始流量、压缩流量、活跃连接）。
-     */
-    private static final class TrafficStats {
-        private final AtomicLong rawBytes = new AtomicLong();
-        private final AtomicLong zstdBytes = new AtomicLong();
-        private final AtomicInteger activeConn = new AtomicInteger();
-
-        private void addRaw(long n) {
-            if (n > 0) {
-                rawBytes.addAndGet(n);
-            }
-        }
-
-        private void addZstd(long n) {
-            if (n > 0) {
-                zstdBytes.addAndGet(n);
-            }
-        }
-
-        private void addConn(int delta) {
-            activeConn.addAndGet(delta);
-        }
-    }
-
-    /**
      * 防刷模块：
      * - 限制每 IP 并发连接数
      * - 限制窗口内请求次数并封禁
@@ -1879,142 +1789,6 @@ final class ServerProxyRuntime {
     }
 
     /**
-     * 统计输入字节数的包装流模块。
-     */
-    private static final class CountingInputStream extends InputStream {
-        private final InputStream delegate;
-        private final Counter counter;
-
-        private CountingInputStream(InputStream delegate, Counter counter) {
-            this.delegate = Objects.requireNonNull(delegate);
-            this.counter = Objects.requireNonNull(counter);
-        }
-
-        @Override
-        public int read() throws IOException {
-            int value = delegate.read();
-            if (value >= 0) {
-                counter.add(1);
-            }
-            return value;
-        }
-
-        @Override
-        public int read(byte[] b, int off, int len) throws IOException {
-            int n = delegate.read(b, off, len);
-            if (n > 0) {
-                counter.add(n);
-            }
-            return n;
-        }
-    }
-
-    /**
-     * 统计输出字节数的包装流模块。
-     */
-    private static final class CountingOutputStream extends OutputStream {
-        private final OutputStream delegate;
-        private final Counter counter;
-
-        private CountingOutputStream(OutputStream delegate, Counter counter) {
-            this.delegate = Objects.requireNonNull(delegate);
-            this.counter = Objects.requireNonNull(counter);
-        }
-
-        @Override
-        public void write(int b) throws IOException {
-            delegate.write(b);
-            counter.add(1);
-        }
-
-        @Override
-        public void write(byte[] b, int off, int len) throws IOException {
-            delegate.write(b, off, len);
-            if (len > 0) {
-                counter.add(len);
-            }
-        }
-
-        @Override
-        public void flush() throws IOException {
-            delegate.flush();
-        }
-    }
-
-    /**
-     * 令牌桶限速模块。
-     */
-    private static final class TokenBucketLimiter {
-        private final double rateBps;
-        private final double capacity;
-        private double tokens;
-        private long lastNanos;
-
-        private TokenBucketLimiter(long rateBps, long burstBytes) {
-            this.rateBps = Math.max(1L, rateBps);
-            this.capacity = Math.max(1L, burstBytes);
-            this.tokens = this.capacity;
-            this.lastNanos = System.nanoTime();
-        }
-
-        static TokenBucketLimiter create(long rateBps, long burstBytes) {
-            if (rateBps <= 0) {
-                return null;
-            }
-            long burst = burstBytes > 0 ? burstBytes : rateBps;
-            return new TokenBucketLimiter(rateBps, burst);
-        }
-
-        void waitBytes(int bytes) {
-            if (bytes <= 0) {
-                return;
-            }
-
-            double remaining = bytes;
-            while (remaining > 0) {
-                double chunk = Math.min(remaining, capacity);
-                waitChunk(chunk);
-                remaining -= chunk;
-            }
-        }
-
-        private void waitChunk(double need) {
-            while (true) {
-                long sleepNanos;
-                synchronized (this) {
-                    long now = System.nanoTime();
-                    double elapsedSec = (now - lastNanos) / 1_000_000_000.0;
-                    if (elapsedSec > 0) {
-                        tokens = Math.min(capacity, tokens + elapsedSec * rateBps);
-                    }
-                    lastNanos = now;
-
-                    if (tokens >= need) {
-                        tokens -= need;
-                        return;
-                    }
-
-                    double shortage = need - tokens;
-                    sleepNanos = (long) Math.ceil((shortage / rateBps) * 1_000_000_000.0);
-                }
-
-                if (sleepNanos <= 0) {
-                    continue;
-                }
-
-                long sleepMillis = sleepNanos / 1_000_000L;
-                int nanosPart = (int) (sleepNanos % 1_000_000L);
-                try {
-                    Thread.sleep(sleepMillis, nanosPart);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-        }
-    }
-
-    /**
      * 带限速控制的输出流模块。
      */
     private static final class RateLimitedOutputStream extends OutputStream {
@@ -2064,11 +1838,6 @@ final class ServerProxyRuntime {
                 globalLimiter.waitBytes(n);
             }
         }
-    }
-
-    @FunctionalInterface
-    private interface Counter {
-        void add(long n);
     }
 
     private void startUdpForwarders(ProxyConfig config) {
@@ -2286,12 +2055,6 @@ final class ServerProxyRuntime {
                 }
             }
         }
-    }
-
-    /**
-     * 线程命名工厂模块，便于日志与诊断定位线程用途。
-     */
-    private record VarIntRead(int value, int next) {
     }
 
     private static final class NamedFactory implements ThreadFactory {
