@@ -858,6 +858,17 @@ final class ServerProxyRuntime {
     }
 
     private void startStatsPrinter() {
+        if (cfg.statsInterval.isZero() || cfg.statsInterval.isNegative()) {
+            LOGGER.info("[zstdnet-server] periodic stats logging disabled.");
+            statsTicker.scheduleAtFixedRate(() -> {
+                FloodGuard currentGuard = guard;
+                if (currentGuard != null) {
+                    currentGuard.sweepExpired();
+                }
+            }, 10L, 10L, TimeUnit.SECONDS);
+            return;
+        }
+
         long periodMs = Math.max(250L, cfg.statsInterval.toMillis());
         AtomicLong prevRaw = new AtomicLong();
         AtomicLong prevZstd = new AtomicLong();
@@ -960,15 +971,12 @@ final class ServerProxyRuntime {
         int maxReq = parseInt(props.getProperty("max_req_per_window"), DEFAULT_MAX_REQ_PER_WINDOW);
         Duration window = parseDuration(props.getProperty("request_window"), Duration.ofSeconds(10));
         Duration ban = parseDuration(props.getProperty("ban_duration"), DEFAULT_BAN_DURATION);
-        Duration statsInterval = parseDuration(props.getProperty("stats_interval"), Duration.ofSeconds(1));
+        Duration statsInterval = parseDuration(props.getProperty("stats_interval"), Duration.ofSeconds(10));
         Duration flushInterval = parseDuration(props.getProperty("flush_interval"), Duration.ofMillis(2));
         Duration idleTimeout = parseDuration(props.getProperty("idle_timeout"), DEFAULT_IDLE_TIMEOUT);
         long maxRatePerConnBps = parseLong(props.getProperty("max_rate_per_conn_bps"), 0L);
         long maxRateGlobalBps = parseLong(props.getProperty("max_rate_global_bps"), 0L);
         int burstBytes = parseInt(props.getProperty("burst_bytes"), DEFAULT_BURST_BYTES);
-        if (statsInterval.isZero() || statsInterval.isNegative()) {
-            statsInterval = Duration.ofSeconds(1);
-        }
         if (flushInterval.isNegative()) {
             flushInterval = Duration.ZERO;
         }

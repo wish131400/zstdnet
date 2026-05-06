@@ -196,7 +196,7 @@ public final class ServerProxyConfigFile {
         props.putIfAbsent("max_req_per_window", "50");
         props.putIfAbsent("request_window", "10s");
         props.putIfAbsent("ban_duration", "1m");
-        props.putIfAbsent("stats_interval", "1s");
+        props.putIfAbsent("stats_interval", "10s");
         props.putIfAbsent("flush_interval", "2ms");
         props.putIfAbsent("idle_timeout", "0");
         props.putIfAbsent("max_rate_per_conn_bps", "0");
