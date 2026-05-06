@@ -54,7 +54,7 @@ public final class LanCompressionSync {
     }
 
     private static void onRegisterPayloadHandlers(RegisterPayloadHandlersEvent event) {
-        PayloadRegistrar registrar = event.registrar(PROTOCOL_VERSION);
+        PayloadRegistrar registrar = event.registrar(PROTOCOL_VERSION).optional();
         registrar.playToClient(PrepareMessage.TYPE, PrepareMessage.STREAM_CODEC, PrepareMessage::handle);
         registrar.playToServer(ReadyMessage.TYPE, ReadyMessage.STREAM_CODEC, ReadyMessage::handle);
         registrar.playToClient(ActivateMessage.TYPE, ActivateMessage.STREAM_CODEC, ActivateMessage::handle);

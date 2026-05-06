@@ -19,6 +19,11 @@
 
 package cn.tohsaka.factory.zstdnet.proxy;
 
+import cn.tohsaka.factory.zstdnet.core.io.StreamTransfer;
+import cn.tohsaka.factory.zstdnet.core.protocol.ByteArrayOps;
+import cn.tohsaka.factory.zstdnet.core.protocol.PacketIo;
+import cn.tohsaka.factory.zstdnet.core.protocol.VarIntCodec;
+import cn.tohsaka.factory.zstdnet.core.protocol.VarIntRead;
 import com.github.luben.zstd.ZstdInputStream;
 import com.github.luben.zstd.ZstdOutputStream;
 import org.slf4j.Logger;
@@ -149,34 +154,34 @@ public final class LocalZstdNet {
             probe.setSoTimeout(1500);
 
             byte[] hostBytes = remoteHost.getBytes(StandardCharsets.UTF_8);
-            byte[] handshakePayload = concat(
-                encodeVarInt(0),
-                encodeVarInt(763),
-                encodeVarInt(hostBytes.length),
+            byte[] handshakePayload = ByteArrayOps.concat(
+                VarIntCodec.encode(0),
+                VarIntCodec.encode(763),
+                VarIntCodec.encode(hostBytes.length),
                 hostBytes,
                 new byte[]{(byte) (remotePort >>> 8), (byte) remotePort},
-                encodeVarInt(1)
+                VarIntCodec.encode(1)
             );
 
-            writePacket(probe.getOutputStream(), handshakePayload);
-            writePacket(probe.getOutputStream(), encodeVarInt(0));
+            PacketIo.writePacket(probe.getOutputStream(), handshakePayload);
+            PacketIo.writePacket(probe.getOutputStream(), VarIntCodec.encode(0));
 
-            byte[] firstPacket = readPacket(probe.getInputStream());
+            byte[] firstPacket = PacketIo.readPacket(probe.getInputStream());
             if (firstPacket.length == 0) {
                 return false;
             }
 
-            VarIntRead packetId = readVarInt(firstPacket, 0);
-            if (packetId == null || packetId.value != 0) {
+            VarIntRead packetId = VarIntCodec.read(firstPacket, 0);
+            if (packetId == null || packetId.value() != 0) {
                 return false;
             }
 
-            VarIntRead jsonLength = readVarInt(firstPacket, packetId.next);
-            if (jsonLength == null || jsonLength.value < 0) {
+            VarIntRead jsonLength = VarIntCodec.read(firstPacket, packetId.next());
+            if (jsonLength == null || jsonLength.value() < 0) {
                 return false;
             }
 
-            return jsonLength.next + jsonLength.value <= firstPacket.length;
+            return jsonLength.next() + jsonLength.value() <= firstPacket.length;
         } catch (Exception ignored) {
             return false;
         }
@@ -325,12 +330,12 @@ public final class LocalZstdNet {
             );
 
             OutputStream upstreamOut = new CountingOutputStream(upstream.getOutputStream(), stats::addClientToServerRawPassthrough);
-            writePacket(upstreamOut, firstPacket);
+            PacketIo.writePacket(upstreamOut, firstPacket);
             upstreamOut.flush();
 
             Future<?> upstreamWriter = WORKERS.submit(() -> {
                 try {
-                    streamCopy(client.getInputStream(), upstreamOut);
+                    StreamTransfer.copyAndFlush(client.getInputStream(), upstreamOut);
                 } catch (Exception ignored) {
                 } finally {
                     try {
@@ -342,7 +347,7 @@ public final class LocalZstdNet {
 
             Future<?> downstreamWriter = WORKERS.submit(() -> {
                 try {
-                    streamCopy(
+                    StreamTransfer.copyAndFlush(
                         new CountingInputStream(upstream.getInputStream(), stats::addServerToClientRawPassthrough),
                         client.getOutputStream()
                     );
@@ -393,9 +398,9 @@ public final class LocalZstdNet {
                 )) {
                     zstdOut.setCloseFrameOnFlush(false);
                     OutputStream countedRawOut = new CountingOutputStream(zstdOut, stats::addClientToServerRaw);
-                    writePacket(countedRawOut, firstPacket);
+                    PacketIo.writePacket(countedRawOut, firstPacket);
                     countedRawOut.flush();
-                    streamCompress(client.getInputStream(), countedRawOut);
+                    StreamTransfer.copyAndFlush(client.getInputStream(), countedRawOut);
                 } catch (Exception ignored) {
                 } finally {
                     try {
@@ -409,7 +414,7 @@ public final class LocalZstdNet {
                 try (ZstdInputStream zstdIn = new ZstdInputStream(
                     new CountingInputStream(upstream.getInputStream(), stats::addServerToClientZstd)
                 )) {
-                    streamCopy(zstdIn, new CountingOutputStream(client.getOutputStream(), stats::addServerToClientRaw));
+                    StreamTransfer.copyAndFlush(zstdIn, new CountingOutputStream(client.getOutputStream(), stats::addServerToClientRaw));
                 } catch (Exception ignored) {
                 } finally {
                     try {
@@ -448,10 +453,10 @@ public final class LocalZstdNet {
                         throw new IOException("packet length varint too large");
                     }
                     prefix[prefixLength++] = (byte) next;
-                    VarIntRead packetLength = readVarInt(prefix, 0, prefixLength);
+                    VarIntRead packetLength = VarIntCodec.read(prefix, 0, prefixLength);
                     if (packetLength != null) {
-                        payloadLength = packetLength.value;
-                        payloadStart = packetLength.next;
+                        payloadLength = packetLength.value();
+                        payloadStart = packetLength.next();
                         if (payloadLength <= 0) {
                             return new byte[0];
                         }
@@ -483,29 +488,29 @@ public final class LocalZstdNet {
     }
 
     private static Integer extractHandshakeNextState(byte[] handshakePayload) {
-        VarIntRead packetId = readVarInt(handshakePayload, 0);
-        if (packetId == null || packetId.value != 0) {
+        VarIntRead packetId = VarIntCodec.read(handshakePayload, 0);
+        if (packetId == null || packetId.value() != 0) {
             return null;
         }
 
-        VarIntRead protocol = readVarInt(handshakePayload, packetId.next);
+        VarIntRead protocol = VarIntCodec.read(handshakePayload, packetId.next());
         if (protocol == null) {
             return null;
         }
 
-        VarIntRead hostLength = readVarInt(handshakePayload, protocol.next);
-        if (hostLength == null || hostLength.value < 0) {
+        VarIntRead hostLength = VarIntCodec.read(handshakePayload, protocol.next());
+        if (hostLength == null || hostLength.value() < 0) {
             return null;
         }
 
-        int afterHost = hostLength.next + hostLength.value;
+        int afterHost = hostLength.next() + hostLength.value();
         int afterPort = afterHost + 2;
         if (afterPort > handshakePayload.length) {
             return null;
         }
 
-        VarIntRead nextState = readVarInt(handshakePayload, afterPort);
-        return nextState == null ? null : nextState.value;
+        VarIntRead nextState = VarIntCodec.read(handshakePayload, afterPort);
+        return nextState == null ? null : nextState.value();
     }
 
     private static byte[] rewriteHandshakeDestination(byte[] handshakePayload, String host, int port) {
@@ -513,38 +518,38 @@ public final class LocalZstdNet {
             return handshakePayload;
         }
 
-        VarIntRead packetId = readVarInt(handshakePayload, 0);
-        if (packetId == null || packetId.value != 0) {
+        VarIntRead packetId = VarIntCodec.read(handshakePayload, 0);
+        if (packetId == null || packetId.value() != 0) {
             return handshakePayload;
         }
 
-        VarIntRead protocol = readVarInt(handshakePayload, packetId.next);
+        VarIntRead protocol = VarIntCodec.read(handshakePayload, packetId.next());
         if (protocol == null) {
             return handshakePayload;
         }
 
-        VarIntRead hostLength = readVarInt(handshakePayload, protocol.next);
-        if (hostLength == null || hostLength.value < 0) {
+        VarIntRead hostLength = VarIntCodec.read(handshakePayload, protocol.next());
+        if (hostLength == null || hostLength.value() < 0) {
             return handshakePayload;
         }
 
-        int hostStart = hostLength.next;
-        int hostEnd = hostStart + hostLength.value;
+        int hostStart = hostLength.next();
+        int hostEnd = hostStart + hostLength.value();
         int portStart = hostEnd;
         int portEnd = portStart + 2;
         if (portEnd > handshakePayload.length) {
             return handshakePayload;
         }
 
-        String originalHost = new String(handshakePayload, hostStart, hostLength.value, StandardCharsets.UTF_8);
+        String originalHost = new String(handshakePayload, hostStart, hostLength.value(), StandardCharsets.UTF_8);
         String hostSuffix = extractHandshakeHostSuffix(originalHost);
         byte[] hostBytes = (host + hostSuffix).getBytes(StandardCharsets.UTF_8);
-        return concat(
-            slice(handshakePayload, 0, protocol.next),
-            encodeVarInt(hostBytes.length),
+        return ByteArrayOps.concat(
+            ByteArrayOps.slice(handshakePayload, 0, protocol.next()),
+            VarIntCodec.encode(hostBytes.length),
             hostBytes,
             new byte[]{(byte) (port >>> 8), (byte) port},
-            slice(handshakePayload, portEnd, handshakePayload.length)
+            ByteArrayOps.slice(handshakePayload, portEnd, handshakePayload.length)
         );
     }
 
@@ -559,152 +564,6 @@ public final class LocalZstdNet {
         return originalHost.substring(markerIndex);
     }
 
-    private static void streamCompress(InputStream in, OutputStream out) throws IOException {
-        byte[] buffer = new byte[16 * 1024];
-        int read;
-        while ((read = in.read(buffer)) >= 0) {
-            if (read > 0) {
-                out.write(buffer, 0, read);
-                out.flush();
-            }
-        }
-    }
-
-    private static void streamCopy(InputStream in, OutputStream out) throws IOException {
-        byte[] buffer = new byte[16 * 1024];
-        int read;
-        while ((read = in.read(buffer)) >= 0) {
-            if (read > 0) {
-                out.write(buffer, 0, read);
-                out.flush();
-            }
-        }
-    }
-
-    private static byte[] readPacket(InputStream in) throws IOException {
-        int length = readVarInt(in);
-        if (length <= 0) {
-            return new byte[0];
-        }
-        return readFully(in, length);
-    }
-
-    private static void writePacket(OutputStream out, byte[] payload) throws IOException {
-        out.write(encodeVarInt(payload.length));
-        if (payload.length > 0) {
-            out.write(payload);
-        }
-    }
-
-    private static int readVarInt(InputStream in) throws IOException {
-        int value = 0;
-        int position = 0;
-        while (true) {
-            int next = in.read();
-            if (next < 0) {
-                if (position == 0) {
-                    return -1;
-                }
-                throw new EOFException("eof during varint");
-            }
-
-            value |= (next & 0x7F) << position;
-            if ((next & 0x80) == 0) {
-                return value;
-            }
-
-            position += 7;
-            if (position > 28) {
-                throw new IOException("varint too big");
-            }
-        }
-    }
-
-    private static VarIntRead readVarInt(byte[] data, int start) {
-        return readVarInt(data, start, data.length);
-    }
-
-    private static VarIntRead readVarInt(byte[] data, int start, int endExclusive) {
-        int value = 0;
-        int position = 0;
-        int index = start;
-
-        while (index < endExclusive) {
-            int next = data[index++] & 0xFF;
-            value |= (next & 0x7F) << position;
-            if ((next & 0x80) == 0) {
-                return new VarIntRead(value, index);
-            }
-
-            position += 7;
-            if (position > 28) {
-                return null;
-            }
-        }
-
-        return null;
-    }
-
-    private static byte[] encodeVarInt(int value) {
-        int working = value;
-        byte[] buffer = new byte[5];
-        int index = 0;
-
-        do {
-            int next = working & 0x7F;
-            working >>>= 7;
-            if (working != 0) {
-                next |= 0x80;
-            }
-            buffer[index++] = (byte) next;
-        } while (working != 0);
-
-        byte[] out = new byte[index];
-        System.arraycopy(buffer, 0, out, 0, index);
-        return out;
-    }
-
-    private static byte[] readFully(InputStream in, int length) throws IOException {
-        byte[] data = new byte[length];
-        int offset = 0;
-        while (offset < length) {
-            int read = in.read(data, offset, length - offset);
-            if (read < 0) {
-                throw new EOFException("unexpected eof");
-            }
-            offset += read;
-        }
-        return data;
-    }
-
-    private static byte[] concat(byte[]... arrays) {
-        int total = 0;
-        for (byte[] array : arrays) {
-            if (array != null) {
-                total += array.length;
-            }
-        }
-
-        byte[] merged = new byte[total];
-        int offset = 0;
-        for (byte[] array : arrays) {
-            if (array == null || array.length == 0) {
-                continue;
-            }
-            System.arraycopy(array, 0, merged, offset, array.length);
-            offset += array.length;
-        }
-        return merged;
-    }
-
-    private static byte[] slice(byte[] source, int startInclusive, int endExclusive) {
-        int start = Math.max(0, startInclusive);
-        int end = Math.max(start, Math.min(source.length, endExclusive));
-        byte[] out = new byte[end - start];
-        System.arraycopy(source, start, out, 0, out.length);
-        return out;
-    }
-
     private static void closeQuietly(Socket socket) {
         try {
             if (socket != null) {
@@ -712,9 +571,6 @@ public final class LocalZstdNet {
             }
         } catch (Exception ignored) {
         }
-    }
-
-    private record VarIntRead(int value, int next) {
     }
 
     private static final class UdpForwarder {

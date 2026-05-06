@@ -6,6 +6,7 @@ license="MIT"
 modId="${mod_id}"
 version="${mod_version}"
 displayName="${mod_name}"
+displayTest="IGNORE_SERVER_VERSION"
 description='''
 NeoForge 1.21.1 source-maintainable Zstd proxy mod.
 Automatically hijacks client connects, supports LAN host publishing, HUD stats,
