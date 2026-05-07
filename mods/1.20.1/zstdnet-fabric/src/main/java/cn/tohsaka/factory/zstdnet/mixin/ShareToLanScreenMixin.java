@@ -44,6 +44,11 @@ abstract class ShareToLanScreenMixin extends Screen {
         }
     }
 
+    @Inject(method = "render(Lnet/minecraft/client/gui/GuiGraphics;IIF)V", at = @At("HEAD"))
+    private void zstdnet$beforeRender(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick, CallbackInfo ci) {
+        ClientProxyPublisher.onShareToLanBeforeRender((ShareToLanScreen) (Object) this);
+    }
+
     @Inject(method = "render(Lnet/minecraft/client/gui/GuiGraphics;IIF)V", at = @At("TAIL"))
     private void zstdnet$afterRender(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick, CallbackInfo ci) {
         ClientProxyPublisher.onShareToLanRender((ShareToLanScreen) (Object) this, guiGraphics);
