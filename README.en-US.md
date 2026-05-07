@@ -148,23 +148,21 @@ Then the recommended setup is:
 
 ## Singleplayer / LAN Hosting
 
-ZstdNet adds two extra ports to the "Open to LAN" screen:
+When opening a singleplayer world to LAN, ZstdNet adds a Zstd port field to the "Open to LAN" screen and keeps the normal game port field compatible with vanilla or advanced LAN screens.
 
-- Game Port
-- Zstd Port
+Recommended usage:
 
-Recommended values:
+- Leave the game port empty unless you explicitly need a fixed Minecraft LAN port. ZstdNet will follow the actual LAN port used by this session.
+- The Zstd port uses the configured port first. If that port is already occupied or reserved by the current LAN session, ZstdNet automatically falls back to another available port.
+- After the LAN world is opened, the in-game chat prints the actual Zstd port. The Zstd port in that message can be clicked to copy it.
 
-- Use a normal port for the game port, such as `25565`
-- Use another free port for the Zstd port, such as `35565`
-
-After opening the world, the mod writes the settings to:
+The active settings are stored in:
 
 ```text
 config/zstdnet-server.properties
 ```
 
-and supports hot reload.
+and support hot reload.
 
 If friends are joining from outside your local network, give them this address:
 
@@ -178,6 +176,8 @@ For example:
 mc.example.com:35565
 203.0.113.10:35565
 ```
+
+If a LAN UI mod fully replaces the screen and the Zstd field is not visible, use `/zstdport show` to view the current ports, or `/zstdport zstd <port>` only when you need to pin a fixed public/tunnel port.
 
 ## Commands
 
@@ -242,7 +242,7 @@ Check these first:
 4. Make sure `listen` and `target` are not reversed.
 5. Make sure the Zstd port is not already in use by another program.
 6. Make sure no other mod is intercepting the login or handshake flow.
-7. In LAN setups, make sure the game port matches the configured `target`.
+7. In LAN setups, use the Zstd port shown in chat. The game port can usually be left empty because ZstdNet follows the actual LAN session port automatically.
 
 ### Does a ratio near 100% mean it's not working?
 
