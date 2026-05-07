@@ -20,7 +20,10 @@
 package cn.tohsaka.factory.zstdnet.server;
 
 import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
+import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.neoforged.neoforge.common.NeoForge;
@@ -142,6 +145,7 @@ public final class ServerProxyBootstrap {
                 RUNTIME.startLan(lanPort);
                 activeLanPort = RUNTIME.isLanMode() ? lanPort : -1;
                 if (activeLanPort > 0) {
+                    notifyLanProxyReady(server, lanPort);
                     LOGGER.info("[zstdnet-server] LAN world published on {}, zstd proxy armed.", lanPort);
                 } else {
                     LOGGER.warn("[zstdnet-server] LAN world published on {}, but zstd proxy did not start. Check zstdnet-server.properties.", lanPort);
@@ -156,6 +160,31 @@ public final class ServerProxyBootstrap {
         }
         publishedLanPort = -1;
         activeLanPort = -1;
+    }
+
+    private static void notifyLanProxyReady(MinecraftServer server, int lanPort) {
+        ServerProxyRuntime.HudSnapshot snapshot = RUNTIME.hudSnapshot();
+        if (snapshot == null) {
+            return;
+        }
+        Component message = Component.translatable(
+            "zstdnet.singleplayer.lan_ready",
+            copyableZstdPort(snapshot.listenPort()),
+            lanPort
+        );
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            player.sendSystemMessage(message);
+        }
+        LOGGER.info("[zstdnet-server] LAN ready: zstd listen port={}, game port={}", snapshot.listenPort(), lanPort);
+    }
+
+    private static Component copyableZstdPort(int port) {
+        String text = String.valueOf(port);
+        return Component.literal(text).withStyle(style -> style
+            .withColor(ChatFormatting.AQUA)
+            .withUnderlined(true)
+            .withClickEvent(new ClickEvent(ClickEvent.Action.COPY_TO_CLIPBOARD, text))
+            .withHoverEvent(new HoverEvent(HoverEvent.Action.SHOW_TEXT, Component.translatable("zstdnet.singleplayer.lan_ready.copy_zstd"))));
     }
 
     private static void forceDisableLanAuthentication(MinecraftServer server) {
