@@ -61,8 +61,12 @@ import net.neoforged.neoforge.common.NeoForge;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.reflect.Field;
 import java.io.IOException;
+import java.net.ServerSocket;
+import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.WeakHashMap;
@@ -87,7 +91,7 @@ public final class ClientProxyPublisher {
     private final Object stateLock = new Object();
     private final Map<JoinMultiplayerScreen, JoinScreenState> joinScreens = new WeakHashMap<>();
     private final Map<DirectJoinServerScreen, DirectJoinState> directJoinScreens = new WeakHashMap<>();
-    private final Map<ShareToLanScreen, ShareToLanState> shareToLanScreens = new WeakHashMap<>();
+    private final Map<Screen, ShareToLanState> shareToLanScreens = new WeakHashMap<>();
 
     private LocalZstdNet.ProxyHandle activeProxy;
     private LocalZstdNet.ProxyHandle activeSession;
@@ -110,6 +114,7 @@ public final class ClientProxyPublisher {
         NeoForge.EVENT_BUS.addListener(INSTANCE::onClientLogin);
         NeoForge.EVENT_BUS.addListener(INSTANCE::onClientLogout);
         NeoForge.EVENT_BUS.addListener(INSTANCE::onRenderGui);
+        NeoForge.EVENT_BUS.addListener(INSTANCE::onScreenRenderPre);
         NeoForge.EVENT_BUS.addListener(INSTANCE::onScreenRender);
         NeoForge.EVENT_BUS.addListener(INSTANCE::onClientTick);
         NeoForge.EVENT_BUS.addListener(INSTANCE::onRegisterClientCommands);
@@ -138,13 +143,13 @@ public final class ClientProxyPublisher {
             return;
         }
 
-        if (screen instanceof ShareToLanScreen shareToLanScreen) {
-            ShareToLanState state = attachShareToLanState(shareToLanScreen, event, listeners);
+        if (isShareToLanLikeScreen(screen)) {
+            ShareToLanState state = attachShareToLanState(screen, event, listeners);
             if (state != null) {
                 synchronized (stateLock) {
-                    shareToLanScreens.put(shareToLanScreen, state);
+                    shareToLanScreens.put(screen, state);
                 }
-                LOGGER.debug("zstdnet: hooked share-to-lan screen");
+                LOGGER.debug("zstdnet: hooked share-to-lan screen {}", screen.getClass().getName());
             }
         }
     }
@@ -156,8 +161,8 @@ public final class ClientProxyPublisher {
                 joinScreens.remove(joinScreen);
             } else if (screen instanceof DirectJoinServerScreen directJoinScreen) {
                 directJoinScreens.remove(directJoinScreen);
-            } else if (screen instanceof ShareToLanScreen shareToLanScreen) {
-                shareToLanScreens.remove(shareToLanScreen);
+            } else if (isShareToLanLikeScreen(screen)) {
+                shareToLanScreens.remove(screen);
             }
         }
     }
@@ -264,7 +269,8 @@ public final class ClientProxyPublisher {
     }
 
     private void onScreenRender(ScreenEvent.Render.Post event) {
-        if (!(event.getScreen() instanceof ShareToLanScreen shareToLanScreen)) {
+        Screen shareToLanScreen = event.getScreen();
+        if (!isShareToLanLikeScreen(shareToLanScreen)) {
             return;
         }
 
@@ -276,8 +282,23 @@ public final class ClientProxyPublisher {
         syncShareToLanState(state);
 
         GuiGraphics gui = event.getGuiGraphics();
+        int labelX = state.zstdPortEdit.getX();
         int labelY = state.zstdPortEdit.getY() - 10;
-        gui.drawCenteredString(Minecraft.getInstance().font, ZSTD_PORT_LABEL, shareToLanScreen.width / 2, labelY, 0xFFFFFF);
+        gui.drawString(Minecraft.getInstance().font, ZSTD_PORT_LABEL, labelX, labelY, 0xFFFFFF);
+    }
+
+    private void onScreenRenderPre(ScreenEvent.Render.Pre event) {
+        Screen screen = event.getScreen();
+        if (isShareToLanLikeScreen(screen)) {
+            ensureShareToLanWidgetAttached(screen);
+        }
+    }
+
+    private void ensureShareToLanWidgetAttached(Screen shareToLanScreen) {
+        ShareToLanState state = getShareToLanState(shareToLanScreen);
+        if (state != null) {
+            ensureShareToLanWidgetAttached(shareToLanScreen, state);
+        }
     }
 
     private void onRegisterClientCommands(RegisterClientCommandsEvent event) {
@@ -361,20 +382,18 @@ public final class ClientProxyPublisher {
             return;
         }
 
-        if (screen instanceof ShareToLanScreen shareToLanScreen) {
+        if (isShareToLanLikeScreen(screen)) {
             if (event.getKeyCode() != 257 && event.getKeyCode() != 335) {
                 return;
             }
-            ShareToLanState state = getShareToLanState(shareToLanScreen);
+            ShareToLanState state = getShareToLanState(screen);
             if (state == null || !state.vanillaStartButton.active) {
                 return;
             }
-            if (screen.getFocused() == state.zstdPortEdit) {
-                if (prepareLanWorldPublish(state)) {
-                    state.vanillaStartButton.onPress();
-                    event.setCanceled(true);
-                }
+            if (prepareLanWorldPublish(state)) {
+                state.vanillaStartButton.onPress();
             }
+            event.setCanceled(true);
         }
     }
 
@@ -437,8 +456,8 @@ public final class ClientProxyPublisher {
             return;
         }
 
-        if (screen instanceof ShareToLanScreen shareToLanScreen) {
-            ShareToLanState state = getShareToLanState(shareToLanScreen);
+        if (isShareToLanLikeScreen(screen)) {
+            ShareToLanState state = getShareToLanState(screen);
             if (state == null || !state.vanillaStartButton.active) {
                 return;
             }
@@ -534,7 +553,7 @@ public final class ClientProxyPublisher {
         }
     }
 
-    private ShareToLanState getShareToLanState(ShareToLanScreen screen) {
+    private ShareToLanState getShareToLanState(Screen screen) {
         synchronized (stateLock) {
             return shareToLanScreens.get(screen);
         }
@@ -825,7 +844,7 @@ public final class ClientProxyPublisher {
         return editBox != null && Objects.equals(editBox.getMessage().getString(), I18n.get("lanServer.port"));
     }
 
-    private static boolean looksLikeVanillaLanPortEdit(EditBox editBox, ShareToLanScreen screen) {
+    private static boolean looksLikeVanillaLanPortEdit(EditBox editBox, Screen screen) {
         if (editBox == null) {
             return false;
         }
@@ -835,7 +854,7 @@ public final class ClientProxyPublisher {
             && Math.abs(editBox.getX() - (screen.width / 2 - 75)) <= 4;
     }
 
-    private static EditBox findBackendPortEdit(List<?> listeners, ShareToLanScreen screen) {
+    private static EditBox findBackendPortEdit(List<?> listeners, Screen screen) {
         EditBox exact = null;
         EditBox fallback = null;
 
@@ -885,6 +904,14 @@ public final class ClientProxyPublisher {
 
     private static String safe(String value) {
         return value == null || value.isBlank() ? "unnamed" : value.trim();
+    }
+
+    private static boolean isShareToLanLikeScreen(Screen screen) {
+        if (screen instanceof ShareToLanScreen) {
+            return true;
+        }
+        String className = screen.getClass().getName().toLowerCase(Locale.ROOT);
+        return className.contains("sharetolan");
     }
 
     private static void sendClientMessage(Component message) {
@@ -964,7 +991,7 @@ public final class ClientProxyPublisher {
         return String.format("%.2f%%", value);
     }
 
-    private ShareToLanState attachShareToLanState(ShareToLanScreen screen, ScreenEvent.Init.Post event, List<?> listeners) {
+    private ShareToLanState attachShareToLanState(Screen screen, ScreenEvent.Init.Post event, List<?> listeners) {
         ShareToLanState existing = getShareToLanState(screen);
         if (existing != null) {
             event.removeListener(existing.zstdPortEdit);
@@ -983,25 +1010,33 @@ public final class ClientProxyPublisher {
             return null;
         }
 
-        int defaultZstdPort = ServerProxyConfigFile.readListenPort();
-        int lowestEditBottom = findLowestEditBoxBottom(listeners);
+        int defaultZstdPort = findAvailableZstdPort(ServerProxyConfigFile.readListenPort());
+        int zstdFieldWidth = 150;
+        int zstdFieldHeight = 20;
+        int zstdFieldX = screen.width / 2 - zstdFieldWidth / 2;
         int zstdFieldY = vanillaStartButton.getY() - 28;
-        if (lowestEditBottom != Integer.MIN_VALUE) {
-            zstdFieldY = lowestEditBottom + 28;
-        } else if (backendPortEdit != null) {
-            zstdFieldY = backendPortEdit.getY() + backendPortEdit.getHeight() + 28;
+        if (backendPortEdit != null) {
+            zstdFieldWidth = backendPortEdit.getWidth();
+            zstdFieldHeight = backendPortEdit.getHeight();
+            zstdFieldX = Math.max(8, backendPortEdit.getX() - zstdFieldWidth - 8);
+            zstdFieldY = backendPortEdit.getY();
+        } else {
+            int lowestEditBottom = findLowestEditBoxBottom(listeners);
+            if (lowestEditBottom != Integer.MIN_VALUE) {
+                zstdFieldY = Math.min(lowestEditBottom + 28, vanillaStartButton.getY() - 28);
+            }
         }
-        zstdFieldY = Math.min(zstdFieldY, vanillaStartButton.getY() - 28);
         EditBox zstdPortEdit = new EditBox(
             screen.getMinecraft().font,
-            screen.width / 2 - 75,
+            zstdFieldX,
             zstdFieldY,
-            150,
-            20,
+            zstdFieldWidth,
+            zstdFieldHeight,
             ZSTD_PORT_LABEL
         );
         zstdPortEdit.setMaxLength(5);
-        zstdPortEdit.setHint(Component.literal(String.valueOf(defaultZstdPort)).withStyle(ChatFormatting.DARK_GRAY));
+        zstdPortEdit.setValue(String.valueOf(defaultZstdPort));
+        zstdPortEdit.setHint(Component.translatable("zstdnet.share_to_lan.zstd_port_auto", defaultZstdPort).withStyle(ChatFormatting.DARK_GRAY));
         zstdPortEdit.setTooltip(Tooltip.create(ZSTD_PORT_HELP));
         zstdPortEdit.setFocused(false);
 
@@ -1021,7 +1056,7 @@ public final class ClientProxyPublisher {
         if (current != null && !current.isBlank()) {
             return;
         }
-        backendPortEdit.setValue(String.valueOf(ServerProxyConfigFile.readTargetPort()));
+        backendPortEdit.setHint(Component.translatable("zstdnet.share_to_lan.backend_port_auto").withStyle(ChatFormatting.DARK_GRAY));
     }
 
     private void applyZstdPortResponse(ShareToLanState state, String raw) {
@@ -1035,6 +1070,42 @@ public final class ClientProxyPublisher {
 
     private void syncShareToLanState(ShareToLanState state) {
         state.zstdPortEdit.setTooltip(Tooltip.create(state.zstdError == null ? ZSTD_PORT_HELP : state.zstdError));
+    }
+
+    private static void ensureShareToLanWidgetAttached(Screen screen, ShareToLanState state) {
+        if (!reattachWidgetToScreenLists(screen, state.zstdPortEdit)) {
+            LOGGER.debug("zstdnet: failed to reattach share-to-lan zstd port field");
+        }
+    }
+
+    private static boolean reattachWidgetToScreenLists(Screen screen, EditBox widget) {
+        boolean attached = false;
+        for (Class<?> type = Screen.class; type != null; type = type.getSuperclass()) {
+            for (Field field : type.getDeclaredFields()) {
+                if (!Collection.class.isAssignableFrom(field.getType())) {
+                    continue;
+                }
+                try {
+                    field.setAccessible(true);
+                    Object value = field.get(screen);
+                    if (value instanceof List<?> list) {
+                        attached |= addWidgetToRawList(list, widget);
+                    }
+                } catch (IllegalAccessException | RuntimeException e) {
+                    LOGGER.debug("zstdnet: failed to inspect screen widget list for share-to-lan field", e);
+                }
+            }
+        }
+        return screen.children().contains(widget);
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static boolean addWidgetToRawList(List list, EditBox widget) {
+        if (list.contains(widget)) {
+            return false;
+        }
+        list.add(widget);
+        return true;
     }
 
     private PortValidation validateZstdPort(String raw, int fallbackPort) {
@@ -1056,6 +1127,29 @@ public final class ClientProxyPublisher {
             return new PortValidation(port, ZSTD_PORT_UNAVAILABLE);
         }
         return new PortValidation(port, null);
+    }
+
+    private static int findAvailableZstdPort(int preferredPort) {
+        int startPort = clampPort(preferredPort);
+        for (int port = startPort; port <= MAX_PORT; port++) {
+            if (HttpUtil.isPortAvailable(port)) {
+                return port;
+            }
+        }
+        for (int port = MIN_PORT; port < startPort; port++) {
+            if (HttpUtil.isPortAvailable(port)) {
+                return port;
+            }
+        }
+        try (ServerSocket socket = new ServerSocket(0)) {
+            return socket.getLocalPort();
+        } catch (IOException e) {
+            return startPort;
+        }
+    }
+
+    private static int clampPort(int port) {
+        return Math.max(MIN_PORT, Math.min(MAX_PORT, port));
     }
 
     private boolean prepareLanWorldPublish(ShareToLanState state) {
