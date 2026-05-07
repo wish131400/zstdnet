@@ -164,15 +164,12 @@ final class ServerProxyRuntime {
                 loaded = loaded.withLanVoiceDefaults(mcServerPort);
             }
 
-            try {
-                listener = new ServerSocket();
-                listener.bind(loaded.listen.toAddress());
-            } catch (IOException e) {
-                LOGGER.error("[zstdnet-server] bind failed on {}: {}", loaded.listen, e.toString());
-                closeQuietly(listener);
-                listener = null;
+            BindResult bindResult = bindListener(loaded, mode);
+            if (bindResult == null) {
                 return;
             }
+            listener = bindResult.listener();
+            loaded = bindResult.config();
 
             this.cfg = loaded;
             this.stats = new TrafficStats();
@@ -203,6 +200,79 @@ final class ServerProxyRuntime {
                 LOGGER.info("[zstdnet-server] auto takeover active: public_entry={} backend={}", loaded.listen, loaded.target);
             }
             LOGGER.info("[zstdnet-server] raw vanilla login passthrough: disabled");
+        }
+    }
+
+    private BindResult bindListener(ProxyConfig config, RuntimeMode mode) {
+        if (mode == RuntimeMode.LAN && isReservedLanListenPort(config, config.listen.port)) {
+            LOGGER.warn("[zstdnet-server] LAN listen port {} is reserved by the current LAN session, trying the next available port.", config.listen);
+        } else {
+            try {
+                return bindListenerOnPort(config, config.listen.port);
+            } catch (IOException e) {
+                if (mode != RuntimeMode.LAN) {
+                    LOGGER.error("[zstdnet-server] bind failed on {}: {}", config.listen, e.toString());
+                    return null;
+                }
+                LOGGER.warn("[zstdnet-server] LAN listen port {} is unavailable, trying the next available port: {}", config.listen, e.toString());
+            }
+        }
+
+        for (int port = Math.max(1024, config.listen.port + 1); port <= MAX_PORT; port++) {
+            BindResult result = tryBindLanListener(config, port);
+            if (result != null) {
+                return result;
+            }
+        }
+        for (int port = 1024; port < Math.max(1024, config.listen.port); port++) {
+            BindResult result = tryBindLanListener(config, port);
+            if (result != null) {
+                return result;
+            }
+        }
+        LOGGER.error("[zstdnet-server] no available LAN listen port found for host {}", config.listen.host);
+        return null;
+    }
+
+    private BindResult tryBindLanListener(ProxyConfig config, int port) {
+        if (isReservedLanListenPort(config, port)) {
+            return null;
+        }
+        try {
+            BindResult result = bindListenerOnPort(config, port);
+            LOGGER.info("[zstdnet-server] LAN listen port changed from {} to {} because the preferred port was unavailable.", config.listen.port, port);
+            return result;
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    private BindResult bindListenerOnPort(ProxyConfig config, int port) throws IOException {
+        ProxyConfig resolved = config.withEndpoints(new HostPort(config.listen.host, port), config.target);
+        ServerSocket socket = new ServerSocket();
+        try {
+            socket.bind(resolved.listen.toAddress());
+            return new BindResult(socket, resolved);
+        } catch (IOException e) {
+            closeQuietly(socket);
+            throw e;
+        }
+    }
+
+    private boolean isReservedLanListenPort(ProxyConfig config, int port) {
+        return port == config.target.port
+            || port == parseOptionalPort(config.voiceChatListen)
+            || port == parseOptionalPort(config.voiceChatTarget);
+    }
+
+    private int parseOptionalPort(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return -1;
+        }
+        try {
+            return HostPort.parse(raw).port;
+        } catch (RuntimeException ignored) {
+            return -1;
         }
     }
 
@@ -1895,6 +1965,9 @@ final class ServerProxyRuntime {
             } catch (Exception ignored) {
             }
         }
+    }
+
+    private record BindResult(ServerSocket listener, ProxyConfig config) {
     }
 
     private static final class UdpForwarder {
