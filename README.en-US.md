@@ -83,7 +83,7 @@ online-mode=false
 
 If you keep vanilla authentication enabled on the backend server, connections may fail. If vanilla network compression is not taken over by ZstdNet, compression efficiency may also be much worse than expected.
 
-If you still want premium account verification while keeping the backend in offline mode, you can additionally use [TrueUUID](https://www.mcmod.cn/class/21953.html).
+If you still want premium account verification while keeping the backend in offline mode, you can additionally use [TrueUUID](https://www.curseforge.com/minecraft/mc-mods/trueuuid).
 
 - This is useful for setups where the backend stays on `online-mode=false`, but you still want login-time premium account verification
 - It can help preserve premium UUIDs, correct name casing, and skin-related profile data while running in offline mode
@@ -145,6 +145,33 @@ Then the recommended setup is:
 - Let ZstdNet move `target` to another local port automatically
 - Configure `frpc.toml` to forward the public port to the host's public `listen`
 - Players connect using the same public port they already know
+
+## Real IP / FRP PROXY v2 Mode
+
+If players connect directly to the ZstdNet entry port, such as public direct connection, LAN direct connection, or virtual LAN direct connection, keep:
+
+```properties
+trust_proxy_protocol=false
+```
+
+In this mode, ZstdNet reads the player's IP directly from the TCP connection. Public direct connections expose the player's public IP; LAN or virtual LAN direct connections expose the player's LAN / virtual-network IP.
+
+Only enable this when there is an FRP / reverse-proxy layer in front of ZstdNet and you want the backend to see the player's real IP:
+
+```properties
+trust_proxy_protocol=true
+trusted_proxy_ips=127.0.0.1,::1,0:0:0:0:0:0:0:1
+```
+
+The FRP TCP proxy must also send PROXY Protocol v2, for example:
+
+```toml
+transport.proxyProtocolVersion = "v2"
+```
+
+`trusted_proxy_ips` is the list of proxy machines that are allowed to tell ZstdNet the player's real IP. It is not a player IP allowlist and not a list of allowed network ranges. If frpc runs on the same machine as the server, keep the default localhost values. If frpc runs on another machine, put the LAN / virtual-network IP that machine uses to connect to this server.
+
+Note: when `trust_proxy_protocol=true`, direct connections to the ZstdNet entry port without a PROXY v2 header will be rejected. This includes local, LAN, virtual LAN, and public direct connections to the `listen` port. This is intentional to prevent clients from spoofing real IP addresses.
 
 ## Singleplayer / LAN Hosting
 

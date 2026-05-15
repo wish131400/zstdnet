@@ -83,7 +83,7 @@ online-mode=false
 
 如果后端服务器继续启用原版验证，连接可能失败；如果原版网络压缩没有被 ZstdNet 接管，压缩收益也会明显低于预期。
 
-如果你仍然希望保留正版校验能力，可以额外搭配 [TrueUUID（正版离线共存）](https://www.mcmod.cn/class/21953.html)。
+如果你仍然希望保留正版校验能力，可以额外搭配 [TrueUUID（正版离线共存）](https://www.curseforge.com/minecraft/mc-mods/trueuuid)。
 
 - 这个模组适合“后端保持 `online-mode=false`，但登录阶段仍然执行正版校验”的场景
 - 可以在离线模式下尽量保留正版 UUID、名称大小写与皮肤属性等信息
@@ -143,6 +143,33 @@ auto_takeover=true
 - 公网入口最终转发到当前 `listen`
 - 后端 `target` 由 ZstdNet 在启动时自动分配
 - 玩家最终继续连接原来的公网端口
+
+## 真实 IP / FRP PROXY v2 怎么选
+
+如果玩家是直接连到 zstdnet 入口端口，比如公网直连、局域网直连、虚拟局域网直连，就保持：
+
+```properties
+trust_proxy_protocol=false
+```
+
+这种情况下 zstdnet 会直接从 TCP 连接里拿到玩家 IP：公网直连看到玩家公网 IP，局域网 / 虚拟局域网直连看到玩家的内网或虚拟网 IP。
+
+只有当前面还有 FRP / 反代，并且你希望后端看到玩家真实 IP 时，才开启：
+
+```properties
+trust_proxy_protocol=true
+trusted_proxy_ips=127.0.0.1,::1,0:0:0:0:0:0:0:1
+```
+
+同时 FRP TCP 映射需要开启 PROXY Protocol v2，例如：
+
+```toml
+transport.proxyProtocolVersion = "v2"
+```
+
+`trusted_proxy_ips` 填的是“有资格告诉 zstdnet 玩家真实 IP 的前置代理机器 IP”，不是玩家 IP，也不是允许进服的网段。frpc 和服务端在同一台机器时保持默认即可；如果 frpc 在另一台机器，就填那台机器连接到本服务器时使用的内网 / 虚拟局域网 IP。
+
+注意：`trust_proxy_protocol=true` 后，直接连 zstdnet 入口端口但不带 PROXY v2 头的连接会被拒绝，例如本机、局域网、虚拟局域网或公网直连 `listen` 端口都会进不去。这是为了防止别人伪造真实 IP。
 
 ## 单机 / 局域网开房
 
