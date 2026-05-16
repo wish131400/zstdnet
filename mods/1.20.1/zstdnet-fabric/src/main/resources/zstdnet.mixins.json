@@ -3,10 +3,13 @@
   "package": "cn.tohsaka.factory.zstdnet.mixin",
   "compatibilityLevel": "JAVA_17",
   "mixins": [
+    "ConnectionMixin",
     "ContainerEventHandlerMixin",
+    "ClientIntentionPacketMixin",
     "DedicatedServerMixin",
     "MinecraftServerMixin",
     "ScreenMixin",
+    "ServerHandshakePacketListenerImplMixin",
     "ServerGamePacketListenerImplAccessor"
   ],
   "client": [

@@ -8,9 +8,8 @@ version="${mod_version}"
 displayName="${mod_name}"
 displayTest="IGNORE_SERVER_VERSION"
 description='''
-NeoForge 1.21.1 source-maintainable Zstd proxy mod.
-Automatically hijacks client connects, supports LAN host publishing, HUD stats,
-and dedicated-server zstd forwarding via config/zstdnet-server.properties.
+ZstdNet is a Minecraft Java Edition mod that compresses relayed traffic between clients and servers through a local or server-side ZSTD proxy, with the goal of significantly reducing public bandwidth usage in high-repetition data scenarios.
+It supports automatic dedicated-server port takeover, LAN host publishing, raw vanilla passthrough compatibility, and forwarded real-IP restoration.
 '''
 
 [features.${mod_id}]

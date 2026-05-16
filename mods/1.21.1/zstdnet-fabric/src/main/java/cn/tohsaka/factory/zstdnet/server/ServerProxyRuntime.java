@@ -21,11 +21,11 @@ package cn.tohsaka.factory.zstdnet.server;
 
 import cn.tohsaka.factory.zstdnet.core.io.CountingInputStream;
 import cn.tohsaka.factory.zstdnet.core.io.CountingOutputStream;
+import cn.tohsaka.factory.zstdnet.core.limit.TokenBucketLimiter;
 import cn.tohsaka.factory.zstdnet.core.protocol.ByteArrayOps;
 import cn.tohsaka.factory.zstdnet.core.protocol.PacketIo;
 import cn.tohsaka.factory.zstdnet.core.protocol.VarIntCodec;
 import cn.tohsaka.factory.zstdnet.core.protocol.VarIntRead;
-import cn.tohsaka.factory.zstdnet.core.limit.TokenBucketLimiter;
 import cn.tohsaka.factory.zstdnet.core.stats.TrafficStats;
 import com.github.luben.zstd.ZstdInputStream;
 import com.github.luben.zstd.ZstdOutputStream;
@@ -55,12 +55,15 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Deque;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -100,8 +103,10 @@ final class ServerProxyRuntime {
     private static final int DEFAULT_BURST_BYTES = 256 * 1024;
     private static final Duration DEFAULT_BAN_DURATION = Duration.ofMinutes(1);
     private static final Duration DEFAULT_IDLE_TIMEOUT = Duration.ZERO;
+    private static final String DEFAULT_TRUSTED_PROXY_IPS = "127.0.0.1,::1,0:0:0:0:0:0:0:1";
     private static final int CLIENT_PEEK_BUFFER = 4096;
     private static final int MAX_HANDSHAKE_PACKET_SIZE = 2048;
+    private static final int MAX_PROXY_V2_PAYLOAD_SIZE = 216;
 
     private final Object lifecycleLock = new Object();
 
@@ -358,23 +363,24 @@ final class ServerProxyRuntime {
     private void handleClient(Socket client) {
         stats.addConn(1);
         String remoteIp = sourceIp(client.getRemoteSocketAddress());
-        String sourceIp = remoteIp;
+        String guardIp = remoteIp;
 
         try (Socket clientSocket = client) {
             PushbackInputStream pushIn = new PushbackInputStream(clientSocket.getInputStream(), CLIENT_PEEK_BUFFER);
             ProxyInfo proxyInfo = parseProxyProtocolV2(pushIn);
-            if (proxyInfo.valid && proxyInfo.sourceIp != null && !proxyInfo.sourceIp.isBlank()) {
-                sourceIp = proxyInfo.sourceIp;
+            String forwardedSourceIp = resolveForwardedSourceIp(remoteIp, proxyInfo);
+            if (forwardedSourceIp == null) {
+                return;
             }
 
-            if (!guard.begin(sourceIp)) {
-                LOGGER.warn("[server] blocked {} by flood guard", sourceIp);
+            if (!guard.begin(guardIp)) {
+                LOGGER.warn("[server] blocked {} by flood guard", guardIp);
                 return;
             }
 
             DetectedClientMode clientMode = detectClientMode(pushIn);
             if (clientMode.mode == ClientMode.RAW_LOGIN) {
-                LOGGER.warn("[server] rejected raw login attempt from {} on zstd-only entry", sourceIp);
+                LOGGER.warn("[server] rejected raw login attempt from {} on zstd-only entry", guardIp);
                 sendLoginDisconnect(
                     clientSocket,
                     """
@@ -404,9 +410,10 @@ final class ServerProxyRuntime {
                     return;
                 }
 
+                final String backendSourceIp = forwardedSourceIp;
                 Future<Exception> c2s = workers.submit(() -> {
                     try {
-                        forwardDecompress(upstream, pushIn, stats);
+                        forwardDecompress(upstream, pushIn, stats, backendSourceIp);
                         return null;
                     } catch (Exception ex) {
                         return ex;
@@ -450,21 +457,48 @@ final class ServerProxyRuntime {
                     err2 = s2c.get();
                 }
                 if (isRealPipeErr(err1)) {
-                    LOGGER.warn("pipe error source={} dir=client->mc: {}", sourceIp, err1.toString());
+                    LOGGER.warn("pipe error source={} dir=client->mc: {}", guardIp, err1.toString());
                 }
                 if (isRealPipeErr(err2)) {
-                    LOGGER.warn("pipe error source={} dir=mc->client: {}", sourceIp, err2.toString());
+                    LOGGER.warn("pipe error source={} dir=mc->client: {}", guardIp, err2.toString());
                 }
             } finally {
-                guard.end(sourceIp);
+                guard.end(guardIp);
             }
         } catch (Exception ex) {
             if (isRealPipeErr(ex)) {
-                LOGGER.warn("[server] connection error source={} remote={}: {}", sourceIp, remoteIp, ex.toString());
+                LOGGER.warn("[server] connection error source={} remote={}: {}", guardIp, remoteIp, ex.toString());
             }
         } finally {
             stats.addConn(-1);
         }
+    }
+
+    private String resolveForwardedSourceIp(String remoteIp, ProxyInfo proxyInfo) {
+        if (!cfg.trustProxyProtocol) {
+            return remoteIp;
+        }
+
+        if (!isTrustedProxyPeer(remoteIp)) {
+            LOGGER.warn(
+                "[server] rejected PROXY protocol connection from untrusted peer {}. trusted_proxy_ips={}",
+                remoteIp,
+                String.join(",", cfg.trustedProxyIps)
+            );
+            return null;
+        }
+
+        if (!proxyInfo.valid || proxyInfo.sourceIp == null || proxyInfo.sourceIp.isBlank()) {
+            LOGGER.warn("[server] rejected trusted PROXY protocol peer {} without a valid PROXY v2 header", remoteIp);
+            return null;
+        }
+
+        LOGGER.debug("[server] trusted PROXY protocol source {} via {}", proxyInfo.sourceIp, remoteIp);
+        return proxyInfo.sourceIp;
+    }
+
+    private boolean isTrustedProxyPeer(String remoteIp) {
+        return remoteIp != null && cfg.trustedProxyIps.contains(remoteIp.trim());
     }
 
     /**
@@ -545,9 +579,16 @@ final class ServerProxyRuntime {
     /**
      * Client -> backend: decompress zstd traffic before forwarding to Minecraft.
      */
-    private void forwardDecompress(Socket dst, InputStream src, TrafficStats stats) throws IOException {
+    private void forwardDecompress(Socket dst, InputStream src, TrafficStats stats, String sourceIp) throws IOException {
         try (ZstdInputStream zstdIn = new ZstdInputStream(new CountingInputStream(src, stats::addZstd))) {
             OutputStream dstOut = dst.getOutputStream();
+            byte[] firstPacket = PacketIo.readPacket(zstdIn);
+            if (firstPacket.length > 0) {
+                byte[] forwardedHandshake = appendForwardedIpToHandshake(firstPacket, sourceIp);
+                PacketIo.writePacket(dstOut, forwardedHandshake);
+                stats.addRaw(VarIntCodec.encode(forwardedHandshake.length).length + forwardedHandshake.length);
+            }
+
             byte[] buf = new byte[16 * 1024];
             int n;
             while ((n = zstdIn.read(buf)) >= 0) {
@@ -557,6 +598,75 @@ final class ServerProxyRuntime {
                 }
             }
         }
+    }
+
+    private byte[] appendForwardedIpToHandshake(byte[] handshakePayload, String sourceIp) {
+        if (handshakePayload == null || handshakePayload.length == 0 || sourceIp == null || sourceIp.isBlank()) {
+            return handshakePayload;
+        }
+
+        VarIntRead packetId = VarIntCodec.read(handshakePayload, 0, handshakePayload.length);
+        if (packetId == null || packetId.value() != 0) {
+            return handshakePayload;
+        }
+
+        VarIntRead protocol = VarIntCodec.read(handshakePayload, packetId.next(), handshakePayload.length);
+        if (protocol == null) {
+            return handshakePayload;
+        }
+
+        VarIntRead hostLength = VarIntCodec.read(handshakePayload, protocol.next(), handshakePayload.length);
+        if (hostLength == null || hostLength.value() < 0) {
+            return handshakePayload;
+        }
+
+        int hostStart = hostLength.next();
+        int hostEnd = hostStart + hostLength.value();
+        int portEnd = hostEnd + 2;
+        if (portEnd > handshakePayload.length) {
+            return handshakePayload;
+        }
+
+        VarIntRead nextState = VarIntCodec.read(handshakePayload, portEnd, handshakePayload.length);
+        if (nextState == null || nextState.value() != 2) {
+            return handshakePayload;
+        }
+
+        String originalHost = new String(handshakePayload, hostStart, hostLength.value(), StandardCharsets.UTF_8);
+        String forwardedHost = appendForwardedIpMarker(originalHost, sourceIp);
+        byte[] hostBytes = forwardedHost.getBytes(StandardCharsets.UTF_8);
+        if (hostBytes.length > 255) {
+            LOGGER.warn("[zstdnet-server] skipped forwarded real IP for {} because forwarded handshake host is too long: {} bytes", sourceIp, hostBytes.length);
+            return handshakePayload;
+        }
+
+        LOGGER.info("[zstdnet-server] appended forwarded real IP {} to login handshake host '{}'", sourceIp, originalHost);
+
+        return ByteArrayOps.concat(
+            ByteArrayOps.slice(handshakePayload, 0, protocol.next()),
+            VarIntCodec.encode(hostBytes.length),
+            hostBytes,
+            ByteArrayOps.slice(handshakePayload, hostEnd, handshakePayload.length)
+        );
+    }
+
+    private static String appendForwardedIpMarker(String originalHost, String sourceIp) {
+        String marker = "zstdnet-real-ip=" + Base64.getUrlEncoder().withoutPadding().encodeToString(sourceIp.getBytes(StandardCharsets.UTF_8));
+        int firstNull = originalHost.indexOf('\0');
+        if (firstNull >= 0) {
+            return originalHost + "\0" + marker;
+        }
+
+        int fmlMarker = originalHost.indexOf(" FML");
+        if (fmlMarker >= 0) {
+            String host = originalHost.substring(0, fmlMarker).trim();
+            String version = originalHost.substring(fmlMarker + 1).trim();
+            if (!host.isEmpty() && !version.isEmpty()) {
+                return host + "\0" + version + "\0" + marker;
+            }
+        }
+
+        return originalHost + "\0" + marker;
     }
 
     /**
@@ -676,6 +786,9 @@ final class ServerProxyRuntime {
         int verCmd = fixed[0] & 0xFF;
         int famProto = fixed[1] & 0xFF;
         int payloadLen = ((fixed[2] & 0xFF) << 8) | (fixed[3] & 0xFF);
+        if (payloadLen > MAX_PROXY_V2_PAYLOAD_SIZE) {
+            throw new IOException("PROXY protocol v2 payload too large: " + payloadLen);
+        }
         byte[] payload = PacketIo.readFully(in, payloadLen);
 
         int version = (verCmd & 0xF0) >> 4;
@@ -1047,6 +1160,8 @@ final class ServerProxyRuntime {
         long maxRatePerConnBps = parseLong(props.getProperty("max_rate_per_conn_bps"), 0L);
         long maxRateGlobalBps = parseLong(props.getProperty("max_rate_global_bps"), 0L);
         int burstBytes = parseInt(props.getProperty("burst_bytes"), DEFAULT_BURST_BYTES);
+        boolean trustProxyProtocol = Boolean.parseBoolean(props.getProperty("trust_proxy_protocol", "false").trim());
+        Set<String> trustedProxyIps = parseTrustedProxyIps(props.getProperty("trusted_proxy_ips", DEFAULT_TRUSTED_PROXY_IPS));
         if (flushInterval.isNegative()) {
             flushInterval = Duration.ZERO;
         }
@@ -1081,8 +1196,27 @@ final class ServerProxyRuntime {
             idleTimeout,
             maxRatePerConnBps,
             maxRateGlobalBps,
-            burstBytes
+            burstBytes,
+            trustProxyProtocol,
+            trustedProxyIps
         );
+    }
+
+    private Set<String> parseTrustedProxyIps(String raw) {
+        LinkedHashSet<String> ips = new LinkedHashSet<>();
+        String source = raw == null || raw.isBlank() ? DEFAULT_TRUSTED_PROXY_IPS : raw;
+        for (String item : source.split(",")) {
+            String value = item.trim();
+            if (!value.isEmpty()) {
+                ips.add(value);
+            }
+        }
+        if (ips.isEmpty()) {
+            ips.add("127.0.0.1");
+            ips.add("::1");
+            ips.add("0:0:0:0:0:0:0:1");
+        }
+        return Set.copyOf(ips);
     }
 
     /**
@@ -1158,11 +1292,22 @@ final class ServerProxyRuntime {
 
             # 令牌桶突发容量（字节）。
             burst_bytes=${BURST_BYTES}
+
+            # 如果玩家是通过 frp / 反代进服，并且你想让后端看到玩家真实 IP，就改成 true。
+            # 普通直连、本机测试、局域网、公网直连都保持 false。
+            # 改成 true 后，直接连 zstdnet 入口端口但不带 PROXY v2 头的连接会被拒绝。
+            trust_proxy_protocol=false
+
+            # 允许哪些机器转发“玩家真实 IP”给 zstdnet。
+            # frpc 和服务端在同一台机器时不用改，保持 127.0.0.1 即可。
+            # 如果 frpc 在另一台机器，就填那台机器连接到本服务器时使用的内网 IP。
+            trusted_proxy_ips=${TRUSTED_PROXY_IPS}
             """
             .replace("${LEVEL}", String.valueOf(DEFAULT_ZSTD_LEVEL))
             .replace("${MAX_CONN}", String.valueOf(DEFAULT_MAX_CONN_PER_IP))
             .replace("${MAX_REQ}", String.valueOf(DEFAULT_MAX_REQ_PER_WINDOW))
-            .replace("${BURST_BYTES}", String.valueOf(DEFAULT_BURST_BYTES));
+            .replace("${BURST_BYTES}", String.valueOf(DEFAULT_BURST_BYTES))
+            .replace("${TRUSTED_PROXY_IPS}", DEFAULT_TRUSTED_PROXY_IPS);
     }
 
     private String buildLanDefaultConfig(int mcServerPort) {
@@ -1230,6 +1375,16 @@ final class ServerProxyRuntime {
 
             # 令牌桶突发容量（字节）。
             burst_bytes=${BURST_BYTES}
+
+            # 如果玩家是通过 frp / 反代进服，并且你想让后端看到玩家真实 IP，就改成 true。
+            # 普通直连、本机测试、局域网、公网直连都保持 false。
+            # 改成 true 后，直接连 zstdnet 入口端口但不带 PROXY v2 头的连接会被拒绝。
+            trust_proxy_protocol=false
+
+            # 允许哪些机器转发“玩家真实 IP”给 zstdnet。
+            # frpc 和服务端在同一台机器时不用改，保持 127.0.0.1 即可。
+            # 如果 frpc 在另一台机器，就填那台机器连接到本服务器时使用的内网 IP。
+            trusted_proxy_ips=${TRUSTED_PROXY_IPS}
             """
             .replace("${LISTEN_PORT}", String.valueOf(mcServerPort))
             .replace("${TARGET_PORT}", String.valueOf(defaultAutoTargetPort(mcServerPort)))
@@ -1237,7 +1392,8 @@ final class ServerProxyRuntime {
             .replace("${LEVEL}", String.valueOf(DEFAULT_ZSTD_LEVEL))
             .replace("${MAX_CONN}", String.valueOf(DEFAULT_MAX_CONN_PER_IP))
             .replace("${MAX_REQ}", String.valueOf(DEFAULT_MAX_REQ_PER_WINDOW))
-            .replace("${BURST_BYTES}", String.valueOf(DEFAULT_BURST_BYTES));
+            .replace("${BURST_BYTES}", String.valueOf(DEFAULT_BURST_BYTES))
+            .replace("${TRUSTED_PROXY_IPS}", DEFAULT_TRUSTED_PROXY_IPS);
     }
 
     private int defaultAutoTargetPort(int publicPort) {
@@ -1636,7 +1792,9 @@ final class ServerProxyRuntime {
         Duration idleTimeout,
         long maxRatePerConnBps,
         long maxRateGlobalBps,
-        int burstBytes
+        int burstBytes,
+        boolean trustProxyProtocol,
+        Set<String> trustedProxyIps
     ) {
         private ProxyConfig withTarget(HostPort newTarget) {
             return new ProxyConfig(
@@ -1657,7 +1815,9 @@ final class ServerProxyRuntime {
                 idleTimeout,
                 maxRatePerConnBps,
                 maxRateGlobalBps,
-                burstBytes
+                burstBytes,
+                trustProxyProtocol,
+                trustedProxyIps
             );
         }
 
@@ -1680,7 +1840,9 @@ final class ServerProxyRuntime {
                 idleTimeout,
                 maxRatePerConnBps,
                 maxRateGlobalBps,
-                burstBytes
+                burstBytes,
+                trustProxyProtocol,
+                trustedProxyIps
             );
         }
 
@@ -1711,7 +1873,9 @@ final class ServerProxyRuntime {
                 idleTimeout,
                 maxRatePerConnBps,
                 maxRateGlobalBps,
-                burstBytes
+                burstBytes,
+                trustProxyProtocol,
+                trustedProxyIps
             );
         }
 
@@ -2138,6 +2302,9 @@ final class ServerProxyRuntime {
         }
     }
 
+    /**
+     * 线程命名工厂模块，便于日志与诊断定位线程用途。
+     */
     private static final class NamedFactory implements ThreadFactory {
         private final String prefix;
         private final AtomicInteger index = new AtomicInteger(1);

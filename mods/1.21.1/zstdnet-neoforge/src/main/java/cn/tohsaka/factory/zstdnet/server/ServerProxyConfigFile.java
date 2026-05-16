@@ -24,7 +24,8 @@ import net.neoforged.fml.loading.FMLEnvironment;
 import net.neoforged.fml.loading.FMLPaths;
 
 import java.io.IOException;
-import java.io.InputStream;
+import java.io.Reader;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -43,6 +44,7 @@ public final class ServerProxyConfigFile {
     private static final String DEFAULT_LISTEN_HOST = "0.0.0.0";
     private static final String DEFAULT_TARGET_HOST = "127.0.0.1";
     private static final String DEFAULT_VOICE_CHAT_LISTEN = DEFAULT_LISTEN_HOST + ":" + DEFAULT_VOICE_CHAT_LISTEN_PORT;
+    private static final String DEFAULT_TRUSTED_PROXY_IPS = "127.0.0.1,::1,0:0:0:0:0:0:0:1";
     private static final Set<String> KNOWN_KEYS = Set.of(
         "enabled",
         "auto_takeover",
@@ -61,7 +63,9 @@ public final class ServerProxyConfigFile {
         "idle_timeout",
         "max_rate_per_conn_bps",
         "max_rate_global_bps",
-        "burst_bytes"
+        "burst_bytes",
+        "trust_proxy_protocol",
+        "trusted_proxy_ips"
     );
 
     private ServerProxyConfigFile() {
@@ -170,8 +174,11 @@ public final class ServerProxyConfigFile {
             return props;
         }
 
-        try (InputStream in = Files.newInputStream(path)) {
-            props.load(in);
+        try {
+            String text = stripUtf8Bom(Files.readString(path, StandardCharsets.UTF_8));
+            try (Reader reader = new StringReader(text)) {
+                props.load(reader);
+            }
         } catch (IOException ignored) {
         }
         return props;
@@ -202,7 +209,26 @@ public final class ServerProxyConfigFile {
         props.putIfAbsent("max_rate_per_conn_bps", "0");
         props.putIfAbsent("max_rate_global_bps", "0");
         props.putIfAbsent("burst_bytes", "262144");
+        props.putIfAbsent("trust_proxy_protocol", "false");
+        props.putIfAbsent("trusted_proxy_ips", DEFAULT_TRUSTED_PROXY_IPS);
         return props;
+    }
+
+    private static String stripUtf8Bom(String text) {
+        return !text.isEmpty() && text.charAt(0) == '\uFEFF' ? text.substring(1) : text;
+    }
+
+    private static boolean isCommentFragmentKey(String key, String value) {
+        String normalizedKey = key.stripLeading();
+        if (normalizedKey.startsWith("#")
+            || normalizedKey.startsWith("!")
+            || normalizedKey.startsWith("\u00EF\u00BB\u00BF#")
+            || normalizedKey.startsWith("\u00EF\u00BB\u00BF!")) {
+            return true;
+        }
+
+        String normalizedValue = value == null ? "" : value.stripLeading();
+        return normalizedKey.endsWith("#") && normalizedValue.startsWith("---");
     }
 
     private static String detectLineSeparator(Path path) throws IOException {
@@ -264,7 +290,7 @@ public final class ServerProxyConfigFile {
         appendLine(builder, "voice_chat_target=" + props.getProperty("voice_chat_target"), lineSeparator);
         appendLine(builder, "", lineSeparator);
 
-        appendLine(builder, "# zstd 压缩等级（-5..22，通常 3..9 就够用）。", lineSeparator);
+        appendLine(builder, "# zstd 压缩等级（1-22，通常建议 3-9）。", lineSeparator);
         appendLine(builder, "level=" + props.getProperty("level"), lineSeparator);
         appendLine(builder, "", lineSeparator);
 
@@ -306,10 +332,22 @@ public final class ServerProxyConfigFile {
 
         appendLine(builder, "# 令牌桶突发容量，单位字节。", lineSeparator);
         appendLine(builder, "burst_bytes=" + props.getProperty("burst_bytes"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 如果玩家是通过 frp / 反代进服，并且你想让后端看到玩家真实 IP，就改成 true。", lineSeparator);
+        appendLine(builder, "# 普通直连、本机测试、局域网、公网直连都保持 false。", lineSeparator);
+        appendLine(builder, "# 改成 true 后，直接连 zstdnet 入口端口但不带 PROXY v2 头的连接会被拒绝。", lineSeparator);
+        appendLine(builder, "trust_proxy_protocol=" + props.getProperty("trust_proxy_protocol"), lineSeparator);
+        appendLine(builder, "", lineSeparator);
+
+        appendLine(builder, "# 允许哪些机器转发“玩家真实 IP”给 zstdnet。", lineSeparator);
+        appendLine(builder, "# frpc 和服务端在同一台机器时不用改，保持 127.0.0.1 即可。", lineSeparator);
+        appendLine(builder, "# 如果 frpc 在另一台机器，就填那台机器连接到本服务器时使用的内网 IP。", lineSeparator);
+        appendLine(builder, "trusted_proxy_ips=" + props.getProperty("trusted_proxy_ips"), lineSeparator);
 
         LinkedHashSet<String> extraKeys = new LinkedHashSet<>();
         for (String key : rawProps.stringPropertyNames()) {
-            if (!KNOWN_KEYS.contains(key) && !"allow_raw_login".equals(key)) {
+            if (!KNOWN_KEYS.contains(key) && !"allow_raw_login".equals(key) && !isCommentFragmentKey(key, rawProps.getProperty(key, ""))) {
                 extraKeys.add(key);
             }
         }
@@ -322,11 +360,15 @@ public final class ServerProxyConfigFile {
             }
         }
 
-        Files.writeString(path, builder.toString(), StandardCharsets.UTF_8);
+        Files.writeString(path, withUtf8Bom(builder.toString()), StandardCharsets.UTF_8);
     }
 
     private static void appendLine(StringBuilder builder, String line, String lineSeparator) {
         builder.append(line).append(lineSeparator);
+    }
+
+    private static String withUtf8Bom(String text) {
+        return "\uFEFF" + stripUtf8Bom(text);
     }
 
     static String parseHost(String listen, String fallback) {

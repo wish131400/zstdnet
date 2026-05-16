@@ -19,6 +19,7 @@
 
 package cn.tohsaka.factory.zstdnet.server;
 
+import cn.tohsaka.factory.zstdnet.coremod.ServerRealIpHooks;
 import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.ClickEvent;
@@ -203,7 +204,7 @@ public final class ServerProxyBootstrap {
         }
 
         SocketAddress remoteAddress = player.connection.getRemoteAddress();
-        if (isLoopback(remoteAddress)) {
+        if (isLoopback(remoteAddress) || ServerRealIpHooks.isForwardedConnection(player.connection.getConnection())) {
             if (activeLanPort > 0 && !player.connection.getConnection().isMemoryConnection()) {
                 LanCompressionSync.requestCompressionUpgrade(player);
             }

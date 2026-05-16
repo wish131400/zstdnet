@@ -3,7 +3,7 @@
   "id": "${mod_id}",
   "version": "${mod_version}",
   "name": "${mod_name}",
-  "description": "Route Minecraft traffic through a local or server-side zstd proxy.",
+  "description": "ZstdNet compresses Minecraft traffic through a local or server-side ZSTD proxy to reduce public bandwidth usage in high-repetition data scenarios. It supports automatic dedicated-server port takeover, LAN host publishing, raw vanilla passthrough compatibility, and forwarded real-IP restoration.",
   "license": "MIT",
   "authors": [
     "wish"

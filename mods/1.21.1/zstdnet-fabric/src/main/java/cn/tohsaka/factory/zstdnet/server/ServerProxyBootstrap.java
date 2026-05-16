@@ -19,6 +19,7 @@
 
 package cn.tohsaka.factory.zstdnet.server;
 
+import cn.tohsaka.factory.zstdnet.coremod.ServerRealIpHooks;
 import cn.tohsaka.factory.zstdnet.mixin.ServerGamePacketListenerImplAccessor;
 import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
 import com.mojang.logging.LogUtils;
@@ -183,8 +184,9 @@ public final class ServerProxyBootstrap {
         }
 
         SocketAddress remoteAddress = player.connection.getRemoteAddress();
-        if (isLoopback(remoteAddress)) {
-            if (activeLanPort > 0 && !((ServerGamePacketListenerImplAccessor) player.connection).zstdnet$getConnection().isMemoryConnection()) {
+        var connection = ((ServerGamePacketListenerImplAccessor) player.connection).zstdnet$getConnection();
+        if (isLoopback(remoteAddress) || ServerRealIpHooks.isForwardedConnection(connection)) {
+            if (activeLanPort > 0 && !connection.isMemoryConnection()) {
                 LanCompressionSync.requestCompressionUpgrade(player);
             }
             return;
