@@ -19,8 +19,10 @@
 
 package cn.tohsaka.factory.zstdnet.network;
 
+import cn.tohsaka.factory.zstdnet.client.ClientProxyPublisher;
 import cn.tohsaka.factory.zstdnet.Zstdnet;
 import cn.tohsaka.factory.zstdnet.mixin.ServerGamePacketListenerImplAccessor;
+import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
 import com.mojang.logging.LogUtils;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
@@ -40,6 +42,7 @@ public final class LanCompressionSync {
     private static final ResourceLocation PREPARE_ID = new ResourceLocation(Zstdnet.MODID, "lan_compression_prepare");
     private static final ResourceLocation READY_ID = new ResourceLocation(Zstdnet.MODID, "lan_compression_ready");
     private static final ResourceLocation ACTIVATE_ID = new ResourceLocation(Zstdnet.MODID, "lan_compression_activate");
+    private static final ResourceLocation SERVER_HUD_ID = new ResourceLocation(Zstdnet.MODID, "server_hud");
 
     private static boolean initialized;
     private static boolean clientInitialized;
@@ -89,6 +92,11 @@ public final class LanCompressionSync {
             int threshold = buf.readVarInt();
             client.execute(() -> applyClientThreshold(threshold));
         });
+
+        ClientPlayNetworking.registerGlobalReceiver(SERVER_HUD_ID, (client, handler, buf, responseSender) -> {
+            ServerProxyBootstrap.ServerHudSnapshot snapshot = decodeServerHudSnapshot(buf);
+            client.execute(() -> ClientProxyPublisher.acceptRemoteServerHudSnapshot(snapshot));
+        });
     }
 
     public static void requestCompressionUpgrade(ServerPlayer player) {
@@ -102,6 +110,15 @@ public final class LanCompressionSync {
         );
     }
 
+    public static void sendServerHudSnapshot(ServerPlayer player, ServerProxyBootstrap.ServerHudSnapshot snapshot) {
+        if (snapshot == null) {
+            return;
+        }
+        FriendlyByteBuf buf = PacketByteBufs.create();
+        encodeServerHudSnapshot(snapshot, buf);
+        ServerPlayNetworking.send(player, SERVER_HUD_ID, buf);
+    }
+
     private static void applyClientThreshold(int threshold) {
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.getConnection() == null) {
@@ -109,5 +126,47 @@ public final class LanCompressionSync {
         }
         minecraft.getConnection().getConnection().setupCompression(threshold, false);
         LOGGER.info("[zstdnet-client] compression threshold switched to {}.", threshold);
+    }
+
+    private static void encodeServerHudSnapshot(ServerProxyBootstrap.ServerHudSnapshot snapshot, FriendlyByteBuf buf) {
+        buf.writeUtf(snapshot.mode());
+        buf.writeUtf(snapshot.listenHost());
+        buf.writeVarInt(snapshot.listenPort());
+        buf.writeLong(snapshot.rawBytes());
+        buf.writeLong(snapshot.zstdBytes());
+        buf.writeLong(snapshot.rawUpBytes());
+        buf.writeLong(snapshot.rawDownBytes());
+        buf.writeLong(snapshot.zstdUpBytes());
+        buf.writeLong(snapshot.zstdDownBytes());
+        buf.writeLong(snapshot.rawUpRate());
+        buf.writeLong(snapshot.rawDownRate());
+        buf.writeLong(snapshot.zstdUpRate());
+        buf.writeLong(snapshot.zstdDownRate());
+        buf.writeLong(snapshot.rawRate());
+        buf.writeLong(snapshot.zstdRate());
+        buf.writeDouble(snapshot.ratioPercent());
+        buf.writeVarInt(snapshot.connections());
+    }
+
+    private static ServerProxyBootstrap.ServerHudSnapshot decodeServerHudSnapshot(FriendlyByteBuf buf) {
+        return new ServerProxyBootstrap.ServerHudSnapshot(
+            buf.readUtf(),
+            buf.readUtf(),
+            buf.readVarInt(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readLong(),
+            buf.readDouble(),
+            buf.readVarInt()
+        );
     }
 }

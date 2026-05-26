@@ -337,8 +337,8 @@ Simple Voice Chat audio is not compressed by zstd. ZstdNet only forwards the UDP
 - `ban_duration`：Ban duration after exceeding limits (default: 1m)
   - Prevents malicious attacks, banned IPs can't connect temporarily
 
-- `stats_interval`：Interval for server logs to show traffic statistics (default: 1s)
-  - Shows traffic information in the console every 1 second
+- `stats_interval`：Interval for server logs to show traffic statistics (default: 0s, disables stats logs)
+  - When set to a positive interval, periodically shows traffic information in the console
 
 - `flush_interval`：How often to send compressed data (default: 2ms)
   - Set to 0 to send immediately after each compression

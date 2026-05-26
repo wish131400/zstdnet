@@ -80,7 +80,7 @@ public final class ServerProxyConfigFile {
     }
 
     public static int readTargetPort() {
-        return parsePort(loadProperties().getProperty("target", "127.0.0.1:" + DEFAULT_MINECRAFT_PORT), DEFAULT_MINECRAFT_PORT);
+        return parsePort(loadProperties().getProperty("target", "127.0.0.1:" + DEFAULT_BACKEND_PORT), DEFAULT_BACKEND_PORT);
     }
 
     public static int readVoiceListenPort() {
@@ -113,11 +113,11 @@ public final class ServerProxyConfigFile {
         Files.createDirectories(path.getParent());
 
         String currentListen = props.getProperty("listen", DEFAULT_LISTEN_HOST + ":" + DEFAULT_ZSTD_PORT);
-        String currentTarget = props.getProperty("target", DEFAULT_TARGET_HOST + ":" + DEFAULT_MINECRAFT_PORT);
+        String currentTarget = props.getProperty("target", DEFAULT_TARGET_HOST + ":" + DEFAULT_BACKEND_PORT);
         String listenHost = parseHost(currentListen, DEFAULT_LISTEN_HOST);
         String targetHost = parseHost(currentTarget, DEFAULT_TARGET_HOST);
         String listenValue = listenHost + ":" + (listenPort != null ? listenPort : parsePort(currentListen, DEFAULT_ZSTD_PORT));
-        String targetValue = targetHost + ":" + (targetPort != null ? targetPort : parsePort(currentTarget, DEFAULT_MINECRAFT_PORT));
+        String targetValue = targetHost + ":" + (targetPort != null ? targetPort : parsePort(currentTarget, DEFAULT_BACKEND_PORT));
         props.setProperty("enabled", "true");
         props.putIfAbsent("auto_takeover", "false");
         props.setProperty("listen", listenValue);
@@ -203,7 +203,7 @@ public final class ServerProxyConfigFile {
         props.putIfAbsent("max_req_per_window", "50");
         props.putIfAbsent("request_window", "10s");
         props.putIfAbsent("ban_duration", "1m");
-        props.putIfAbsent("stats_interval", "0");
+        props.putIfAbsent("stats_interval", "0s");
         props.putIfAbsent("flush_interval", "2ms");
         props.putIfAbsent("idle_timeout", "0");
         props.putIfAbsent("max_rate_per_conn_bps", "0");

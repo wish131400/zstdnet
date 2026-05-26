@@ -78,8 +78,16 @@ import java.util.WeakHashMap;
 public final class ClientProxyPublisher {
     private static final int MIN_PORT = 1024;
     private static final int MAX_PORT = 65535;
+    private static final int DEFAULT_BACKEND_PORT = 25566;
     private static final int PORT_TEXT_NORMAL = 14737632;
     private static final int PORT_TEXT_INVALID = 16733525;
+    private static final int HUD_SERVER_BACKGROUND = 0x90241208;
+    private static final int HUD_SERVER_TITLE = 0xFFE1A3;
+    private static final int HUD_SERVER_TEXT = 0xFFD08A;
+    private static final int HUD_CLIENT_BACKGROUND = 0x90081224;
+    private static final int HUD_CLIENT_TITLE = 0xA8E6FF;
+    private static final int HUD_CLIENT_TEXT = 0x8FD3FF;
+    private static final long REMOTE_HUD_SNAPSHOT_TTL_MS = 3000L;
     private static final Logger LOGGER = LoggerFactory.getLogger(ClientProxyPublisher.class);
     private static final ClientProxyPublisher INSTANCE = new ClientProxyPublisher();
     private static final Component BACKEND_PORT_LABEL = Component.translatable("zstdnet.share_to_lan.backend_port");
@@ -99,6 +107,8 @@ public final class ClientProxyPublisher {
     private boolean singleplayerLanHintShown;
     private Object lastListEntry;
     private long lastListClickTime;
+    private ServerProxyBootstrap.ServerHudSnapshot remoteServerHudSnapshot;
+    private long remoteServerHudSnapshotMillis;
 
     private ClientProxyPublisher() {
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "zstdnet-client-shutdown"));
@@ -119,6 +129,10 @@ public final class ClientProxyPublisher {
         NeoForge.EVENT_BUS.addListener(INSTANCE::onClientTick);
         NeoForge.EVENT_BUS.addListener(INSTANCE::onRegisterClientCommands);
         LOGGER.info("zstdnet client runtime initialized");
+    }
+
+    public static void acceptRemoteServerHudSnapshot(ServerProxyBootstrap.ServerHudSnapshot snapshot) {
+        INSTANCE.updateRemoteServerHudSnapshot(snapshot);
     }
 
     private void onScreenInit(ScreenEvent.Init.Post event) {
@@ -188,6 +202,8 @@ public final class ClientProxyPublisher {
     private void onClientLogout(ClientPlayerNetworkEvent.LoggingOut event) {
         synchronized (stateLock) {
             closeActiveSessionLocked();
+            remoteServerHudSnapshot = null;
+            remoteServerHudSnapshotMillis = 0L;
         }
     }
 
@@ -212,7 +228,7 @@ public final class ClientProxyPublisher {
         if (minecraft.player == null || minecraft.options.hideGui) {
             return;
         }
-        ServerProxyBootstrap.ServerHudSnapshot hostSnapshot = ServerProxyBootstrap.currentHudSnapshot();
+        ServerProxyBootstrap.ServerHudSnapshot hostSnapshot = visibleHostSnapshot();
         boolean remoteServer = minecraft.getCurrentServer() != null;
         if (!remoteServer) {
             synchronized (stateLock) {
@@ -238,16 +254,14 @@ public final class ClientProxyPublisher {
             String hostMode = translateServerHudMode(hostSnapshot.mode());
             String[] hostLines = {
                 I18n.get("zstdnet.hud.host.title", hostMode, hostSnapshot.listenHost(), hostSnapshot.listenPort()),
-                I18n.get("zstdnet.hud.host.rate", formatRate(hostSnapshot.zstdRate()), formatRate(hostSnapshot.rawRate())),
-                I18n.get(
-                    "zstdnet.hud.total_ratio",
-                    formatSize(hostSnapshot.zstdBytes()),
-                    formatSize(hostSnapshot.rawBytes()),
-                    formatPercent(hostSnapshot.ratioPercent())
-                ),
+                I18n.get("zstdnet.hud.server.zstd_rate", formatRate(hostSnapshot.zstdUpRate()), formatRate(hostSnapshot.zstdDownRate())),
+                I18n.get("zstdnet.hud.server.raw_rate", formatRate(hostSnapshot.rawUpRate()), formatRate(hostSnapshot.rawDownRate())),
+                I18n.get("zstdnet.hud.server.zstd_total", formatSize(hostSnapshot.zstdBytes())),
+                I18n.get("zstdnet.hud.server.raw_total", formatSize(hostSnapshot.rawBytes())),
+                I18n.get("zstdnet.hud.server.ratio", formatPercent(hostSnapshot.ratioPercent())),
                 I18n.get("zstdnet.hud.connections", hostSnapshot.connections())
             };
-            y = renderHudPanel(gui, minecraft, y, hostLines);
+            y = renderHudPanel(gui, minecraft, y, hostLines, HUD_SERVER_BACKGROUND, HUD_SERVER_TITLE, HUD_SERVER_TEXT);
         }
 
         if (session != null) {
@@ -264,7 +278,7 @@ public final class ClientProxyPublisher {
                     formatPercent(stats.ratioPercent())
                 )
             };
-            renderHudPanel(gui, minecraft, y, clientLines);
+            renderHudPanel(gui, minecraft, y, clientLines, HUD_CLIENT_BACKGROUND, HUD_CLIENT_TITLE, HUD_CLIENT_TEXT);
         }
     }
 
@@ -923,6 +937,32 @@ public final class ClientProxyPublisher {
         }
     }
 
+    private void updateRemoteServerHudSnapshot(ServerProxyBootstrap.ServerHudSnapshot snapshot) {
+        synchronized (stateLock) {
+            remoteServerHudSnapshot = snapshot;
+            remoteServerHudSnapshotMillis = System.currentTimeMillis();
+        }
+    }
+
+    private ServerProxyBootstrap.ServerHudSnapshot visibleHostSnapshot() {
+        ServerProxyBootstrap.ServerHudSnapshot localSnapshot = ServerProxyBootstrap.currentHudSnapshot();
+        if (localSnapshot != null) {
+            return localSnapshot;
+        }
+
+        synchronized (stateLock) {
+            if (remoteServerHudSnapshot == null) {
+                return null;
+            }
+            if (System.currentTimeMillis() - remoteServerHudSnapshotMillis > REMOTE_HUD_SNAPSHOT_TTL_MS) {
+                remoteServerHudSnapshot = null;
+                remoteServerHudSnapshotMillis = 0L;
+                return null;
+            }
+            return remoteServerHudSnapshot;
+        }
+    }
+
     private static String formatRate(long bytesPerSecond) {
         return formatSize(bytesPerSecond) + "/s";
     }
@@ -942,7 +982,15 @@ public final class ClientProxyPublisher {
         return String.format("%.1f %s", value, units[unit]);
     }
 
-    private static int renderHudPanel(GuiGraphics gui, Minecraft minecraft, int startY, String[] lines) {
+    private static int renderHudPanel(
+        GuiGraphics gui,
+        Minecraft minecraft,
+        int startY,
+        String[] lines,
+        int backgroundColor,
+        int titleColor,
+        int textColor
+    ) {
         int x = 8;
         int y = startY;
         int lineHeight = 10;
@@ -953,13 +1001,9 @@ public final class ClientProxyPublisher {
         width += 8;
         int height = lineHeight * lines.length + 6;
 
-        gui.fill(x - 3, y - 3, x - 3 + width, y - 3 + height, 0x90000000);
+        gui.fill(x - 3, y - 3, x - 3 + width, y - 3 + height, backgroundColor);
         for (int i = 0; i < lines.length; i++) {
-            int color = switch (i) {
-                case 1 -> 0xA8E6A1;
-                case 2 -> 0x8FD3FF;
-                default -> 0xFFFFFF;
-            };
+            int color = i == 0 ? titleColor : textColor;
             gui.drawString(minecraft.font, lines[i], x, y + lineHeight * i, color);
         }
         return y + height + 4;
@@ -1010,7 +1054,9 @@ public final class ClientProxyPublisher {
             return null;
         }
 
-        int defaultZstdPort = findAvailableZstdPort(ServerProxyConfigFile.readListenPort());
+        int preferredZstdPort = ServerProxyConfigFile.readListenPort();
+        int defaultBackendPort = resolveBackendPortForLan(backendPortEdit, preferredZstdPort);
+        int defaultZstdPort = findAvailableZstdPort(preferredZstdPort, defaultBackendPort);
         int zstdFieldWidth = 150;
         int zstdFieldHeight = 20;
         int zstdFieldX = screen.width / 2 - zstdFieldWidth / 2;
@@ -1060,7 +1106,7 @@ public final class ClientProxyPublisher {
     }
 
     private void applyZstdPortResponse(ShareToLanState state, String raw) {
-        PortValidation validation = validateZstdPort(raw, state.defaultZstdPort);
+        PortValidation validation = validateZstdPort(raw, state.defaultZstdPort, state.backendPortEdit);
         state.zstdPort = validation.port();
         state.zstdError = validation.error();
         state.zstdPortEdit.setTextColor(validation.error() == null ? PORT_TEXT_NORMAL : PORT_TEXT_INVALID);
@@ -1108,7 +1154,7 @@ public final class ClientProxyPublisher {
         return true;
     }
 
-    private PortValidation validateZstdPort(String raw, int fallbackPort) {
+    private PortValidation validateZstdPort(String raw, int fallbackPort, EditBox backendPortEdit) {
         String text = raw == null ? "" : raw.trim();
         int port = fallbackPort;
 
@@ -1123,29 +1169,77 @@ public final class ClientProxyPublisher {
         if (port < MIN_PORT || port > MAX_PORT) {
             return new PortValidation(fallbackPort, ZSTD_PORT_INVALID);
         }
-        if (!HttpUtil.isPortAvailable(port)) {
+        if (!isZstdPortAvailable(port, resolveBackendPortForLan(backendPortEdit, port))) {
             return new PortValidation(port, ZSTD_PORT_UNAVAILABLE);
         }
         return new PortValidation(port, null);
     }
 
-    private static int findAvailableZstdPort(int preferredPort) {
+    private static int findAvailableZstdPort(int preferredPort, Integer reservedPort) {
         int startPort = clampPort(preferredPort);
         for (int port = startPort; port <= MAX_PORT; port++) {
-            if (HttpUtil.isPortAvailable(port)) {
+            if (isZstdPortAvailable(port, reservedPort)) {
                 return port;
             }
         }
         for (int port = MIN_PORT; port < startPort; port++) {
-            if (HttpUtil.isPortAvailable(port)) {
+            if (isZstdPortAvailable(port, reservedPort)) {
                 return port;
             }
         }
         try (ServerSocket socket = new ServerSocket(0)) {
-            return socket.getLocalPort();
+            int port = socket.getLocalPort();
+            return isReservedZstdPort(port, reservedPort) ? startPort : port;
         } catch (IOException e) {
             return startPort;
         }
+    }
+
+    private static boolean isZstdPortAvailable(int port, Integer reservedPort) {
+        return !isReservedZstdPort(port, reservedPort) && HttpUtil.isPortAvailable(port);
+    }
+
+    private static boolean isReservedZstdPort(int port, Integer reservedPort) {
+        return Objects.equals(port, reservedPort);
+    }
+
+    private static int resolveBackendPortForLan(EditBox backendPortEdit, int zstdPort) {
+        Integer backendPort = tryReadPort(backendPortEdit);
+        if (backendPort != null) {
+            return backendPort;
+        }
+        return findAvailableBackendPort(ServerProxyConfigFile.readTargetPort(), zstdPort);
+    }
+
+    private static int findAvailableBackendPort(int preferredPort, int reservedPort) {
+        int startPort = clampPort(preferredPort);
+        if (isBackendPortAvailable(startPort, reservedPort)) {
+            return startPort;
+        }
+        int defaultPort = clampPort(DEFAULT_BACKEND_PORT);
+        if (isBackendPortAvailable(defaultPort, reservedPort)) {
+            return defaultPort;
+        }
+        for (int port = Math.max(MIN_PORT, startPort + 1); port <= MAX_PORT; port++) {
+            if (isBackendPortAvailable(port, reservedPort)) {
+                return port;
+            }
+        }
+        for (int port = MIN_PORT; port < startPort; port++) {
+            if (isBackendPortAvailable(port, reservedPort)) {
+                return port;
+            }
+        }
+        try (ServerSocket socket = new ServerSocket(0)) {
+            int port = socket.getLocalPort();
+            return port == reservedPort ? startPort : port;
+        } catch (IOException e) {
+            return startPort;
+        }
+    }
+
+    private static boolean isBackendPortAvailable(int port, int reservedPort) {
+        return port != reservedPort && HttpUtil.isPortAvailable(port);
     }
 
     private static int clampPort(int port) {
@@ -1154,10 +1248,14 @@ public final class ClientProxyPublisher {
 
     private boolean prepareLanWorldPublish(ShareToLanState state) {
         syncShareToLanState(state);
+        applyZstdPortResponse(state, state.zstdPortEdit.getValue());
         if (state.zstdError != null) {
             return false;
         }
-        Integer backendPort = tryReadPort(state.backendPortEdit);
+        int backendPort = resolveBackendPortForLan(state.backendPortEdit, state.zstdPort);
+        if (state.backendPortEdit != null && (state.backendPortEdit.getValue() == null || state.backendPortEdit.getValue().isBlank())) {
+            state.backendPortEdit.setValue(String.valueOf(backendPort));
+        }
         try {
             ServerProxyConfigFile.writePorts(state.zstdPort, backendPort);
         } catch (IOException e) {

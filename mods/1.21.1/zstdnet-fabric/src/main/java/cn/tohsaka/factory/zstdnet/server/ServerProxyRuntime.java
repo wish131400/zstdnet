@@ -183,7 +183,7 @@ final class ServerProxyRuntime {
             this.statsTicker = Executors.newSingleThreadScheduledExecutor(new NamedFactory("zstdsrv-stats"));
             this.globalLimiter = TokenBucketLimiter.create(loaded.maxRateGlobalBps, loaded.burstBytes);
             this.runtimeMode = mode;
-            this.latestHudSnapshot = new HudSnapshot(mode, loaded.listen.host, loaded.listen.port, 0L, 0L, 0L, 0L, 0.0D, 0);
+            this.latestHudSnapshot = new HudSnapshot(mode, loaded.listen.host, loaded.listen.port, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0.0D, 0);
             this.running = true;
 
             startStatsPrinter();
@@ -265,9 +265,7 @@ final class ServerProxyRuntime {
     }
 
     private boolean isReservedLanListenPort(ProxyConfig config, int port) {
-        return port == config.target.port
-            || port == parseOptionalPort(config.voiceChatListen)
-            || port == parseOptionalPort(config.voiceChatTarget);
+        return port == config.target.port;
     }
 
     private int parseOptionalPort(String raw) {
@@ -331,7 +329,15 @@ final class ServerProxyRuntime {
     }
 
     HudSnapshot hudSnapshot() {
-        return latestHudSnapshot;
+        if (!running || stats == null || cfg == null || runtimeMode == null) {
+            return latestHudSnapshot;
+        }
+        HudSnapshot previous = latestHudSnapshot;
+        long rawUpRate = previous == null ? 0L : previous.rawUpRate();
+        long rawDownRate = previous == null ? 0L : previous.rawDownRate();
+        long zstdUpRate = previous == null ? 0L : previous.zstdUpRate();
+        long zstdDownRate = previous == null ? 0L : previous.zstdDownRate();
+        return buildHudSnapshot(rawUpRate, rawDownRate, zstdUpRate, zstdDownRate);
     }
 
     boolean configChangedOnDisk() {
@@ -552,11 +558,11 @@ final class ServerProxyRuntime {
         OutputStream upstreamOut = upstream.getOutputStream();
         upstreamOut.write(initialWireData);
         upstreamOut.flush();
-        addRawPassthroughStats(initialWireData.length, stats);
+        addRawPassthroughStats(initialWireData.length, stats, true);
 
         Future<?> upstreamWriter = workers.submit(() -> {
             try {
-                streamRaw(clientIn, upstreamOut, stats);
+                streamRaw(clientIn, upstreamOut, stats, true);
             } catch (Exception ignored) {
             } finally {
                 closeWrite(upstream);
@@ -565,7 +571,7 @@ final class ServerProxyRuntime {
 
         Future<?> downstreamWriter = workers.submit(() -> {
             try {
-                streamRaw(upstream.getInputStream(), clientSocket.getOutputStream(), stats);
+                streamRaw(upstream.getInputStream(), clientSocket.getOutputStream(), stats, false);
             } catch (Exception ignored) {
             } finally {
                 closeWrite(clientSocket);
@@ -580,13 +586,13 @@ final class ServerProxyRuntime {
      * Client -> backend: decompress zstd traffic before forwarding to Minecraft.
      */
     private void forwardDecompress(Socket dst, InputStream src, TrafficStats stats, String sourceIp) throws IOException {
-        try (ZstdInputStream zstdIn = new ZstdInputStream(new CountingInputStream(src, stats::addZstd))) {
+        try (ZstdInputStream zstdIn = new ZstdInputStream(new CountingInputStream(src, stats::addZstdUp))) {
             OutputStream dstOut = dst.getOutputStream();
             byte[] firstPacket = PacketIo.readPacket(zstdIn);
             if (firstPacket.length > 0) {
                 byte[] forwardedHandshake = appendForwardedIpToHandshake(firstPacket, sourceIp);
                 PacketIo.writePacket(dstOut, forwardedHandshake);
-                stats.addRaw(VarIntCodec.encode(forwardedHandshake.length).length + forwardedHandshake.length);
+                stats.addRawUp(VarIntCodec.encode(forwardedHandshake.length).length + forwardedHandshake.length);
             }
 
             byte[] buf = new byte[16 * 1024];
@@ -594,7 +600,7 @@ final class ServerProxyRuntime {
             while ((n = zstdIn.read(buf)) >= 0) {
                 if (n > 0) {
                     dstOut.write(buf, 0, n);
-                    stats.addRaw(n);
+                    stats.addRawUp(n);
                 }
             }
         }
@@ -675,13 +681,13 @@ final class ServerProxyRuntime {
     /**
      * Raw status traffic bypasses compression but still updates bandwidth stats as 100% ratio traffic.
      */
-    private void streamRaw(InputStream in, OutputStream out, TrafficStats stats) throws IOException {
+    private void streamRaw(InputStream in, OutputStream out, TrafficStats stats, boolean upstream) throws IOException {
         byte[] buf = new byte[16 * 1024];
         int n;
         while ((n = in.read(buf)) >= 0) {
             if (n > 0) {
                 out.write(buf, 0, n);
-                addRawPassthroughStats(n, stats);
+                addRawPassthroughStats(n, stats, upstream);
             }
         }
     }
@@ -699,7 +705,7 @@ final class ServerProxyRuntime {
         TokenBucketLimiter globalLimiter
     ) throws IOException {
         OutputStream limitedDst = new RateLimitedOutputStream(dst, perConnLimiter, globalLimiter);
-        try (ZstdOutputStream zstdOut = new ZstdOutputStream(new CountingOutputStream(limitedDst, stats::addZstd), level)) {
+        try (ZstdOutputStream zstdOut = new ZstdOutputStream(new CountingOutputStream(limitedDst, stats::addZstdDown), level)) {
             zstdOut.setCloseFrameOnFlush(false);
             InputStream srcIn = src.getInputStream();
             byte[] buf = new byte[16 * 1024];
@@ -747,7 +753,7 @@ final class ServerProxyRuntime {
                         continue;
                     }
 
-                    stats.addRaw(n);
+                    stats.addRawDown(n);
                     zstdOut.write(buf, 0, n);
                     hasPending = true;
                     if (flushIntervalNs == 0L || (System.nanoTime() - lastFlushNs) >= flushIntervalNs) {
@@ -1032,29 +1038,49 @@ final class ServerProxyRuntime {
     /**
      * Utility helpers for packet framing and passthrough traffic accounting.
      */
-    private void addRawPassthroughStats(int bytes, TrafficStats stats) {
+    private void addRawPassthroughStats(int bytes, TrafficStats stats, boolean upstream) {
         if (stats == null || bytes <= 0) {
             return;
         }
-        stats.addRaw(bytes);
-        stats.addZstd(bytes);
+        if (upstream) {
+            stats.addRawUp(bytes);
+            stats.addZstdUp(bytes);
+        } else {
+            stats.addRawDown(bytes);
+            stats.addZstdDown(bytes);
+        }
+    }
+
+    private HudSnapshot buildHudSnapshot(long rawUpRate, long rawDownRate, long zstdUpRate, long zstdDownRate) {
+        long raw = stats.rawBytes();
+        long zstd = stats.zstdBytes();
+        double ratio = raw <= 0 ? 0.0 : ((double) zstd * 100.0 / (double) raw);
+        return new HudSnapshot(
+            runtimeMode,
+            cfg.listen.host,
+            cfg.listen.port,
+            raw,
+            zstd,
+            stats.rawUpBytes(),
+            stats.rawDownBytes(),
+            stats.zstdUpBytes(),
+            stats.zstdDownBytes(),
+            rawUpRate,
+            rawDownRate,
+            zstdUpRate,
+            zstdDownRate,
+            rawUpRate + rawDownRate,
+            zstdUpRate + zstdDownRate,
+            ratio,
+            stats.activeConnections()
+        );
     }
 
     private void startStatsPrinter() {
-        if (cfg.statsInterval.isZero() || cfg.statsInterval.isNegative()) {
-            LOGGER.info("[zstdnet-server] periodic stats logging disabled.");
-            statsTicker.scheduleAtFixedRate(() -> {
-                FloodGuard currentGuard = guard;
-                if (currentGuard != null) {
-                    currentGuard.sweepExpired();
-                }
-            }, 10L, 10L, TimeUnit.SECONDS);
-            return;
-        }
-
-        long periodMs = Math.max(250L, cfg.statsInterval.toMillis());
-        AtomicLong prevRaw = new AtomicLong();
-        AtomicLong prevZstd = new AtomicLong();
+        AtomicLong prevHudRawUp = new AtomicLong(stats.rawUpBytes.get());
+        AtomicLong prevHudRawDown = new AtomicLong(stats.rawDownBytes.get());
+        AtomicLong prevHudZstdUp = new AtomicLong(stats.zstdUpBytes.get());
+        AtomicLong prevHudZstdDown = new AtomicLong(stats.zstdDownBytes.get());
 
         statsTicker.scheduleAtFixedRate(() -> {
             FloodGuard currentGuard = guard;
@@ -1062,16 +1088,36 @@ final class ServerProxyRuntime {
                 currentGuard.sweepExpired();
             }
 
+            long rawUp = stats.rawUpBytes.get();
+            long rawDown = stats.rawDownBytes.get();
+            long zstdUp = stats.zstdUpBytes.get();
+            long zstdDown = stats.zstdDownBytes.get();
+            latestHudSnapshot = buildHudSnapshot(
+                rawUp - prevHudRawUp.getAndSet(rawUp),
+                rawDown - prevHudRawDown.getAndSet(rawDown),
+                zstdUp - prevHudZstdUp.getAndSet(zstdUp),
+                zstdDown - prevHudZstdDown.getAndSet(zstdDown)
+            );
+        }, 1000L, 1000L, TimeUnit.MILLISECONDS);
+
+        if (cfg.statsInterval.isZero() || cfg.statsInterval.isNegative()) {
+            LOGGER.info("[zstdnet-server] periodic stats logging disabled.");
+            return;
+        }
+
+        long periodMs = Math.max(250L, cfg.statsInterval.toMillis());
+        AtomicLong prevRaw = new AtomicLong(stats.rawBytes.get());
+        AtomicLong prevZstd = new AtomicLong(stats.zstdBytes.get());
+
+        statsTicker.scheduleAtFixedRate(() -> {
             long raw = stats.rawBytes.get();
             long zstd = stats.zstdBytes.get();
-            int conns = stats.activeConn.get();
 
             long dr = raw - prevRaw.getAndSet(raw);
             long dz = zstd - prevZstd.getAndSet(zstd);
             long rawPerSec = (long) (dr * (1000.0 / periodMs));
             long zstdPerSec = (long) (dz * (1000.0 / periodMs));
             double ratio = raw <= 0 ? 0.0 : ((double) zstd * 100.0 / (double) raw);
-            latestHudSnapshot = new HudSnapshot(runtimeMode, cfg.listen.host, cfg.listen.port, raw, zstd, rawPerSec, zstdPerSec, ratio, conns);
 
             String now = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
             LOGGER.info("[{}] Raw: {} ({}) | Zstd: {} ({}) | Ratio: {}% | Conns: {}",
@@ -1081,7 +1127,7 @@ final class ServerProxyRuntime {
                 formatSize(zstd),
                 formatRate(zstdPerSec),
                 String.format(Locale.ROOT, "%.2f", ratio),
-                conns);
+                stats.activeConnections());
         }, periodMs, periodMs, TimeUnit.MILLISECONDS);
     }
 
@@ -1154,7 +1200,7 @@ final class ServerProxyRuntime {
         int maxReq = parseInt(props.getProperty("max_req_per_window"), DEFAULT_MAX_REQ_PER_WINDOW);
         Duration window = parseDuration(props.getProperty("request_window"), Duration.ofSeconds(10));
         Duration ban = parseDuration(props.getProperty("ban_duration"), DEFAULT_BAN_DURATION);
-        Duration statsInterval = parseDuration(props.getProperty("stats_interval"), Duration.ofSeconds(10));
+        Duration statsInterval = parseDuration(props.getProperty("stats_interval"), Duration.ZERO);
         Duration flushInterval = parseDuration(props.getProperty("flush_interval"), Duration.ofMillis(2));
         Duration idleTimeout = parseDuration(props.getProperty("idle_timeout"), DEFAULT_IDLE_TIMEOUT);
         long maxRatePerConnBps = parseLong(props.getProperty("max_rate_per_conn_bps"), 0L);
@@ -1276,7 +1322,7 @@ final class ServerProxyRuntime {
             ban_duration=1m
 
             # 统计日志输出间隔。
-            stats_interval=10s
+            stats_interval=0s
 
             # zstd flush 间隔，0ms 表示每次写入都 flush。
             flush_interval=2ms
@@ -1359,7 +1405,7 @@ final class ServerProxyRuntime {
             ban_duration=1m
 
             # 统计日志输出间隔。
-            stats_interval=10s
+            stats_interval=0s
 
             # zstd flush 间隔，0ms 表示每次写入都 flush。
             flush_interval=2ms
@@ -1758,6 +1804,14 @@ final class ServerProxyRuntime {
         int listenPort,
         long rawBytes,
         long zstdBytes,
+        long rawUpBytes,
+        long rawDownBytes,
+        long zstdUpBytes,
+        long zstdDownBytes,
+        long rawUpRate,
+        long rawDownRate,
+        long zstdUpRate,
+        long zstdDownRate,
         long rawRate,
         long zstdRate,
         double ratioPercent,

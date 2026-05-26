@@ -19,7 +19,9 @@
 
 package cn.tohsaka.factory.zstdnet.network;
 
+import cn.tohsaka.factory.zstdnet.client.ClientProxyPublisher;
 import cn.tohsaka.factory.zstdnet.Zstdnet;
+import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
 import com.mojang.logging.LogUtils;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.FriendlyByteBuf;
@@ -68,10 +70,15 @@ public final class LanCompressionSync {
             .decoder(ReadyMessage::decode)
             .consumerMainThread(ReadyMessage::handle)
             .add();
-        CHANNEL.messageBuilder(ActivateMessage.class, id, NetworkDirection.PLAY_TO_CLIENT)
+        CHANNEL.messageBuilder(ActivateMessage.class, id++, NetworkDirection.PLAY_TO_CLIENT)
             .encoder(ActivateMessage::encode)
             .decoder(ActivateMessage::decode)
             .consumerMainThread(ActivateMessage::handle)
+            .add();
+        CHANNEL.messageBuilder(ServerHudMessage.class, id++, NetworkDirection.PLAY_TO_CLIENT)
+            .encoder(ServerHudMessage::encode)
+            .decoder(ServerHudMessage::decode)
+            .consumerMainThread(ServerHudMessage::handle)
             .add();
     }
 
@@ -83,6 +90,14 @@ public final class LanCompressionSync {
             LAN_THRESHOLD,
             player.getGameProfile().getName()
         );
+    }
+
+    public static void sendServerHudSnapshot(ServerPlayer player, ServerProxyBootstrap.ServerHudSnapshot snapshot) {
+        if (snapshot == null) {
+            return;
+        }
+        init();
+        CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), ServerHudMessage.from(snapshot));
     }
 
     private static void applyClientThreshold(int threshold) {
@@ -149,6 +164,117 @@ public final class LanCompressionSync {
         private static void handle(ActivateMessage message, Supplier<NetworkEvent.Context> supplier) {
             supplier.get().enqueueWork(() -> applyClientThreshold(message.threshold));
             supplier.get().setPacketHandled(true);
+        }
+    }
+
+    private record ServerHudMessage(
+        String mode,
+        String listenHost,
+        int listenPort,
+        long rawBytes,
+        long zstdBytes,
+        long rawUpBytes,
+        long rawDownBytes,
+        long zstdUpBytes,
+        long zstdDownBytes,
+        long rawUpRate,
+        long rawDownRate,
+        long zstdUpRate,
+        long zstdDownRate,
+        long rawRate,
+        long zstdRate,
+        double ratioPercent,
+        int connections
+    ) {
+        private static ServerHudMessage from(ServerProxyBootstrap.ServerHudSnapshot snapshot) {
+            return new ServerHudMessage(
+                snapshot.mode(),
+                snapshot.listenHost(),
+                snapshot.listenPort(),
+                snapshot.rawBytes(),
+                snapshot.zstdBytes(),
+                snapshot.rawUpBytes(),
+                snapshot.rawDownBytes(),
+                snapshot.zstdUpBytes(),
+                snapshot.zstdDownBytes(),
+                snapshot.rawUpRate(),
+                snapshot.rawDownRate(),
+                snapshot.zstdUpRate(),
+                snapshot.zstdDownRate(),
+                snapshot.rawRate(),
+                snapshot.zstdRate(),
+                snapshot.ratioPercent(),
+                snapshot.connections()
+            );
+        }
+
+        private static ServerHudMessage decode(FriendlyByteBuf buf) {
+            return new ServerHudMessage(
+                buf.readUtf(),
+                buf.readUtf(),
+                buf.readVarInt(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readLong(),
+                buf.readDouble(),
+                buf.readVarInt()
+            );
+        }
+
+        private static void encode(ServerHudMessage message, FriendlyByteBuf buf) {
+            buf.writeUtf(message.mode);
+            buf.writeUtf(message.listenHost);
+            buf.writeVarInt(message.listenPort);
+            buf.writeLong(message.rawBytes);
+            buf.writeLong(message.zstdBytes);
+            buf.writeLong(message.rawUpBytes);
+            buf.writeLong(message.rawDownBytes);
+            buf.writeLong(message.zstdUpBytes);
+            buf.writeLong(message.zstdDownBytes);
+            buf.writeLong(message.rawUpRate);
+            buf.writeLong(message.rawDownRate);
+            buf.writeLong(message.zstdUpRate);
+            buf.writeLong(message.zstdDownRate);
+            buf.writeLong(message.rawRate);
+            buf.writeLong(message.zstdRate);
+            buf.writeDouble(message.ratioPercent);
+            buf.writeVarInt(message.connections);
+        }
+
+        private static void handle(ServerHudMessage message, Supplier<NetworkEvent.Context> supplier) {
+            supplier.get().enqueueWork(() -> ClientProxyPublisher.acceptRemoteServerHudSnapshot(message.toSnapshot()));
+            supplier.get().setPacketHandled(true);
+        }
+
+        private ServerProxyBootstrap.ServerHudSnapshot toSnapshot() {
+            return new ServerProxyBootstrap.ServerHudSnapshot(
+                mode,
+                listenHost,
+                listenPort,
+                rawBytes,
+                zstdBytes,
+                rawUpBytes,
+                rawDownBytes,
+                zstdUpBytes,
+                zstdDownBytes,
+                rawUpRate,
+                rawDownRate,
+                zstdUpRate,
+                zstdDownRate,
+                rawRate,
+                zstdRate,
+                ratioPercent,
+                connections
+            );
         }
     }
 }

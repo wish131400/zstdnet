@@ -48,6 +48,7 @@ public final class ServerProxyBootstrap {
     private static final ServerProxyRuntime RUNTIME = new ServerProxyRuntime();
     private static volatile int publishedLanPort = -1;
     private static volatile int activeLanPort = -1;
+    private static volatile long lastHudSyncMillis;
 
     private ServerProxyBootstrap() {
     }
@@ -74,6 +75,14 @@ public final class ServerProxyBootstrap {
             snapshot.listenPort(),
             snapshot.rawBytes(),
             snapshot.zstdBytes(),
+            snapshot.rawUpBytes(),
+            snapshot.rawDownBytes(),
+            snapshot.zstdUpBytes(),
+            snapshot.zstdDownBytes(),
+            snapshot.rawUpRate(),
+            snapshot.rawDownRate(),
+            snapshot.zstdUpRate(),
+            snapshot.zstdDownRate(),
             snapshot.rawRate(),
             snapshot.zstdRate(),
             snapshot.ratioPercent(),
@@ -101,6 +110,7 @@ public final class ServerProxyBootstrap {
     private static void onServerStopping(MinecraftServer server) {
         publishedLanPort = -1;
         activeLanPort = -1;
+        lastHudSyncMillis = 0L;
         RUNTIME.stop();
         DedicatedServerAutoPort.clear();
     }
@@ -112,6 +122,7 @@ public final class ServerProxyBootstrap {
                 RUNTIME.stop();
                 RUNTIME.start(server.getPort());
             }
+            syncServerHudSnapshot(server);
             return;
         }
 
@@ -144,6 +155,22 @@ public final class ServerProxyBootstrap {
         }
         publishedLanPort = -1;
         activeLanPort = -1;
+    }
+
+    private static void syncServerHudSnapshot(MinecraftServer server) {
+        long now = System.currentTimeMillis();
+        if (now - lastHudSyncMillis < 1000L) {
+            return;
+        }
+        lastHudSyncMillis = now;
+
+        ServerHudSnapshot snapshot = currentHudSnapshot();
+        if (snapshot == null) {
+            return;
+        }
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            LanCompressionSync.sendServerHudSnapshot(player, snapshot);
+        }
     }
 
     private static void notifyLanProxyReady(MinecraftServer server, int lanPort) {
@@ -214,6 +241,14 @@ public final class ServerProxyBootstrap {
         int listenPort,
         long rawBytes,
         long zstdBytes,
+        long rawUpBytes,
+        long rawDownBytes,
+        long zstdUpBytes,
+        long zstdDownBytes,
+        long rawUpRate,
+        long rawDownRate,
+        long zstdUpRate,
+        long zstdDownRate,
         long rawRate,
         long zstdRate,
         double ratioPercent,
