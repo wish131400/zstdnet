@@ -258,8 +258,8 @@ public final class ClientProxyPublisher {
             String hostMode = translateServerHudMode(hostSnapshot.mode());
             String[] hostLines = {
                 I18n.get("zstdnet.hud.host.title", hostMode, hostSnapshot.listenHost(), hostSnapshot.listenPort()),
-                I18n.get("zstdnet.hud.server.zstd_rate", formatRate(hostSnapshot.zstdUpRate()), formatRate(hostSnapshot.zstdDownRate())),
-                I18n.get("zstdnet.hud.server.raw_rate", formatRate(hostSnapshot.rawUpRate()), formatRate(hostSnapshot.rawDownRate())),
+                I18n.get("zstdnet.hud.server.zstd_rate", formatRate(hostSnapshot.zstdDownRate()), formatRate(hostSnapshot.zstdUpRate())),
+                I18n.get("zstdnet.hud.server.raw_rate", formatRate(hostSnapshot.rawDownRate()), formatRate(hostSnapshot.rawUpRate())),
                 I18n.get("zstdnet.hud.server.zstd_total", formatSize(hostSnapshot.zstdBytes())),
                 I18n.get("zstdnet.hud.server.raw_total", formatSize(hostSnapshot.rawBytes())),
                 I18n.get("zstdnet.hud.server.ratio", formatPercent(hostSnapshot.ratioPercent())),
