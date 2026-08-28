@@ -247,19 +247,18 @@ Used to view or change ports in singleplayer / LAN hosting scenarios:
 /zstdport show
 /zstdport game 25565
 /zstdport zstd 35565
-/zstdport voice 25565
-/zstdport zstdvoice 24455
+/zstdport udp show
+/zstdport udp add 24456
+/zstdport udp remove 24456
 ```
 
 Notes:
 
 - `/zstdport` is a client-side command
 - `show` can view the current config
-- `voice` changes `voice_chat_target`, which is the backend voice port
-- `zstdvoice` changes `voice_chat_listen`, which is the public voice entry
-- In singleplayer/LAN hosting, the default `voice_chat_target` is `127.0.0.1:25565`
-- On dedicated servers, the default `voice_chat_target` remains `127.0.0.1:24454`
-- `game`, `zstd`, `voice`, and `zstdvoice` can only be changed by the local host with admin permission
+- `game` and `zstd` can only be changed by the local host with admin permission
+- `udp show` displays the current `udp_direct_ports`
+- `udp add <port>` / `udp remove <port>` add or remove direct UDP ports, de-duplicate automatically, and reject the public game port
 - This command does not modify dedicated server configs
 - For dedicated servers, edit `config/zstdnet-server.properties` directly
 
@@ -305,11 +304,12 @@ UI-heavy menu rewrites can still cause compatibility issues.
 
 ### What about Simple Voice Chat or other UDP-based voice mods?
 
-Simple Voice Chat audio is not compressed by zstd. ZstdNet only forwards the UDP packets as raw passthrough on the server side.
+Simple Voice Chat audio is not compressed by zstd.
 
-- If Simple Voice Chat uses its own UDP port, you must set `voice_chat_listen` explicitly. `voice_chat_target` can stay blank and will default to the local SVC port.
-- If the UDP route cannot be armed, the game TCP path still works, but voice chat may stay offline.
-- If you want to edit the `voice` passthrough entries in `zstdnet-server.properties` directly, use `/zstdport voice <port>` for the backend voice port, or `/zstdport zstdvoice <port>` for the public voice entry.
+- The default `udp_direct_ports=24454` supports SVC out of the box. The client temporarily owns `127.0.0.1:24454` and forwards it directly to the original server address on the same port, so the local zstd TCP proxy does not confuse SVC.
+- `udp_direct_ports` does not create a server-side zstd UDP route. Your firewall, FRP tunnel, or other public ingress must still forward the same UDP port directly to the server.
+- Do not put the public game entry port in `udp_direct_ports`. ZstdNet reserves that UDP route for same-port mods such as Sable and Create: Aeronautics.
+- If SVC uses a non-default port, add that port to `udp_direct_ports` instead.
 
 ## Configuration Files
 
@@ -380,18 +380,11 @@ Simple Voice Chat audio is not compressed by zstd. ZstdNet only forwards the UDP
   - Unit is bytes, acts as a "buffer pool" for traffic
   - Allows short-term burst traffic to exceed the limit even with rate limiting enabled
 
-- `voice_chat_passthrough`：Enable raw UDP passthrough for Simple Voice Chat (default: true)
-  - Voice traffic is forwarded without zstd compression
-  - Set to false to disable voice UDP route handling entirely
-
-- `voice_chat_listen`：Optional public UDP entry for voice chat
-  - In singleplayer/LAN mode, the generated default is usually `0.0.0.0:24455`
-  - In separate-port mode, this must be set explicitly
-
-- `voice_chat_target`：Optional backend UDP target for voice chat
-  - In singleplayer/LAN mode, the generated default is `127.0.0.1:25565`
-  - On dedicated servers, the generated default is `127.0.0.1:24454`
-  - In separate-port mode, when `voice_chat_listen` is set, it defaults to `127.0.0.1:<SVC port>`
+- `udp_direct_ports`: Comma-separated UDP ports that clients should reach directly (default: `24454`)
+  - For example: `24454,24456`; leave blank to disable direct routing for independent UDP services
+  - Each port is temporarily bound on the client loopback address and forwarded unchanged to the original server address for the active zstd session
+  - Suitable for the default SVC port and other fixed independent UDP services; it bypasses both zstd compression and server-side UDP routing
+  - Do not include the public zstd game entry port, to avoid interfering with same-port UDP mods such as Sable
 
 ### Client Configuration File `zstdnet-client.toml` Content
 

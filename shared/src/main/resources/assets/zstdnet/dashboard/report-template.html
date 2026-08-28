@@ -1304,8 +1304,18 @@
           ctx.save(); ctx.strokeStyle=cssColor('--text'); ctx.globalAlpha=.55; ctx.lineWidth=1;
           ctx.strokeRect(hit.left - 2, hit.top - 2, hit.width + 4, pad.t + ch - hit.top + 4); ctx.restore();
         }
-        const labels=Math.min(7,points.length);ctx.fillStyle=cssColor('--chart-label');
-        for(let i=0;i<labels;i++){const idx=Math.round(i*(points.length-1)/Math.max(1,labels-1));ctx.textAlign=i===0?'left':i===labels-1?'right':'center';ctx.fillText((points[idx].date||'').slice(5),pad.l+slot*idx+slot/2,height-12);}
+        const dateLabels=points.map(point=>(point.date||'').slice(5));
+        const widestDateLabel=Math.max(...dateLabels.map(label=>ctx.measureText(label).width));
+        const labelStep=Math.max(1,Math.ceil((widestDateLabel+12)/slot));
+        const labelIndexes=[];
+        for(let i=0;i<points.length;i+=labelStep) labelIndexes.push(i);
+        const lastIndex=points.length-1;
+        if(labelIndexes[labelIndexes.length-1]!==lastIndex){
+          if(lastIndex-labelIndexes[labelIndexes.length-1]<labelStep) labelIndexes.pop();
+          labelIndexes.push(lastIndex);
+        }
+        ctx.fillStyle=cssColor('--chart-label');ctx.textAlign='center';
+        labelIndexes.forEach(idx=>ctx.fillText(dateLabels[idx],pad.l+slot*idx+slot/2,height-12));
       }
       function drawEmpty(ctx,w,h,message){ctx.fillStyle=cssColor('--chart-label');ctx.font='12px system-ui';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(message,w/2,h/2);}
 

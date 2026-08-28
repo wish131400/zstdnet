@@ -19,8 +19,6 @@
 
 package cn.tohsaka.factory.zstdnet.server;
 
-import net.neoforged.api.distmarker.Dist;
-import net.neoforged.fml.loading.FMLEnvironment;
 import net.neoforged.fml.loading.FMLPaths;
 
 import java.io.IOException;
@@ -29,30 +27,27 @@ import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 
 public final class ServerProxyConfigFile {
-    private static final int DEFAULT_MINECRAFT_PORT = 25565;
     private static final int DEFAULT_ZSTD_PORT = 25565;
     private static final int DEFAULT_BACKEND_PORT = 25566;
-    private static final int DEFAULT_VOICE_CHAT_PORT = 24454;
-    private static final int DEFAULT_VOICE_CHAT_LISTEN_PORT = 24455;
     private static final int MIN_PORT = 1;
     private static final int MAX_PORT = 65535;
     private static final String DEFAULT_LISTEN_HOST = "0.0.0.0";
     private static final String DEFAULT_TARGET_HOST = "127.0.0.1";
-    private static final String DEFAULT_VOICE_CHAT_LISTEN = DEFAULT_LISTEN_HOST + ":" + DEFAULT_VOICE_CHAT_LISTEN_PORT;
     private static final String DEFAULT_TRUSTED_PROXY_IPS = "127.0.0.1,::1,0:0:0:0:0:0:0:1";
     private static final Set<String> KNOWN_KEYS = Set.of(
         "enabled",
         "auto_takeover",
         "listen",
         "target",
-        "voice_chat_passthrough",
-        "voice_chat_listen",
-        "voice_chat_target",
+        "udp_direct_ports",
         "level",
         "max_conn_per_ip",
         "max_req_per_window",
@@ -83,12 +78,16 @@ public final class ServerProxyConfigFile {
         return parsePort(loadProperties().getProperty("target", "127.0.0.1:" + DEFAULT_BACKEND_PORT), DEFAULT_BACKEND_PORT);
     }
 
-    public static int readVoiceListenPort() {
-        return parsePort(loadProperties().getProperty("voice_chat_listen", DEFAULT_VOICE_CHAT_LISTEN), DEFAULT_VOICE_CHAT_LISTEN_PORT);
+    public static List<Integer> readUdpDirectPorts() {
+        return parseUdpDirectPorts(loadProperties().getProperty("udp_direct_ports", "24454"));
     }
 
-    public static int readVoiceTargetPort() {
-        return parsePort(loadProperties().getProperty("voice_chat_target", defaultVoiceChatTarget()), defaultVoiceChatTargetPort());
+    public static void writeUdpDirectPorts(Collection<Integer> ports) throws IOException {
+        Path path = path();
+        Properties props = normalizeProperties(loadProperties());
+        Files.createDirectories(path.getParent());
+        props.setProperty("udp_direct_ports", formatUdpDirectPorts(ports));
+        writeConfigWithComments(path, props, detectLineSeparator(path));
     }
 
     public static void writeListenPort(int port) throws IOException {
@@ -97,14 +96,6 @@ public final class ServerProxyConfigFile {
 
     public static void writeTargetPort(int port) throws IOException {
         writePorts(null, port);
-    }
-
-    public static void writeVoiceTargetPort(int port) throws IOException {
-        writeVoicePorts(null, port);
-    }
-
-    public static void writeVoiceListenPort(int port) throws IOException {
-        writeVoicePorts(port, null);
     }
 
     public static void writePorts(Integer listenPort, Integer targetPort) throws IOException {
@@ -125,25 +116,6 @@ public final class ServerProxyConfigFile {
         writeConfigWithComments(path, props, detectLineSeparator(path));
     }
 
-    public static void writeVoicePorts(Integer listenPort, Integer targetPort) throws IOException {
-        Path path = path();
-        Properties props = normalizeProperties(loadProperties());
-        Files.createDirectories(path.getParent());
-
-        String currentListen = props.getProperty("voice_chat_listen", DEFAULT_VOICE_CHAT_LISTEN);
-        String currentTarget = props.getProperty("voice_chat_target", defaultVoiceChatTarget());
-        String listenHost = parseHost(currentListen, DEFAULT_LISTEN_HOST);
-        String targetHost = parseHost(currentTarget, DEFAULT_TARGET_HOST);
-        int resolvedTargetPort = targetPort != null ? targetPort : parsePort(currentTarget, DEFAULT_VOICE_CHAT_PORT);
-        int resolvedListenPort = listenPort != null ? listenPort : parsePort(currentListen, DEFAULT_VOICE_CHAT_LISTEN_PORT);
-        String listenValue = formatHostPort(listenHost, resolvedListenPort);
-        String targetValue = formatHostPort(targetHost, resolvedTargetPort);
-        props.setProperty("voice_chat_passthrough", "true");
-        props.setProperty("voice_chat_listen", listenValue);
-        props.setProperty("voice_chat_target", targetValue);
-        writeConfigWithComments(path, props, detectLineSeparator(path));
-    }
-
     public static void writeResolvedAutoTakeoverConfig(
         String listenHost,
         int listenPort,
@@ -160,6 +132,21 @@ public final class ServerProxyConfigFile {
         writeConfigWithComments(path, props, detectLineSeparator(path));
     }
 
+    public static void migrateDeprecatedVoiceChatOptions() throws IOException {
+        Path path = path();
+        if (!Files.exists(path)) {
+            return;
+        }
+        Properties props = loadProperties();
+        boolean needsMigration = !props.containsKey("udp_direct_ports")
+            || props.containsKey("voice_chat_passthrough")
+            || props.containsKey("voice_chat_listen")
+            || props.containsKey("voice_chat_target");
+        if (needsMigration) {
+            writeConfigWithComments(path, props, detectLineSeparator(path));
+        }
+    }
+
     private static Properties loadProperties() {
         Properties props = new Properties();
         Path path = path();
@@ -168,9 +155,7 @@ public final class ServerProxyConfigFile {
             props.setProperty("auto_takeover", "true");
             props.setProperty("listen", "0.0.0.0:" + DEFAULT_ZSTD_PORT);
             props.setProperty("target", "127.0.0.1:" + DEFAULT_BACKEND_PORT);
-            props.setProperty("voice_chat_passthrough", "true");
-            props.setProperty("voice_chat_listen", DEFAULT_VOICE_CHAT_LISTEN);
-            props.setProperty("voice_chat_target", defaultVoiceChatTarget());
+            props.setProperty("udp_direct_ports", "24454");
             return props;
         }
 
@@ -195,9 +180,10 @@ public final class ServerProxyConfigFile {
         props.putIfAbsent("auto_takeover", "true");
         props.putIfAbsent("listen", DEFAULT_LISTEN_HOST + ":" + DEFAULT_ZSTD_PORT);
         props.putIfAbsent("target", DEFAULT_TARGET_HOST + ":" + DEFAULT_BACKEND_PORT);
-        props.putIfAbsent("voice_chat_passthrough", "true");
-        props.putIfAbsent("voice_chat_listen", DEFAULT_VOICE_CHAT_LISTEN);
-        props.putIfAbsent("voice_chat_target", defaultVoiceChatTarget());
+        props.remove("voice_chat_passthrough");
+        props.remove("voice_chat_listen");
+        props.remove("voice_chat_target");
+        props.putIfAbsent("udp_direct_ports", "24454");
         props.putIfAbsent("level", "9");
         props.putIfAbsent("max_conn_per_ip", "9999");
         props.putIfAbsent("max_req_per_window", "50");
@@ -212,6 +198,40 @@ public final class ServerProxyConfigFile {
         props.putIfAbsent("trust_proxy_protocol", "false");
         props.putIfAbsent("trusted_proxy_ips", DEFAULT_TRUSTED_PROXY_IPS);
         return props;
+    }
+
+    private static List<Integer> parseUdpDirectPorts(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+        LinkedHashSet<Integer> ports = new LinkedHashSet<>();
+        for (String item : raw.split(",")) {
+            try {
+                int port = Integer.parseInt(item.trim());
+                if (port >= MIN_PORT && port <= MAX_PORT) {
+                    ports.add(port);
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return List.copyOf(ports);
+    }
+
+    private static String formatUdpDirectPorts(Collection<Integer> rawPorts) {
+        if (rawPorts == null || rawPorts.isEmpty()) {
+            return "";
+        }
+        LinkedHashSet<Integer> ports = new LinkedHashSet<>();
+        for (Integer port : rawPorts) {
+            if (port != null && port >= MIN_PORT && port <= MAX_PORT) {
+                ports.add(port);
+            }
+        }
+        List<String> values = new ArrayList<>(ports.size());
+        for (int port : ports) {
+            values.add(String.valueOf(port));
+        }
+        return String.join(",", values);
     }
 
     private static String stripUtf8Bom(String text) {
@@ -231,20 +251,18 @@ public final class ServerProxyConfigFile {
         return normalizedKey.endsWith("#") && normalizedValue.startsWith("---");
     }
 
+    private static boolean isDeprecatedVoiceChatKey(String key) {
+        return "voice_chat_passthrough".equals(key)
+            || "voice_chat_listen".equals(key)
+            || "voice_chat_target".equals(key);
+    }
+
     private static String detectLineSeparator(Path path) throws IOException {
         if (!Files.exists(path)) {
             return System.lineSeparator();
         }
         String text = Files.readString(path, StandardCharsets.UTF_8);
         return text.contains("\r\n") ? "\r\n" : "\n";
-    }
-
-    private static int defaultVoiceChatTargetPort() {
-        return FMLEnvironment.dist == Dist.CLIENT ? DEFAULT_MINECRAFT_PORT : DEFAULT_VOICE_CHAT_PORT;
-    }
-
-    private static String defaultVoiceChatTarget() {
-        return DEFAULT_TARGET_HOST + ":" + defaultVoiceChatTargetPort();
     }
 
     private static void writeConfigWithComments(Path path, Properties rawProps, String lineSeparator) throws IOException {
@@ -275,19 +293,10 @@ public final class ServerProxyConfigFile {
         appendLine(builder, "target=" + props.getProperty("target"), lineSeparator);
         appendLine(builder, "", lineSeparator);
 
-        appendLine(builder, "# 是否透传 Simple Voice Chat 的 UDP。", lineSeparator);
-        appendLine(builder, "voice_chat_passthrough=" + props.getProperty("voice_chat_passthrough"), lineSeparator);
-        appendLine(builder, "", lineSeparator);
-
-        appendLine(builder, "# 语音聊天的公网 UDP 入口。留空时，单机 / LAN 会跟随当前开放端口；写了值就按配置走。", lineSeparator);
-        appendLine(builder, "# /zstdport zstdvoice 会修改这个值。", lineSeparator);
-        appendLine(builder, "voice_chat_listen=" + props.getProperty("voice_chat_listen"), lineSeparator);
-        appendLine(builder, "", lineSeparator);
-
-        appendLine(builder, "# 语音聊天的后端 UDP 目标。留空时，单机 / LAN 会指向当前 LAN 端口；写了值就按配置走。", lineSeparator);
-        appendLine(builder, "# 专用服留空时默认指向本机 24454。", lineSeparator);
-        appendLine(builder, "# /zstdport voice 会修改这个值。", lineSeparator);
-        appendLine(builder, "voice_chat_target=" + props.getProperty("voice_chat_target"), lineSeparator);
+        appendLine(builder, "# 需要客户端直连的 UDP 端口，逗号分隔；例如 SVC 默认端口：24454。", lineSeparator);
+        appendLine(builder, "# 这些端口不经过 zstdnet 服务端转发，客户端会直连当前服务器地址。", lineSeparator);
+        appendLine(builder, "# 不要填写游戏公网入口端口，否则会与 Sable 等同端口 UDP 模组冲突。", lineSeparator);
+        appendLine(builder, "udp_direct_ports=" + props.getProperty("udp_direct_ports"), lineSeparator);
         appendLine(builder, "", lineSeparator);
 
         appendLine(builder, "# zstd 压缩等级（1-22，通常建议 3-9）。", lineSeparator);
@@ -347,7 +356,7 @@ public final class ServerProxyConfigFile {
 
         LinkedHashSet<String> extraKeys = new LinkedHashSet<>();
         for (String key : rawProps.stringPropertyNames()) {
-            if (!KNOWN_KEYS.contains(key) && !"allow_raw_login".equals(key) && !isCommentFragmentKey(key, rawProps.getProperty(key, ""))) {
+            if (!KNOWN_KEYS.contains(key) && !"allow_raw_login".equals(key) && !isDeprecatedVoiceChatKey(key) && !isCommentFragmentKey(key, rawProps.getProperty(key, ""))) {
                 extraKeys.add(key);
             }
         }

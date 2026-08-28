@@ -35,6 +35,9 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
 
+import java.util.ArrayList;
+import java.util.List;
+
 public final class LanCompressionSync {
     public static final int LAN_THRESHOLD = 1048576;
     private static final int MAX_REPORT_BYTES = 1024 * 1024;
@@ -46,6 +49,7 @@ public final class LanCompressionSync {
     private static final ResourceLocation SERVER_HUD_ID = new ResourceLocation(Zstdnet.MODID, "server_hud");
     private static final ResourceLocation TRAFFIC_REPORT_REQUEST_ID = new ResourceLocation(Zstdnet.MODID, "traffic_report_request");
     private static final ResourceLocation TRAFFIC_REPORT_RESPONSE_ID = new ResourceLocation(Zstdnet.MODID, "traffic_report_response");
+    private static final ResourceLocation UDP_DIRECT_PORTS_ID = new ResourceLocation(Zstdnet.MODID, "udp_direct_ports");
 
     private static boolean initialized;
     private static boolean clientInitialized;
@@ -127,6 +131,11 @@ public final class LanCompressionSync {
             String payload = buf.readUtf(MAX_REPORT_BYTES);
             client.execute(() -> ClientProxyPublisher.acceptTrafficReportResponse(success, payload));
         });
+
+        ClientPlayNetworking.registerGlobalReceiver(UDP_DIRECT_PORTS_ID, (client, handler, buf, responseSender) -> {
+            List<Integer> ports = decodeUdpDirectPorts(buf);
+            client.execute(() -> ClientProxyPublisher.acceptUdpDirectPorts(ports));
+        });
     }
 
     public static void requestCompressionUpgrade(ServerPlayer player) {
@@ -147,6 +156,12 @@ public final class LanCompressionSync {
         FriendlyByteBuf buf = PacketByteBufs.create();
         encodeServerHudSnapshot(snapshot, buf);
         ServerPlayNetworking.send(player, SERVER_HUD_ID, buf);
+    }
+
+    public static void sendUdpDirectPorts(ServerPlayer player, List<Integer> ports) {
+        FriendlyByteBuf buf = PacketByteBufs.create();
+        encodeUdpDirectPorts(ports, buf);
+        ServerPlayNetworking.send(player, UDP_DIRECT_PORTS_ID, buf);
     }
 
     public static void requestTrafficReport(String range) {
@@ -204,5 +219,32 @@ public final class LanCompressionSync {
             buf.readDouble(),
             buf.readVarInt()
         );
+    }
+
+    private static void encodeUdpDirectPorts(List<Integer> ports, FriendlyByteBuf buf) {
+        List<Integer> normalized = ports == null ? List.of() : ports;
+        if (normalized.size() > 32) {
+            throw new IllegalArgumentException("too many direct UDP ports");
+        }
+        buf.writeVarInt(normalized.size());
+        for (int port : normalized) {
+            buf.writeVarInt(port);
+        }
+    }
+
+    private static List<Integer> decodeUdpDirectPorts(FriendlyByteBuf buf) {
+        int count = buf.readVarInt();
+        if (count < 0 || count > 32) {
+            throw new IllegalArgumentException("invalid direct UDP port count " + count);
+        }
+        List<Integer> ports = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            int port = buf.readVarInt();
+            if (port < 1 || port > 65535) {
+                throw new IllegalArgumentException("invalid direct UDP port " + port);
+            }
+            ports.add(port);
+        }
+        return List.copyOf(ports);
     }
 }

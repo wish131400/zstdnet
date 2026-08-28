@@ -139,6 +139,18 @@ public final class LocalZstdNet {
         }
     }
 
+    /**
+     * Starts a raw UDP route for a separately configured service. Unlike the
+     * built-in game UDP route, this has no zstd framing and targets the
+     * original server endpoint directly.
+     */
+    public static UdpProxyHandle startDirectUdpForwarder(String remoteHost, int remotePort, int localPort) throws IOException {
+        UdpForwarder forwarder = new UdpForwarder(remoteHost, remotePort, localPort);
+        forwarder.start();
+        LOGGER.info("zstdnet: direct UDP route armed 127.0.0.1:{} -> {}:{}", localPort, remoteHost, remotePort);
+        return new UdpProxyHandle(forwarder, localPort, remoteHost, remotePort);
+    }
+
     private static Mode resolveMode(String remoteHost, int remotePort, Mode requestedMode) {
         if (requestedMode == null || requestedMode == Mode.AUTO) {
             Mode picked = probeRawStatus(remoteHost, remotePort) ? Mode.RAW : Mode.ZSTD;
@@ -763,6 +775,30 @@ public final class LocalZstdNet {
             }
 
             return new HostPort(value, 25565);
+        }
+    }
+
+    public static final class UdpProxyHandle implements AutoCloseable {
+        private final UdpForwarder forwarder;
+        private final int localPort;
+        private final String remoteHost;
+        private final int remotePort;
+
+        private UdpProxyHandle(UdpForwarder forwarder, int localPort, String remoteHost, int remotePort) {
+            this.forwarder = forwarder;
+            this.localPort = localPort;
+            this.remoteHost = remoteHost;
+            this.remotePort = remotePort;
+        }
+
+        public int localPort() {
+            return localPort;
+        }
+
+        @Override
+        public void close() {
+            LOGGER.info("zstdnet: closing direct UDP route 127.0.0.1:{} -> {}:{}", localPort, remoteHost, remotePort);
+            forwarder.stop();
         }
     }
 

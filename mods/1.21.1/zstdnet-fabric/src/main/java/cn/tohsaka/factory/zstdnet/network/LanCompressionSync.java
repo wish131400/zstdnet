@@ -24,6 +24,8 @@ import cn.tohsaka.factory.zstdnet.Zstdnet;
 import cn.tohsaka.factory.zstdnet.mixin.ServerGamePacketListenerImplAccessor;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
 import com.mojang.logging.LogUtils;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
@@ -59,6 +61,7 @@ public final class LanCompressionSync {
         PayloadTypeRegistry.playS2C().register(ServerHudMessage.TYPE, ServerHudMessage.STREAM_CODEC);
         PayloadTypeRegistry.playC2S().register(TrafficReportRequestMessage.TYPE, TrafficReportRequestMessage.STREAM_CODEC);
         PayloadTypeRegistry.playS2C().register(TrafficReportResponseMessage.TYPE, TrafficReportResponseMessage.STREAM_CODEC);
+        PayloadTypeRegistry.playS2C().register(UdpDirectPortsMessage.TYPE, UdpDirectPortsMessage.STREAM_CODEC);
 
         ServerPlayNetworking.registerGlobalReceiver(ReadyMessage.TYPE, (message, context) -> {
             context.server().execute(() -> {
@@ -112,6 +115,10 @@ public final class LanCompressionSync {
         ClientPlayNetworking.registerGlobalReceiver(TrafficReportResponseMessage.TYPE, (message, context) -> {
             context.client().execute(() -> ClientProxyPublisher.acceptTrafficReportResponse(message.success(), message.payload()));
         });
+
+        ClientPlayNetworking.registerGlobalReceiver(UdpDirectPortsMessage.TYPE, (message, context) -> {
+            context.client().execute(() -> ClientProxyPublisher.acceptUdpDirectPorts(message.ports()));
+        });
     }
 
     public static void requestCompressionUpgrade(ServerPlayer player) {
@@ -128,6 +135,10 @@ public final class LanCompressionSync {
             return;
         }
         ServerPlayNetworking.send(player, ServerHudMessage.from(snapshot));
+    }
+
+    public static void sendUdpDirectPorts(ServerPlayer player, List<Integer> ports) {
+        ServerPlayNetworking.send(player, new UdpDirectPortsMessage(ports));
     }
 
     public static void requestTrafficReport(String range) {
@@ -215,6 +226,50 @@ public final class LanCompressionSync {
 
         @Override
         public Type<TrafficReportResponseMessage> type() {
+            return TYPE;
+        }
+    }
+
+    private record UdpDirectPortsMessage(List<Integer> ports) implements CustomPacketPayload {
+        private static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath(Zstdnet.MODID, "udp_direct_ports");
+        private static final Type<UdpDirectPortsMessage> TYPE = new Type<>(ID);
+        private static final StreamCodec<RegistryFriendlyByteBuf, UdpDirectPortsMessage> STREAM_CODEC = StreamCodec.of(
+            UdpDirectPortsMessage::encode,
+            UdpDirectPortsMessage::decode
+        );
+
+        private UdpDirectPortsMessage {
+            ports = ports == null ? List.of() : List.copyOf(ports);
+            if (ports.size() > 32) {
+                throw new IllegalArgumentException("too many direct UDP ports");
+            }
+        }
+
+        private static UdpDirectPortsMessage decode(RegistryFriendlyByteBuf buf) {
+            int count = buf.readVarInt();
+            if (count < 0 || count > 32) {
+                throw new IllegalArgumentException("invalid direct UDP port count " + count);
+            }
+            List<Integer> ports = new ArrayList<>(count);
+            for (int index = 0; index < count; index++) {
+                int port = buf.readVarInt();
+                if (port < 1 || port > 65535) {
+                    throw new IllegalArgumentException("invalid direct UDP port " + port);
+                }
+                ports.add(port);
+            }
+            return new UdpDirectPortsMessage(ports);
+        }
+
+        private static void encode(RegistryFriendlyByteBuf buf, UdpDirectPortsMessage message) {
+            buf.writeVarInt(message.ports.size());
+            for (int port : message.ports) {
+                buf.writeVarInt(port);
+            }
+        }
+
+        @Override
+        public Type<UdpDirectPortsMessage> type() {
             return TYPE;
         }
     }

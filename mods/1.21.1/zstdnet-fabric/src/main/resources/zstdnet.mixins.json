@@ -9,10 +9,12 @@
     "DedicatedServerMixin",
     "MinecraftServerMixin",
     "ScreenMixin",
+    "ServerLoginPacketListenerImplMixin",
     "ServerHandshakePacketListenerImplMixin",
     "ServerGamePacketListenerImplAccessor"
   ],
   "client": [
+    "ChatComponentMixin",
     "ConnectScreenMixin",
     "DirectJoinServerScreenMixin",
     "IntegratedServerMixin",

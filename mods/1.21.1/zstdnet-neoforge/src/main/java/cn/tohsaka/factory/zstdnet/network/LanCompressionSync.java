@@ -22,6 +22,8 @@ package cn.tohsaka.factory.zstdnet.network;
 import cn.tohsaka.factory.zstdnet.client.ClientProxyPublisher;
 import cn.tohsaka.factory.zstdnet.Zstdnet;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.RegistryFriendlyByteBuf;
@@ -43,7 +45,7 @@ public final class LanCompressionSync {
     private static final int MAX_REPORT_BYTES = 1024 * 1024;
 
     private static final Logger LOGGER = LoggerFactory.getLogger(LanCompressionSync.class);
-    private static final String PROTOCOL_VERSION = "1";
+    private static final String PROTOCOL_VERSION = "2";
     private static final AtomicBoolean INITIALIZED = new AtomicBoolean(false);
 
     private LanCompressionSync() {
@@ -64,6 +66,7 @@ public final class LanCompressionSync {
         registrar.playToClient(ServerHudMessage.TYPE, ServerHudMessage.STREAM_CODEC, ServerHudMessage::handle);
         registrar.playToServer(TrafficReportRequestMessage.TYPE, TrafficReportRequestMessage.STREAM_CODEC, TrafficReportRequestMessage::handle);
         registrar.playToClient(TrafficReportResponseMessage.TYPE, TrafficReportResponseMessage.STREAM_CODEC, TrafficReportResponseMessage::handle);
+        registrar.playToClient(UdpDirectPortsMessage.TYPE, UdpDirectPortsMessage.STREAM_CODEC, UdpDirectPortsMessage::handle);
     }
 
     public static void requestCompressionUpgrade(ServerPlayer player) {
@@ -80,6 +83,10 @@ public final class LanCompressionSync {
             return;
         }
         PacketDistributor.sendToPlayer(player, ServerHudMessage.from(snapshot));
+    }
+
+    public static void sendUdpDirectPorts(ServerPlayer player, List<Integer> ports) {
+        PacketDistributor.sendToPlayer(player, new UdpDirectPortsMessage(ports));
     }
 
     public static void requestTrafficReport(String range) {
@@ -217,6 +224,54 @@ public final class LanCompressionSync {
 
         private static void handle(TrafficReportResponseMessage message, IPayloadContext context) {
             context.enqueueWork(() -> ClientProxyPublisher.acceptTrafficReportResponse(message.success, message.payload));
+        }
+    }
+
+    private record UdpDirectPortsMessage(List<Integer> ports) implements CustomPacketPayload {
+        private static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath(Zstdnet.MODID, "udp_direct_ports");
+        private static final Type<UdpDirectPortsMessage> TYPE = new Type<>(ID);
+        private static final StreamCodec<RegistryFriendlyByteBuf, UdpDirectPortsMessage> STREAM_CODEC = StreamCodec.of(
+            UdpDirectPortsMessage::encode,
+            UdpDirectPortsMessage::decode
+        );
+
+        private UdpDirectPortsMessage {
+            ports = ports == null ? List.of() : List.copyOf(ports);
+            if (ports.size() > 32) {
+                throw new IllegalArgumentException("too many direct UDP ports");
+            }
+        }
+
+        private static UdpDirectPortsMessage decode(RegistryFriendlyByteBuf buf) {
+            int count = buf.readVarInt();
+            if (count < 0 || count > 32) {
+                throw new IllegalArgumentException("invalid direct UDP port count " + count);
+            }
+            List<Integer> ports = new ArrayList<>(count);
+            for (int index = 0; index < count; index++) {
+                int port = buf.readVarInt();
+                if (port < 1 || port > 65535) {
+                    throw new IllegalArgumentException("invalid direct UDP port " + port);
+                }
+                ports.add(port);
+            }
+            return new UdpDirectPortsMessage(ports);
+        }
+
+        private static void encode(RegistryFriendlyByteBuf buf, UdpDirectPortsMessage message) {
+            buf.writeVarInt(message.ports.size());
+            for (int port : message.ports) {
+                buf.writeVarInt(port);
+            }
+        }
+
+        @Override
+        public Type<UdpDirectPortsMessage> type() {
+            return TYPE;
+        }
+
+        private static void handle(UdpDirectPortsMessage message, IPayloadContext context) {
+            context.enqueueWork(() -> ClientProxyPublisher.acceptUdpDirectPorts(message.ports));
         }
     }
 

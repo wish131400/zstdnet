@@ -84,6 +84,19 @@ class TrafficReportGeneratorTest {
     }
 
     @Test
+    void centersDailyLabelsAndDeterminesTheirSpacingFromAvailableWidth() throws Exception {
+        TrafficReportGenerator.GeneratedReport generated = TrafficReportGenerator.generate(
+            tempDir,
+            "{\"schemaVersion\":1,\"daily\":[]}"
+        );
+
+        String html = Files.readString(generated.latest(), StandardCharsets.UTF_8);
+        assertTrue(html.contains("const labelStep=Math.max(1,Math.ceil((widestDateLabel+12)/slot))"));
+        assertTrue(html.contains("ctx.fillStyle=cssColor('--chart-label');ctx.textAlign='center'"));
+        assertFalse(html.contains("const labels=Math.min(7,points.length)"));
+    }
+
+    @Test
     void keepsTenArchivedReportsPerServer() throws Exception {
         String json = "{\"schemaVersion\":1}";
         TrafficReportGenerator.GeneratedReport firstServer = TrafficReportGenerator.generate(

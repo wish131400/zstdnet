@@ -5,6 +5,8 @@ var FieldInsnNode = Java.type('org.objectweb.asm.tree.FieldInsnNode');
 var InsnNode = Java.type('org.objectweb.asm.tree.InsnNode');
 var MethodInsnNode = Java.type('org.objectweb.asm.tree.MethodInsnNode');
 var VarInsnNode = Java.type('org.objectweb.asm.tree.VarInsnNode');
+var JumpInsnNode = Java.type('org.objectweb.asm.tree.JumpInsnNode');
+var LabelNode = Java.type('org.objectweb.asm.tree.LabelNode');
 
 function initializeCoreMod() {
     return {
@@ -102,6 +104,60 @@ function initializeCoreMod() {
                 }
 
                 ASMAPI.log('ERROR', '[zstdnet] failed to patch ServerHandshakePacketListenerImpl#beginLogin.');
+                return classNode;
+            }
+        },
+        'zstdnet_server_login_guard': {
+            'target': {
+                'type': 'CLASS',
+                'name': 'net.minecraft.server.network.ServerLoginPacketListenerImpl'
+            },
+            'transformer': function(classNode) {
+                var connectionField = null;
+                for (var i = 0; i < classNode.fields.size(); i++) {
+                    var field = classNode.fields.get(i);
+                    if (field.desc == 'Lnet/minecraft/network/Connection;') {
+                        connectionField = field.name;
+                        break;
+                    }
+                }
+
+                if (connectionField == null) {
+                    ASMAPI.log('ERROR', '[zstdnet] failed to patch ServerLoginPacketListenerImpl - Connection field not found.');
+                    return classNode;
+                }
+
+                for (var j = 0; j < classNode.methods.size(); j++) {
+                    var method = classNode.methods.get(j);
+                    if (method.desc != '(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V') {
+                        continue;
+                    }
+
+                    var continueLabel = new LabelNode();
+                    var injected = new InsnList();
+                    injected.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                    injected.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        'net/minecraft/server/network/ServerLoginPacketListenerImpl',
+                        connectionField,
+                        'Lnet/minecraft/network/Connection;'
+                    ));
+                    injected.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        'cn/tohsaka/factory/zstdnet/server/ServerProxyBootstrap',
+                        'rejectDirectBackendLogin',
+                        '(Lnet/minecraft/network/Connection;)Z',
+                        false
+                    ));
+                    injected.add(new JumpInsnNode(Opcodes.IFEQ, continueLabel));
+                    injected.add(new InsnNode(Opcodes.RETURN));
+                    injected.add(continueLabel);
+                    method.instructions.insert(injected);
+                    ASMAPI.log('INFO', '[zstdnet] patched ServerLoginPacketListenerImpl#handleHello for zstd-only backend guard.');
+                    return classNode;
+                }
+
+                ASMAPI.log('ERROR', '[zstdnet] failed to patch ServerLoginPacketListenerImpl#handleHello.');
                 return classNode;
             }
         },

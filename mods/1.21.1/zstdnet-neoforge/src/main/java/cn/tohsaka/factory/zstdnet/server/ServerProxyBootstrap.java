@@ -24,9 +24,12 @@ import cn.tohsaka.factory.zstdnet.core.stats.TrafficStats;
 import cn.tohsaka.factory.zstdnet.coremod.ServerRealIpHooks;
 import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
 import net.minecraft.ChatFormatting;
+import net.minecraft.network.Connection;
+import net.minecraft.network.PacketSendListener;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.HoverEvent;
+import net.minecraft.network.protocol.login.ClientboundLoginDisconnectPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.neoforged.neoforge.common.NeoForge;
@@ -259,8 +262,7 @@ public final class ServerProxyBootstrap {
         }
         Component message = Component.translatable(
             "zstdnet.singleplayer.lan_ready",
-            copyableZstdPort(snapshot.listenPort()),
-            lanPort
+            copyableZstdPort(snapshot.listenPort())
         );
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             player.sendSystemMessage(message);
@@ -284,11 +286,33 @@ public final class ServerProxyBootstrap {
         }
     }
 
+    public static boolean rejectDirectBackendLogin(Connection connection) {
+        if (connection == null || !RUNTIME.protectsBackendLogin()) {
+            return false;
+        }
+
+        SocketAddress remoteAddress = connection.getRemoteAddress();
+        if (isLoopback(remoteAddress) || ServerRealIpHooks.isForwardedConnection(connection)) {
+            return false;
+        }
+
+        Component reason = Component.literal(RUNTIME.zstdAddressHint());
+        connection.send(
+            new ClientboundLoginDisconnectPacket(reason),
+            PacketSendListener.thenRun(() -> connection.disconnect(reason))
+        );
+        connection.setReadOnly();
+        LOGGER.warn("[server] rejected direct backend login from {}", remoteAddress);
+        return true;
+    }
+
     private static void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
-        if (!RUNTIME.protectsBackendLogin()) {
+        if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
         }
-        if (!(event.getEntity() instanceof ServerPlayer player)) {
+
+        LanCompressionSync.sendUdpDirectPorts(player, RUNTIME.udpDirectPorts());
+        if (!RUNTIME.protectsBackendLogin()) {
             return;
         }
 
@@ -301,7 +325,7 @@ public final class ServerProxyBootstrap {
         }
 
         LOGGER.warn("[server] rejected direct backend login from {}", remoteAddress);
-        player.connection.disconnect(Component.literal(ServerProxyRuntime.ZSTD_ADDRESS_HINT));
+        player.connection.disconnect(Component.literal(RUNTIME.zstdAddressHint()));
     }
 
     private static boolean isLoopback(SocketAddress address) {

@@ -246,19 +246,18 @@ mc.example.com:35565
 /zstdport show
 /zstdport game 25565
 /zstdport zstd 35565
-/zstdport voice 25565
-/zstdport zstdvoice 24455
+/zstdport udp show
+/zstdport udp add 24456
+/zstdport udp remove 24456
 ```
 
 注意：
 
 - `/zstdport` 是客户端指令
 - `show` 可以查看当前配置
-- `voice` 修改 `voice_chat_target`，也就是后端语音端口
-- `zstdvoice` 修改 `voice_chat_listen`，也就是公网语音入口
-- 单机开房 / LAN 模式下，默认 `voice_chat_target` 是 `127.0.0.1:25565`
-- 专用服默认 `voice_chat_target` 仍然是 `127.0.0.1:24454`
-- `game`、`zstd`、`voice`、`zstdvoice` 只有本地房主且有管理员权限时才能修改
+- `game`、`zstd` 只有本地房主且有管理员权限时才能修改
+- `udp show` 查看当前 `udp_direct_ports`
+- `udp add <端口>` / `udp remove <端口>` 用于增删直连 UDP 端口，自动去重并拒绝游戏公网端口
 - 专用服不会通过这个指令改服务器配置
 - 专用服请直接修改 `config/zstdnet-server.properties`
 
@@ -304,11 +303,12 @@ mc.example.com:35565
 
 ### Simple Voice Chat 这类语音模组能不能用？
 
-可以，但语音流量不会走 zstd 压缩，只会在服务端做原样 UDP 转发。
+可以，但语音流量不会走 zstd 压缩。
 
-- 如果 Simple Voice Chat 使用独立 UDP 端口，就必须显式填写 `voice_chat_listen`；`voice_chat_target` 可以留空让模组自动指向本机的 SVC 端口。
-- 如果语音 UDP 路由没有成功启动，游戏本身的 TCP 连接仍然可以正常工作，只是语音会离线。
-- 如果你想直接改 `zstdnet-server.properties` 里的语音转发项，可以用 `/zstdport voice <端口>` 修改后端语音端口，或用 `/zstdport zstdvoice <端口>` 修改公网语音入口。
+- 默认的 `udp_direct_ports=24454` 已适配 SVC；客户端会临时接管 `127.0.0.1:24454` 并直连玩家原始填写的服务器地址同端口。这样不会受到 zstd 本地 TCP 代理地址的影响。
+- `udp_direct_ports` 不会建立服务端 zstd UDP 路由。公网防火墙、FRP 或其他隧道仍必须把相同的 UDP 端口直通到服务端。
+- 不要把游戏公网入口端口填入 `udp_direct_ports`。该 UDP 路径由 zstdnet 保留给 Sable、机械动力：航空学等同端口 UDP 模组。
+- 若 SVC 使用了非默认端口，直接把该端口填入 `udp_direct_ports` 即可。
 
 ## 配置文件
 
@@ -383,18 +383,11 @@ mc.example.com:35565
   - 单位是字节，相当于流量的"缓冲池"
   - 即使设置了限速，短时间内的突发流量也可以超过限制
 
-- `voice_chat_passthrough`：是否为 Simple Voice Chat 启用原样 UDP 转发（默认：true）
-  - 语音流量不会经过 zstd 压缩
-  - 设为 false 后将完全关闭额外的语音 UDP 路由处理
-
-- `voice_chat_listen`：语音的公网 UDP 入口（可选）
-  - 单机开房 / LAN 模式下，生成出来的默认值通常是 `0.0.0.0:24455`
-  - 独立语音端口模式下必须显式填写这里
-
-- `voice_chat_target`：语音的后端 UDP 目标（可选）
-  - 单机开房 / LAN 模式下，生成出来的默认值是 `127.0.0.1:25565`
-  - 专用服生成出来的默认值是 `127.0.0.1:24454`
-  - 独立语音端口模式下，若 `voice_chat_listen` 已填写，默认会指向 `127.0.0.1:<SVC端口>`
+- `udp_direct_ports`：需要客户端直连的 UDP 端口列表（默认：`24454`）
+  - 用逗号分隔，例如 `24454,24456`；留空可禁用独立 UDP 服务直连
+  - 每个端口会在客户端本机回环地址上临时监听，并原样转发到当前 zstd 会话的原始服务器地址同端口
+  - 适合 SVC 默认端口和其他固定独立 UDP 服务；不经过 zstd 压缩或服务端 UDP 转发
+  - 不可填写 zstd 游戏公网入口端口，以避免影响 Sable 等同端口 UDP 模组
 
 ### 客户端配置文件 `zstdnet-client.toml` 内容
 

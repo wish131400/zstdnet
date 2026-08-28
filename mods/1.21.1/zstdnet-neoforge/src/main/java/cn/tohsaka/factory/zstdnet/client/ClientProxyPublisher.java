@@ -20,6 +20,7 @@
 package cn.tohsaka.factory.zstdnet.client;
 
 import cn.tohsaka.factory.zstdnet.ClientConfig;
+import cn.tohsaka.factory.zstdnet.coremod.LanChatMessageHooks;
 import cn.tohsaka.factory.zstdnet.coremod.ConnectScreenHooks;
 import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
 import cn.tohsaka.factory.zstdnet.proxy.LocalZstdNet;
@@ -68,7 +69,10 @@ import java.lang.reflect.Field;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.net.ServerSocket;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -83,6 +87,8 @@ import java.util.concurrent.CompletableFuture;
 public final class ClientProxyPublisher {
     private static final int MIN_PORT = 1024;
     private static final int MAX_PORT = 65535;
+    private static final int MIN_UDP_DIRECT_PORT = 1;
+    private static final int MAX_UDP_DIRECT_PORTS = 32;
     private static final int DEFAULT_BACKEND_PORT = 25566;
     private static final int PORT_TEXT_NORMAL = 14737632;
     private static final int PORT_TEXT_INVALID = 16733525;
@@ -105,9 +111,11 @@ public final class ClientProxyPublisher {
     private final Map<JoinMultiplayerScreen, JoinScreenState> joinScreens = new WeakHashMap<>();
     private final Map<DirectJoinServerScreen, DirectJoinState> directJoinScreens = new WeakHashMap<>();
     private final Map<Screen, ShareToLanState> shareToLanScreens = new WeakHashMap<>();
+    private final Map<Integer, LocalZstdNet.UdpProxyHandle> activeDirectUdp = new LinkedHashMap<>();
 
     private LocalZstdNet.ProxyHandle activeProxy;
     private LocalZstdNet.ProxyHandle activeSession;
+    private List<Integer> udpDirectPorts = List.of();
     private boolean hudVisible = false;
     private boolean singleplayerLanHintShown;
     private Object lastListEntry;
@@ -138,6 +146,10 @@ public final class ClientProxyPublisher {
 
     public static void acceptRemoteServerHudSnapshot(ServerProxyBootstrap.ServerHudSnapshot snapshot) {
         INSTANCE.updateRemoteServerHudSnapshot(snapshot);
+    }
+
+    public static void acceptUdpDirectPorts(List<Integer> ports) {
+        INSTANCE.updateUdpDirectPorts(ports);
     }
 
     public static void acceptTrafficReportResponse(boolean success, String payload) {
@@ -240,12 +252,14 @@ public final class ClientProxyPublisher {
             if (activeProxy != null) {
                 activeSession = activeProxy;
             }
+            reconcileDirectUdpLocked();
         }
     }
 
     private void onClientLogout(ClientPlayerNetworkEvent.LoggingOut event) {
         synchronized (stateLock) {
             closeActiveSessionLocked();
+            udpDirectPorts = List.of();
             remoteServerHudSnapshot = null;
             remoteServerHudSnapshotMillis = 0L;
         }
@@ -411,24 +425,25 @@ public final class ClientProxyPublisher {
                             .executes(this::setGamePort)
                     )
             )
-            .then(buildVoiceTargetBranch("voice"))
-            .then(buildVoiceListenBranch("zstdvoice"));
+            .then(buildUdpPortsBranch());
     }
 
-    private LiteralArgumentBuilder<CommandSourceStack> buildVoiceTargetBranch(String literal) {
-        return Commands.literal(literal)
-            .requires(source -> canEditPortConfig())
-            .executes(this::showVoicePortStatus)
-            .then(Commands.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
-                .executes(this::setVoicePort));
-    }
-
-    private LiteralArgumentBuilder<CommandSourceStack> buildVoiceListenBranch(String literal) {
-        return Commands.literal(literal)
-            .requires(source -> canEditPortConfig())
-            .executes(this::showVoicePortStatus)
-            .then(Commands.argument("port", IntegerArgumentType.integer(MIN_PORT, MAX_PORT))
-                .executes(this::setVoiceListenPort));
+    private LiteralArgumentBuilder<CommandSourceStack> buildUdpPortsBranch() {
+        return Commands.literal("udp")
+            .executes(this::showUdpDirectPorts)
+            .then(Commands.literal("show").executes(this::showUdpDirectPorts))
+            .then(
+                Commands.literal("add")
+                    .requires(source -> canEditPortConfig())
+                    .then(Commands.argument("port", IntegerArgumentType.integer(MIN_UDP_DIRECT_PORT, MAX_PORT))
+                        .executes(this::addUdpDirectPort))
+            )
+            .then(
+                Commands.literal("remove")
+                    .requires(source -> canEditPortConfig())
+                    .then(Commands.argument("port", IntegerArgumentType.integer(MIN_UDP_DIRECT_PORT, MAX_PORT))
+                        .executes(this::removeUdpDirectPort))
+            );
     }
 
     private void onKeyPressed(ScreenEvent.KeyPressed.Pre event) {
@@ -699,6 +714,7 @@ public final class ClientProxyPublisher {
     }
 
     private void closeActiveSessionLocked() {
+        closeDirectUdpLocked();
         if (activeSession == null) {
             return;
         }
@@ -709,6 +725,75 @@ public final class ClientProxyPublisher {
             }
         }
         activeSession = null;
+    }
+
+    private void updateUdpDirectPorts(List<Integer> ports) {
+        List<Integer> normalized = ports == null ? List.of() : List.copyOf(new LinkedHashSet<>(ports));
+        synchronized (stateLock) {
+            udpDirectPorts = normalized;
+            reconcileDirectUdpLocked();
+        }
+    }
+
+    private void reconcileDirectUdpLocked() {
+        LocalZstdNet.ProxyHandle session = activeSession != null ? activeSession : activeProxy;
+        if (session == null) {
+            return;
+        }
+
+        LinkedHashSet<Integer> desiredPorts = new LinkedHashSet<>();
+        for (int port : udpDirectPorts) {
+            if (port < 1 || port > 65535) {
+                continue;
+            }
+            if (port == session.remotePort()) {
+                LOGGER.warn("zstdnet: skipped direct UDP port {} because it is the active game UDP route.", port);
+                continue;
+            }
+            desiredPorts.add(port);
+        }
+
+        List<Integer> stalePorts = new ArrayList<>();
+        for (int port : activeDirectUdp.keySet()) {
+            if (!desiredPorts.contains(port)) {
+                stalePorts.add(port);
+            }
+        }
+        for (int port : stalePorts) {
+            LocalZstdNet.UdpProxyHandle handle = activeDirectUdp.remove(port);
+            if (handle != null) {
+                handle.close();
+            }
+        }
+
+        for (int port : desiredPorts) {
+            if (activeDirectUdp.containsKey(port)) {
+                continue;
+            }
+            try {
+                LocalZstdNet.UdpProxyHandle handle = LocalZstdNet.startDirectUdpForwarder(
+                    session.remoteHost(),
+                    port,
+                    port
+                );
+                activeDirectUdp.put(port, handle);
+            } catch (IOException e) {
+                LOGGER.warn("zstdnet: direct UDP port {} is unavailable for {}: {}", port, session.remoteHost(), e.toString());
+            }
+        }
+    }
+
+    private void closeDirectUdpLocked() {
+        if (activeDirectUdp.isEmpty()) {
+            return;
+        }
+        for (LocalZstdNet.UdpProxyHandle handle : activeDirectUdp.values()) {
+            try {
+                handle.close();
+            } catch (Exception ignored) {
+            }
+        }
+        activeDirectUdp.clear();
     }
 
     private void shutdown() {
@@ -754,11 +839,10 @@ public final class ClientProxyPublisher {
         return 1;
     }
 
-    private int showVoicePortStatus(CommandContext<CommandSourceStack> context) {
+    private int showUdpDirectPorts(CommandContext<CommandSourceStack> context) {
         sendClientMessage(Component.translatable(
-            "zstdnet.command.port.voice_status",
-            ServerProxyConfigFile.readVoiceListenPort(),
-            ServerProxyConfigFile.readVoiceTargetPort()
+            "zstdnet.command.udp.status",
+            formatUdpDirectPorts(ServerProxyConfigFile.readUdpDirectPorts())
         ));
         return 1;
     }
@@ -810,46 +894,66 @@ public final class ClientProxyPublisher {
         return 1;
     }
 
-    private int setVoicePort(CommandContext<CommandSourceStack> context) {
-        if (!canEditPortConfig()) {
-            sendClientMessage(Component.translatable("zstdnet.command.voice.no_permission"));
-            return 0;
-        }
-
+    private int addUdpDirectPort(CommandContext<CommandSourceStack> context) {
         int port = IntegerArgumentType.getInteger(context, "port");
-        try {
-            ServerProxyConfigFile.writeVoiceTargetPort(port);
-        } catch (IOException e) {
-            LOGGER.error("zstdnet: failed to update voice target port {}", port, e);
-            sendClientMessage(Component.translatable("zstdnet.command.voice.write_failed"));
+        if (port == ServerProxyConfigFile.readListenPort()) {
+            sendClientMessage(Component.translatable("zstdnet.command.udp.game_route", port));
             return 0;
         }
-        sendClientMessage(Component.translatable(
-            "zstdnet.command.port.voice_target_set",
-            ServerProxyConfigFile.readVoiceTargetPort()
-        ));
+        List<Integer> ports = new ArrayList<>(ServerProxyConfigFile.readUdpDirectPorts());
+        if (ports.contains(port)) {
+            sendClientMessage(Component.translatable("zstdnet.command.udp.already_present", port));
+            return 0;
+        }
+        if (ports.size() >= MAX_UDP_DIRECT_PORTS) {
+            sendClientMessage(Component.translatable("zstdnet.command.udp.limit", MAX_UDP_DIRECT_PORTS));
+            return 0;
+        }
+        ports.add(port);
+        if (!writeUdpDirectPorts(ports)) {
+            return 0;
+        }
+        sendClientMessage(Component.translatable("zstdnet.command.udp.added", port));
         return 1;
     }
 
-    private int setVoiceListenPort(CommandContext<CommandSourceStack> context) {
-        if (!canEditPortConfig()) {
-            sendClientMessage(Component.translatable("zstdnet.command.voice.no_permission"));
-            return 0;
-        }
-
+    private int removeUdpDirectPort(CommandContext<CommandSourceStack> context) {
         int port = IntegerArgumentType.getInteger(context, "port");
-        try {
-            ServerProxyConfigFile.writeVoiceListenPort(port);
-        } catch (IOException e) {
-            LOGGER.error("zstdnet: failed to update voice listen port {}", port, e);
-            sendClientMessage(Component.translatable("zstdnet.command.voice.write_failed"));
+        List<Integer> ports = new ArrayList<>(ServerProxyConfigFile.readUdpDirectPorts());
+        if (!ports.remove(Integer.valueOf(port))) {
+            sendClientMessage(Component.translatable("zstdnet.command.udp.not_present", port));
             return 0;
         }
-        sendClientMessage(Component.translatable(
-            "zstdnet.command.port.voice_listen_set",
-            ServerProxyConfigFile.readVoiceListenPort()
-        ));
+        if (!writeUdpDirectPorts(ports)) {
+            return 0;
+        }
+        sendClientMessage(Component.translatable("zstdnet.command.udp.removed", port));
         return 1;
+    }
+
+    private boolean writeUdpDirectPorts(List<Integer> ports) {
+        try {
+            ServerProxyConfigFile.writeUdpDirectPorts(ports);
+            return true;
+        } catch (IOException e) {
+            LOGGER.error("zstdnet: failed to update direct UDP ports", e);
+            sendClientMessage(Component.translatable("zstdnet.command.udp.write_failed"));
+            return false;
+        }
+    }
+
+    private static String formatUdpDirectPorts(List<Integer> ports) {
+        if (ports == null || ports.isEmpty()) {
+            return "-";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (int port : ports) {
+            if (!builder.isEmpty()) {
+                builder.append(", ");
+            }
+            builder.append(port);
+        }
+        return builder.toString();
     }
 
     private boolean canEditPortConfig() {
@@ -1344,6 +1448,7 @@ public final class ClientProxyPublisher {
         if (state.backendPortEdit != null && (state.backendPortEdit.getValue() == null || state.backendPortEdit.getValue().isBlank())) {
             state.backendPortEdit.setValue(String.valueOf(backendPort));
         }
+        LanChatMessageHooks.beginLanPublishMessageSuppression();
         try {
             ServerProxyConfigFile.writePorts(state.zstdPort, backendPort);
         } catch (IOException e) {

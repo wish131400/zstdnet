@@ -34,6 +34,8 @@ import net.minecraftforge.network.PacketDistributor;
 import net.minecraftforge.network.simple.SimpleChannel;
 import org.slf4j.Logger;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Supplier;
 
 public final class LanCompressionSync {
@@ -41,7 +43,7 @@ public final class LanCompressionSync {
     private static final int MAX_REPORT_BYTES = 1024 * 1024;
 
     private static final Logger LOGGER = LogUtils.getLogger();
-    private static final String PROTOCOL_VERSION = "1";
+    private static final String PROTOCOL_VERSION = "2";
     private static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
         new ResourceLocation(Zstdnet.MODID, "lan_compression"),
         () -> PROTOCOL_VERSION,
@@ -91,6 +93,11 @@ public final class LanCompressionSync {
             .decoder(TrafficReportResponseMessage::decode)
             .consumerMainThread(TrafficReportResponseMessage::handle)
             .add();
+        CHANNEL.messageBuilder(UdpDirectPortsMessage.class, id++, NetworkDirection.PLAY_TO_CLIENT)
+            .encoder(UdpDirectPortsMessage::encode)
+            .decoder(UdpDirectPortsMessage::decode)
+            .consumerMainThread(UdpDirectPortsMessage::handle)
+            .add();
     }
 
     public static void requestCompressionUpgrade(ServerPlayer player) {
@@ -109,6 +116,11 @@ public final class LanCompressionSync {
         }
         init();
         CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), ServerHudMessage.from(snapshot));
+    }
+
+    public static void sendUdpDirectPorts(ServerPlayer player, List<Integer> ports) {
+        init();
+        CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), new UdpDirectPortsMessage(ports));
     }
 
     public static void requestTrafficReport(String range) {
@@ -228,6 +240,42 @@ public final class LanCompressionSync {
 
         private static void handle(TrafficReportResponseMessage message, Supplier<NetworkEvent.Context> supplier) {
             supplier.get().enqueueWork(() -> ClientProxyPublisher.acceptTrafficReportResponse(message.success, message.payload));
+            supplier.get().setPacketHandled(true);
+        }
+    }
+
+    private record UdpDirectPortsMessage(List<Integer> ports) {
+        private static final int MAX_PORTS = 32;
+
+        private UdpDirectPortsMessage {
+            ports = ports == null ? List.of() : List.copyOf(ports);
+        }
+
+        private static UdpDirectPortsMessage decode(FriendlyByteBuf buf) {
+            int count = buf.readVarInt();
+            if (count < 0 || count > MAX_PORTS) {
+                throw new IllegalArgumentException("invalid direct UDP port count " + count);
+            }
+            List<Integer> ports = new ArrayList<>(count);
+            for (int index = 0; index < count; index++) {
+                int port = buf.readVarInt();
+                if (port < 1 || port > 65535) {
+                    throw new IllegalArgumentException("invalid direct UDP port " + port);
+                }
+                ports.add(port);
+            }
+            return new UdpDirectPortsMessage(ports);
+        }
+
+        private static void encode(UdpDirectPortsMessage message, FriendlyByteBuf buf) {
+            buf.writeVarInt(message.ports.size());
+            for (int port : message.ports) {
+                buf.writeVarInt(port);
+            }
+        }
+
+        private static void handle(UdpDirectPortsMessage message, Supplier<NetworkEvent.Context> supplier) {
+            supplier.get().enqueueWork(() -> ClientProxyPublisher.acceptUdpDirectPorts(message.ports));
             supplier.get().setPacketHandled(true);
         }
     }

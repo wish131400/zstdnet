@@ -88,7 +88,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * 4) 管理线程池与生命周期启停。
  */
 final class ServerProxyRuntime {
-    static final String ZSTD_ADDRESS_HINT = "当前服务器启用了 ZSTD 连接，请联系服务器管理员获取正确的连接地址。";
+    private static final String ZSTD_ADDRESS_HINT_FALLBACK = "当前服务器仅接受 ZstdNet 连接，原版 Minecraft 直连已关闭。请安装与服务器匹配的 ZstdNet 客户端，并使用管理员提供的 ZstdNet 入口端口重新连接。";
 
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final byte[] PROXY_V2_SIGNATURE = new byte[]{
@@ -99,8 +99,7 @@ final class ServerProxyRuntime {
     private static final int MIN_PORT = 1;
     private static final int MAX_PORT = 65535;
     private static final String DEFAULT_LISTEN_HOST = "0.0.0.0";
-    private static final int DEFAULT_VOICE_CHAT_PORT = 24454;
-    private static final int DEFAULT_VOICE_CHAT_LISTEN_PORT = 24455;
+    private static final int MAX_UDP_DIRECT_PORTS = 32;
     private static final int DEFAULT_ZSTD_LEVEL = 9;
     private static final int DEFAULT_MAX_CONN_PER_IP = 9999;
     private static final int DEFAULT_MAX_CONN_TOTAL = 128;
@@ -165,6 +164,11 @@ final class ServerProxyRuntime {
             }
 
             Path configPath = ServerProxyConfigFile.path();
+            try {
+                ServerProxyConfigFile.migrateDeprecatedVoiceChatOptions();
+            } catch (IOException e) {
+                LOGGER.warn("[zstdnet-server] could not migrate deprecated voice chat settings: {}", e.toString());
+            }
             ProxyConfig loaded = loadOrCreateConfig(configPath, mcServerPort, mode);
             if (loaded == null) {
                 return;
@@ -191,7 +195,6 @@ final class ServerProxyRuntime {
                 if (loaded.target == null || loaded.target.port <= 0) {
                     loaded = loaded.withTarget(new HostPort("127.0.0.1", mcServerPort));
                 }
-                loaded = loaded.withLanVoiceDefaults(mcServerPort);
             }
 
             BindResult bindResult = bindListener(loaded, mode);
@@ -398,6 +401,21 @@ final class ServerProxyRuntime {
         return running && runtimeMode == RuntimeMode.DEDICATED;
     }
 
+    /**
+     * Explains why the vanilla backend port rejected a player and gives the
+     * administrator the exact proxy endpoint to share with players.
+     */
+    String zstdAddressHint() {
+        ProxyConfig config = cfg;
+        if (config == null || config.listen == null) {
+            return ZSTD_ADDRESS_HINT_FALLBACK;
+        }
+        return "当前服务器仅接受 ZstdNet 连接，原版 Minecraft 直连端口已关闭。\n"
+            + "请安装与服务器匹配的 ZstdNet 客户端，并连接服务器的 ZstdNet 入口端口："
+            + config.listen.port
+            + "。如果使用樱花（或其他端口映射/FRP），请以映射后的公网端口为准。";
+    }
+
     boolean isLanMode() {
         return running && runtimeMode == RuntimeMode.LAN;
     }
@@ -412,6 +430,11 @@ final class ServerProxyRuntime {
         long zstdUpRate = previous == null ? 0L : previous.zstdUpRate();
         long zstdDownRate = previous == null ? 0L : previous.zstdDownRate();
         return buildHudSnapshot(rawUpRate, rawDownRate, zstdUpRate, zstdDownRate);
+    }
+
+    List<Integer> udpDirectPorts() {
+        ProxyConfig config = cfg;
+        return config == null ? List.of() : config.udpDirectPorts;
     }
 
     boolean configChangedOnDisk() {
@@ -509,9 +532,7 @@ final class ServerProxyRuntime {
                 sendLoginDisconnect(
                     clientWireOut,
                     stats,
-                    """
-                    当前服务器启用了 ZSTD 连接，请联系服务器管理员获取正确的连接方式。
-                    """
+                    zstdAddressHint()
                 );
                 return;
             }
@@ -1379,9 +1400,7 @@ final class ServerProxyRuntime {
             "target",
             "127.0.0.1:" + DEFAULT_MINECRAFT_PORT
         ));
-        boolean voiceChatPassthrough = Boolean.parseBoolean(props.getProperty("voice_chat_passthrough", "true").trim());
-        String voiceChatListen = props.getProperty("voice_chat_listen", "").trim();
-        String voiceChatTarget = props.getProperty("voice_chat_target", "").trim();
+        List<Integer> udpDirectPorts = parseUdpDirectPorts(props.getProperty("udp_direct_ports", "24454"), listen.port());
 
         int level = clamp(parseInt(props.getProperty("level"), DEFAULT_ZSTD_LEVEL), 1, 22);
         int maxConn = parseInt(props.getProperty("max_conn_per_ip"), DEFAULT_MAX_CONN_PER_IP);
@@ -1442,9 +1461,7 @@ final class ServerProxyRuntime {
             autoTakeover,
             listen,
             target,
-            voiceChatPassthrough,
-            voiceChatListen,
-            voiceChatTarget,
+            udpDirectPorts,
             level,
             maxConn,
             maxConnTotal,
@@ -1484,6 +1501,55 @@ final class ServerProxyRuntime {
         return Set.copyOf(ips);
     }
 
+    static List<Integer> parseUdpDirectPorts(String raw, int gameListenPort) {
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+
+        LinkedHashSet<Integer> ports = new LinkedHashSet<>();
+        for (String item : raw.split(",")) {
+            String value = item.trim();
+            if (value.isEmpty()) {
+                continue;
+            }
+            int port;
+            try {
+                port = Integer.parseInt(value);
+            } catch (NumberFormatException e) {
+                LOGGER.warn("[zstdnet-server] ignoring invalid udp_direct_ports entry '{}'.", value);
+                continue;
+            }
+            if (port < MIN_PORT || port > MAX_PORT) {
+                LOGGER.warn("[zstdnet-server] ignoring out-of-range udp_direct_ports entry '{}'.", value);
+                continue;
+            }
+            if (port == gameListenPort) {
+                LOGGER.warn("[zstdnet-server] ignoring udp_direct_ports entry {} because it is the game UDP route.", port);
+                continue;
+            }
+            if (ports.size() >= MAX_UDP_DIRECT_PORTS) {
+                LOGGER.warn("[zstdnet-server] ignoring udp_direct_ports entry {} because the limit is {} ports.", port, MAX_UDP_DIRECT_PORTS);
+                continue;
+            }
+            ports.add(port);
+        }
+        return List.copyOf(ports);
+    }
+
+    static List<Integer> excludeGameUdpRoute(List<Integer> ports, int gameListenPort) {
+        if (ports == null || ports.isEmpty() || !ports.contains(gameListenPort)) {
+            return ports == null ? List.of() : ports;
+        }
+        LOGGER.warn("[zstdnet-server] removing UDP direct port {} because the active game route uses that port.", gameListenPort);
+        List<Integer> filtered = new ArrayList<>(ports.size() - 1);
+        for (int port : ports) {
+            if (port != gameListenPort) {
+                filtered.add(port);
+            }
+        }
+        return List.copyOf(filtered);
+    }
+
     /**
      * 生成默认配置模板文本。
      */
@@ -1516,14 +1582,10 @@ final class ServerProxyRuntime {
             # listen=0.0.0.0:25565
             # target=127.0.0.1:25566
 
-            # Simple Voice Chat 的原样 UDP 转发。
-            voice_chat_passthrough=true
-
-            # 语音聊天的公网 UDP 入口；LAN 默认跟随当前游戏 UDP 端口。
-            voice_chat_listen=0.0.0.0:${VOICE_PORT}
-
-            # 语音聊天的后端 UDP 目标；LAN 默认指向当前游戏 UDP 端口。
-            voice_chat_target=127.0.0.1:${VOICE_PORT}
+            # 需要客户端直连的 UDP 端口，逗号分隔；例如 SVC 默认端口：24454。
+            # 这些端口不会经过 zstdnet 服务端转发，客户端会映射到当前服务器地址。
+            # 不要填写游戏公网入口端口，否则会与 Sable 等同端口 UDP 模组冲突。
+            udp_direct_ports=24454
 
             # zstd 压缩等级（1-22，通常建议 3-9）。
             level=${LEVEL}
@@ -1599,14 +1661,9 @@ final class ServerProxyRuntime {
             # 一般保持为本地游戏端口即可。
             target=127.0.0.1:${TARGET_PORT}
 
-            # Simple Voice Chat 的原样 UDP 转发。
-            voice_chat_passthrough=true
-
-            # 语音聊天的公网 UDP 入口；留空时跟随当前 LAN 端口，填写后按配置值生效。
-            voice_chat_listen=
-
-            # 语音聊天的后端 UDP 目标；留空时指向本机当前 LAN 端口，填写后按配置值生效。
-            voice_chat_target=
+            # 需要客户端直连的 UDP 端口，逗号分隔；例如 SVC 默认端口：24454。
+            # 这些端口不会经过 zstdnet 服务端转发，客户端会映射到当前服务器地址。
+            udp_direct_ports=24454
 
             # zstd 压缩等级（1-22，通常建议 3-9）。
             level=${LEVEL}
@@ -1653,7 +1710,6 @@ final class ServerProxyRuntime {
             """
             .replace("${LISTEN_PORT}", String.valueOf(ServerProxyConfigFile.readListenPort()))
             .replace("${TARGET_PORT}", String.valueOf(mcServerPort))
-            .replace("${VOICE_PORT}", String.valueOf(mcServerPort))
             .replace("${LEVEL}", String.valueOf(DEFAULT_ZSTD_LEVEL))
             .replace("${MAX_CONN}", String.valueOf(DEFAULT_MAX_CONN_PER_IP))
             .replace("${MAX_REQ}", String.valueOf(DEFAULT_MAX_REQ_PER_WINDOW))
@@ -1667,20 +1723,6 @@ final class ServerProxyRuntime {
             return DEFAULT_MINECRAFT_PORT + 1;
         }
         return candidate;
-    }
-
-    private VoiceChatPassthroughDecision resolveVoiceChatPassthrough(ProxyConfig config) {
-        Path svcConfig = simpleVoiceChatConfigPath();
-        Integer simpleVoiceChatPort = readSimpleVoiceChatPort(svcConfig);
-        return resolveVoiceChatPassthrough(
-            config.listen,
-            config.target,
-            config.voiceChatPassthrough,
-            config.voiceChatListen,
-            config.voiceChatTarget,
-            simpleVoiceChatPort,
-            svcConfig.toString()
-        );
     }
 
     static VoiceChatPassthroughDecision resolveVoiceChatPassthrough(
@@ -2062,9 +2104,7 @@ final class ServerProxyRuntime {
         boolean autoTakeover,
         HostPort listen,
         HostPort target,
-        boolean voiceChatPassthrough,
-        String voiceChatListen,
-        String voiceChatTarget,
+        List<Integer> udpDirectPorts,
         int level,
         int maxConnPerIp,
         int maxConnTotal,
@@ -2091,9 +2131,7 @@ final class ServerProxyRuntime {
                 autoTakeover,
                 listen,
                 newTarget,
-                voiceChatPassthrough,
-                voiceChatListen,
-                voiceChatTarget,
+                udpDirectPorts,
                 level,
                 maxConnPerIp,
                 maxConnTotal,
@@ -2122,9 +2160,7 @@ final class ServerProxyRuntime {
                 autoTakeover,
                 newListen,
                 newTarget,
-                voiceChatPassthrough,
-                voiceChatListen,
-                voiceChatTarget,
+                excludeGameUdpRoute(udpDirectPorts, newListen.port()),
                 level,
                 maxConnPerIp,
                 maxConnTotal,
@@ -2145,53 +2181,6 @@ final class ServerProxyRuntime {
                 trustProxyProtocol,
                 trustedProxyIps
             );
-        }
-
-        private ProxyConfig withLanVoiceDefaults(int lanPort) {
-            String effectiveVoiceListen = voiceChatListen;
-            String effectiveVoiceTarget = voiceChatTarget;
-            if (isDefaultVoiceChatListen(voiceChatListen)) {
-                effectiveVoiceListen = DEFAULT_LISTEN_HOST + ":" + lanPort;
-            }
-            if (isDefaultVoiceChatTarget(voiceChatTarget)) {
-                effectiveVoiceTarget = "127.0.0.1:" + lanPort;
-            }
-            return new ProxyConfig(
-                enabled,
-                autoTakeover,
-                listen,
-                target,
-                voiceChatPassthrough,
-                effectiveVoiceListen,
-                effectiveVoiceTarget,
-                level,
-                maxConnPerIp,
-                maxConnTotal,
-                maxReqPerWindow,
-                maxReqTotalPerWindow,
-                maxWorkerThreads,
-                window,
-                banDuration,
-                statsInterval,
-                flushInterval,
-                idleTimeout,
-                handshakeTimeout,
-                rawStatusTimeout,
-                statusCacheTtl,
-                maxRatePerConnBps,
-                maxRateGlobalBps,
-                burstBytes,
-                trustProxyProtocol,
-                trustedProxyIps
-            );
-        }
-
-        private static boolean isDefaultVoiceChatListen(String raw) {
-            return raw == null || raw.isBlank();
-        }
-
-        private static boolean isDefaultVoiceChatTarget(String raw) {
-            return raw == null || raw.isBlank();
         }
 
     }
@@ -2465,25 +2454,7 @@ final class ServerProxyRuntime {
     }
 
     private List<UdpRoute> buildUdpRoutes(ProxyConfig config) {
-        List<UdpRoute> routes = new ArrayList<>();
-        routes.add(new UdpRoute("game", config.listen, config.target));
-
-        VoiceChatPassthroughDecision voiceChat = resolveVoiceChatPassthrough(config);
-        if (voiceChat.reuseGameRoute()) {
-            LOGGER.info("[zstdnet-server] voice chat UDP passthrough reuses the built-in game UDP route.");
-            return routes;
-        }
-        if (voiceChat.route() != null) {
-            routes.add(voiceChat.route());
-            return routes;
-        }
-
-        if (config.voiceChatPassthrough) {
-            LOGGER.warn("[zstdnet-server] voice chat UDP passthrough not armed: {}", voiceChat.reason());
-        } else {
-            LOGGER.info("[zstdnet-server] voice chat UDP passthrough disabled.");
-        }
-        return routes;
+        return List.of(new UdpRoute("game", config.listen, config.target));
     }
 
     private void stopUdpForwarders() {
