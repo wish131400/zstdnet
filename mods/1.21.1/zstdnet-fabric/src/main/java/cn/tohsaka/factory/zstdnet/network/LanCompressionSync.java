@@ -20,9 +20,12 @@
 package cn.tohsaka.factory.zstdnet.network;
 
 import cn.tohsaka.factory.zstdnet.client.ClientProxyPublisher;
+import cn.tohsaka.factory.zstdnet.ClientConfig;
+import cn.tohsaka.factory.zstdnet.core.transport.ZstdPipeline;
 import cn.tohsaka.factory.zstdnet.Zstdnet;
 import cn.tohsaka.factory.zstdnet.mixin.ServerGamePacketListenerImplAccessor;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
+import cn.tohsaka.factory.zstdnet.server.ServerProxyConfigFile;
 import com.mojang.logging.LogUtils;
 import java.util.ArrayList;
 import java.util.List;
@@ -31,16 +34,21 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.client.Minecraft;
+import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
+import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.ByteBufCodecs;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.network.ServerGamePacketListenerImpl;
 import org.slf4j.Logger;
 
 public final class LanCompressionSync {
-    public static final int LAN_THRESHOLD = 1048576;
+    public static final int LAN_THRESHOLD = 256;
     private static final int MAX_REPORT_BYTES = 1024 * 1024;
 
     private static final Logger LOGGER = LogUtils.getLogger();
@@ -58,14 +66,18 @@ public final class LanCompressionSync {
         PayloadTypeRegistry.playS2C().register(PrepareMessage.TYPE, PrepareMessage.STREAM_CODEC);
         PayloadTypeRegistry.playC2S().register(ReadyMessage.TYPE, ReadyMessage.STREAM_CODEC);
         PayloadTypeRegistry.playS2C().register(ActivateMessage.TYPE, ActivateMessage.STREAM_CODEC);
+        PayloadTypeRegistry.playS2C().register(IntegratedPrepareMessage.TYPE, IntegratedPrepareMessage.STREAM_CODEC);
+        PayloadTypeRegistry.playC2S().register(IntegratedReadyMessage.TYPE, IntegratedReadyMessage.STREAM_CODEC);
         PayloadTypeRegistry.playS2C().register(ServerHudMessage.TYPE, ServerHudMessage.STREAM_CODEC);
         PayloadTypeRegistry.playC2S().register(TrafficReportRequestMessage.TYPE, TrafficReportRequestMessage.STREAM_CODEC);
         PayloadTypeRegistry.playS2C().register(TrafficReportResponseMessage.TYPE, TrafficReportResponseMessage.STREAM_CODEC);
-        PayloadTypeRegistry.playS2C().register(UdpDirectPortsMessage.TYPE, UdpDirectPortsMessage.STREAM_CODEC);
 
         ServerPlayNetworking.registerGlobalReceiver(ReadyMessage.TYPE, (message, context) -> {
             context.server().execute(() -> {
                 ServerPlayer player = context.player();
+                if (message.threshold() == -1) {
+                    return;
+                }
                 ((ServerGamePacketListenerImplAccessor) player.connection).zstdnet$getConnection().setupCompression(message.threshold(), true);
                 ServerPlayNetworking.send(player, new ActivateMessage(message.threshold()));
                 LOGGER.info(
@@ -75,6 +87,9 @@ public final class LanCompressionSync {
                 );
             });
         });
+
+        // ConnectionMixin consumes transport controls before Fabric queues payloads on the game thread.
+        ServerPlayNetworking.registerGlobalReceiver(IntegratedReadyMessage.TYPE, (message, context) -> { });
 
         ServerPlayNetworking.registerGlobalReceiver(TrafficReportRequestMessage.TYPE, (message, context) -> {
             context.server().execute(() -> {
@@ -101,11 +116,19 @@ public final class LanCompressionSync {
         }
 
         ClientPlayNetworking.registerGlobalReceiver(PrepareMessage.TYPE, (message, context) -> {
-            context.client().execute(() -> ClientPlayNetworking.send(new ReadyMessage(message.threshold())));
+            if (message.threshold() != -1) {
+                context.responseSender().sendPacket(new ReadyMessage(message.threshold()));
+            }
         });
 
+        ClientPlayNetworking.registerGlobalReceiver(IntegratedPrepareMessage.TYPE, (message, context) -> { });
+
         ClientPlayNetworking.registerGlobalReceiver(ActivateMessage.TYPE, (message, context) -> {
-            context.client().execute(() -> applyClientThreshold(message.threshold()));
+            context.client().execute(() -> {
+                if (message.threshold() != -1) {
+                    applyClientThreshold(message.threshold());
+                }
+            });
         });
 
         ClientPlayNetworking.registerGlobalReceiver(ServerHudMessage.TYPE, (message, context) -> {
@@ -116,9 +139,51 @@ public final class LanCompressionSync {
             context.client().execute(() -> ClientProxyPublisher.acceptTrafficReportResponse(message.success(), message.payload()));
         });
 
-        ClientPlayNetworking.registerGlobalReceiver(UdpDirectPortsMessage.TYPE, (message, context) -> {
-            context.client().execute(() -> ClientProxyPublisher.acceptUdpDirectPorts(message.ports()));
-        });
+    }
+
+    public static boolean handleTransportPacket(Connection connection, Packet<?> packet) {
+        if (packet instanceof ClientboundCustomPayloadPacket incoming) {
+            CustomPacketPayload payload = incoming.payload();
+            if (payload instanceof IntegratedPrepareMessage message && message.version() == 1) {
+                prepareClientTransport(connection, new IntegratedReadyMessage(1));
+                return true;
+            }
+            if (payload instanceof PrepareMessage message && message.threshold() == -1) {
+                prepareClientTransport(connection, new ReadyMessage(-1));
+                return true;
+            }
+            if (payload instanceof ActivateMessage message && message.threshold() == -1) {
+                ZstdPipeline.installClientEncoder(connection, ClientConfig.getLevel());
+                return true;
+            }
+        } else if (packet instanceof ServerboundCustomPayloadPacket incoming) {
+            CustomPacketPayload payload = incoming.payload();
+            boolean ready = payload instanceof IntegratedReadyMessage integrated && integrated.version() == 1
+                || payload instanceof ReadyMessage legacy && legacy.threshold() == -1;
+            if (ready) {
+                if (connection.getPacketListener() instanceof ServerGamePacketListenerImpl listener
+                    && ServerPlayNetworking.canSend(listener.player, IntegratedPrepareMessage.TYPE)) {
+                    activateIntegrated(connection);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void prepareClientTransport(Connection connection, CustomPacketPayload ready) {
+        if (ZstdPipeline.canUpgrade(connection)) {
+            ZstdPipeline.installClientDecoder(connection, () ->
+                ZstdPipeline.sendUpgradeReady(connection, ClientPlayNetworking.createC2SPacket(ready)));
+        } else {
+            Minecraft minecraft = Minecraft.getInstance();
+            minecraft.execute(() -> {
+                if (minecraft.getConnection() != null && minecraft.getConnection().getConnection() == connection
+                    && minecraft.player != null) {
+                    ZstdPipeline.notifyKryptonFallback(connection, minecraft.player::sendSystemMessage);
+                }
+            });
+        }
     }
 
     public static void requestCompressionUpgrade(ServerPlayer player) {
@@ -130,16 +195,45 @@ public final class LanCompressionSync {
         );
     }
 
+    public static void requestIntegratedUpgrade(ServerPlayer player) {
+        Connection connection = ((ServerGamePacketListenerImplAccessor) player.connection).zstdnet$getConnection();
+        if (!ServerPlayNetworking.canSend(player, IntegratedPrepareMessage.TYPE)) {
+            return;
+        }
+        if (!ZstdPipeline.canUpgrade(connection)) {
+            ZstdPipeline.notifyKryptonFallback(connection, player::sendSystemMessage);
+            return;
+        }
+        ZstdPipeline.offerUpgrade(connection, () -> ServerPlayNetworking.createS2CPacket(new IntegratedPrepareMessage(1)));
+    }
+
+    private static void activateIntegrated(Connection connection) {
+        if (!ZstdPipeline.consumeUpgradeOffer(connection)) {
+            return;
+        }
+        ZstdPipeline.installDecoder(connection,
+            ServerProxyBootstrap::addIntegratedRawUp,
+            ServerProxyBootstrap::addIntegratedWireUp,
+            () -> ZstdPipeline.sendUpgradeActivation(connection,
+                ServerPlayNetworking.createS2CPacket(new ActivateMessage(-1)),
+                ServerProxyConfigFile.readLevel(),
+                ServerProxyBootstrap::addIntegratedRawDown,
+                ServerProxyBootstrap::addIntegratedWireDown,
+                () -> ServerProxyBootstrap.addIntegratedConnection(1),
+                () -> ServerProxyBootstrap.addIntegratedConnection(-1)
+            ));
+    }
+
     public static void sendServerHudSnapshot(ServerPlayer player, ServerProxyBootstrap.ServerHudSnapshot snapshot) {
-        if (snapshot == null) {
+        if (snapshot == null || !ServerPlayNetworking.canSend(player, ServerHudMessage.TYPE)) {
+            return;
+        }
+        if ("INTEGRATED".equals(snapshot.mode()) && !ServerPlayNetworking.canSend(player, IntegratedPrepareMessage.TYPE)) {
             return;
         }
         ServerPlayNetworking.send(player, ServerHudMessage.from(snapshot));
     }
 
-    public static void sendUdpDirectPorts(ServerPlayer player, List<Integer> ports) {
-        ServerPlayNetworking.send(player, new UdpDirectPortsMessage(ports));
-    }
 
     public static void requestTrafficReport(String range) {
         ClientPlayNetworking.send(new TrafficReportRequestMessage(range));
@@ -165,6 +259,32 @@ public final class LanCompressionSync {
 
         @Override
         public Type<PrepareMessage> type() {
+            return TYPE;
+        }
+    }
+
+    private record IntegratedPrepareMessage(int version) implements CustomPacketPayload {
+        private static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath(Zstdnet.MODID, "integrated_prepare");
+        private static final Type<IntegratedPrepareMessage> TYPE = new Type<>(ID);
+        private static final StreamCodec<RegistryFriendlyByteBuf, IntegratedPrepareMessage> STREAM_CODEC = StreamCodec.composite(
+            ByteBufCodecs.VAR_INT, IntegratedPrepareMessage::version, IntegratedPrepareMessage::new
+        );
+
+        @Override
+        public Type<IntegratedPrepareMessage> type() {
+            return TYPE;
+        }
+    }
+
+    private record IntegratedReadyMessage(int version) implements CustomPacketPayload {
+        private static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath(Zstdnet.MODID, "integrated_ready");
+        private static final Type<IntegratedReadyMessage> TYPE = new Type<>(ID);
+        private static final StreamCodec<RegistryFriendlyByteBuf, IntegratedReadyMessage> STREAM_CODEC = StreamCodec.composite(
+            ByteBufCodecs.VAR_INT, IntegratedReadyMessage::version, IntegratedReadyMessage::new
+        );
+
+        @Override
+        public Type<IntegratedReadyMessage> type() {
             return TYPE;
         }
     }
@@ -230,49 +350,6 @@ public final class LanCompressionSync {
         }
     }
 
-    private record UdpDirectPortsMessage(List<Integer> ports) implements CustomPacketPayload {
-        private static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath(Zstdnet.MODID, "udp_direct_ports");
-        private static final Type<UdpDirectPortsMessage> TYPE = new Type<>(ID);
-        private static final StreamCodec<RegistryFriendlyByteBuf, UdpDirectPortsMessage> STREAM_CODEC = StreamCodec.of(
-            UdpDirectPortsMessage::encode,
-            UdpDirectPortsMessage::decode
-        );
-
-        private UdpDirectPortsMessage {
-            ports = ports == null ? List.of() : List.copyOf(ports);
-            if (ports.size() > 32) {
-                throw new IllegalArgumentException("too many direct UDP ports");
-            }
-        }
-
-        private static UdpDirectPortsMessage decode(RegistryFriendlyByteBuf buf) {
-            int count = buf.readVarInt();
-            if (count < 0 || count > 32) {
-                throw new IllegalArgumentException("invalid direct UDP port count " + count);
-            }
-            List<Integer> ports = new ArrayList<>(count);
-            for (int index = 0; index < count; index++) {
-                int port = buf.readVarInt();
-                if (port < 1 || port > 65535) {
-                    throw new IllegalArgumentException("invalid direct UDP port " + port);
-                }
-                ports.add(port);
-            }
-            return new UdpDirectPortsMessage(ports);
-        }
-
-        private static void encode(RegistryFriendlyByteBuf buf, UdpDirectPortsMessage message) {
-            buf.writeVarInt(message.ports.size());
-            for (int port : message.ports) {
-                buf.writeVarInt(port);
-            }
-        }
-
-        @Override
-        public Type<UdpDirectPortsMessage> type() {
-            return TYPE;
-        }
-    }
 
     private record ServerHudMessage(
         String mode,

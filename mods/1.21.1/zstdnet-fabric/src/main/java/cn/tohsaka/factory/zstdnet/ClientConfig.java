@@ -99,7 +99,7 @@ public final class ClientConfig {
     private static String defaultConfigBody() {
         return """
             # ZstdNet client config
-            # zstd compression level for the local client proxy
+            # zstd compression level for the client connection
             level=%d
             """.formatted(DEFAULT_LEVEL);
     }

@@ -20,6 +20,7 @@ base {
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 
 sourceSets {
+    test.java.srcDir '../../../shared/src/test/java'
     main {
         java.srcDir '../../../shared/src/main/java'
         resources.srcDir '../../../shared/src/main/resources'
@@ -77,6 +78,11 @@ dependencies {
     testRuntimeOnly 'com.mojang:logging:1.2.7'
     testRuntimeOnly 'org.slf4j:slf4j-api:2.0.9'
     testRuntimeOnly 'com.google.code.gson:gson:2.11.0'
+    testRuntimeOnly 'org.openjdk.nashorn:nashorn-core:15.4'
+    testRuntimeOnly 'org.ow2.asm:asm-commons:9.8'
+    testRuntimeOnly 'org.ow2.asm:asm-util:9.8'
+    testImplementation 'io.netty:netty-codec:4.1.97.Final'
+    testImplementation 'org.ow2.asm:asm-analysis:9.8'
 }
 
 tasks.withType(JavaCompile).configureEach {
@@ -85,6 +91,7 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.named('test', Test).configure {
     useJUnitPlatform()
+    classpath += sourceSets.main.compileClasspath
 }
 
 processResources {

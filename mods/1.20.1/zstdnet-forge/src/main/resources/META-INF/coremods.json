@@ -1,6 +1,5 @@
 {
+  "zstdnet_initial_sync": "coremods/zstdnet_initial_sync.js",
   "zstdnet_lan_compression_threshold": "coremods/zstdnet_lan_compression_threshold.js",
-  "zstdnet_connect_screen_intercept": "coremods/zstdnet_connect_screen_intercept.js",
-  "zstdnet_server_real_ip": "coremods/zstdnet_server_real_ip.js",
-  "zstdnet_lan_chat_filter": "coremods/zstdnet_lan_chat_filter.js"
+  "zstdnet_server_real_ip": "coremods/zstdnet_server_real_ip.js"
 }

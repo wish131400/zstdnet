@@ -20,8 +20,15 @@
 package cn.tohsaka.factory.zstdnet.network;
 
 import cn.tohsaka.factory.zstdnet.client.ClientProxyPublisher;
+import cn.tohsaka.factory.zstdnet.ClientConfig;
 import cn.tohsaka.factory.zstdnet.Zstdnet;
 import cn.tohsaka.factory.zstdnet.server.ServerProxyBootstrap;
+import cn.tohsaka.factory.zstdnet.server.ServerProxyConfigFile;
+import cn.tohsaka.factory.zstdnet.core.transport.ZstdPipeline;
+import net.minecraft.network.Connection;
+import net.minecraft.network.ConnectionProtocol;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
+import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -37,11 +44,13 @@ import net.neoforged.neoforge.network.PacketDistributor;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.handling.IPayloadContext;
 import net.neoforged.neoforge.network.registration.PayloadRegistrar;
+import net.neoforged.neoforge.network.registration.HandlerThread;
+import net.neoforged.neoforge.network.registration.NetworkRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public final class LanCompressionSync {
-    public static final int LAN_THRESHOLD = 1048576;
+    public static final int LAN_THRESHOLD = 256;
     private static final int MAX_REPORT_BYTES = 1024 * 1024;
 
     private static final Logger LOGGER = LoggerFactory.getLogger(LanCompressionSync.class);
@@ -60,13 +69,15 @@ public final class LanCompressionSync {
 
     private static void onRegisterPayloadHandlers(RegisterPayloadHandlersEvent event) {
         PayloadRegistrar registrar = event.registrar(PROTOCOL_VERSION).optional();
-        registrar.playToClient(PrepareMessage.TYPE, PrepareMessage.STREAM_CODEC, PrepareMessage::handle);
-        registrar.playToServer(ReadyMessage.TYPE, ReadyMessage.STREAM_CODEC, ReadyMessage::handle);
-        registrar.playToClient(ActivateMessage.TYPE, ActivateMessage.STREAM_CODEC, ActivateMessage::handle);
+        PayloadRegistrar transport = registrar.executesOn(HandlerThread.NETWORK);
+        transport.playToClient(PrepareMessage.TYPE, PrepareMessage.STREAM_CODEC, PrepareMessage::handle);
+        transport.playToServer(ReadyMessage.TYPE, ReadyMessage.STREAM_CODEC, ReadyMessage::handle);
+        transport.playToClient(ActivateMessage.TYPE, ActivateMessage.STREAM_CODEC, ActivateMessage::handle);
+        transport.playToClient(IntegratedPrepareMessage.TYPE, IntegratedPrepareMessage.STREAM_CODEC, IntegratedPrepareMessage::handle);
+        transport.playToServer(IntegratedReadyMessage.TYPE, IntegratedReadyMessage.STREAM_CODEC, IntegratedReadyMessage::handle);
         registrar.playToClient(ServerHudMessage.TYPE, ServerHudMessage.STREAM_CODEC, ServerHudMessage::handle);
         registrar.playToServer(TrafficReportRequestMessage.TYPE, TrafficReportRequestMessage.STREAM_CODEC, TrafficReportRequestMessage::handle);
         registrar.playToClient(TrafficReportResponseMessage.TYPE, TrafficReportResponseMessage.STREAM_CODEC, TrafficReportResponseMessage::handle);
-        registrar.playToClient(UdpDirectPortsMessage.TYPE, UdpDirectPortsMessage.STREAM_CODEC, UdpDirectPortsMessage::handle);
     }
 
     public static void requestCompressionUpgrade(ServerPlayer player) {
@@ -78,28 +89,98 @@ public final class LanCompressionSync {
         );
     }
 
+    public static void requestIntegratedUpgrade(ServerPlayer player) {
+        Connection connection = player.connection.getConnection();
+        if (!NetworkRegistry.hasChannel(connection, ConnectionProtocol.PLAY, IntegratedPrepareMessage.ID)) {
+            return;
+        }
+        if (!ZstdPipeline.canUpgrade(connection)) {
+            ZstdPipeline.notifyKryptonFallback(connection, player::sendSystemMessage);
+            return;
+        }
+        ZstdPipeline.offerUpgrade(connection, () -> new ClientboundCustomPayloadPacket(new IntegratedPrepareMessage(1)));
+    }
+
+    private record IntegratedPrepareMessage(int version) implements CustomPacketPayload {
+        private static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath(Zstdnet.MODID, "integrated_prepare");
+        private static final Type<IntegratedPrepareMessage> TYPE = new Type<>(ID);
+        private static final StreamCodec<RegistryFriendlyByteBuf, IntegratedPrepareMessage> STREAM_CODEC = StreamCodec.composite(
+            ByteBufCodecs.VAR_INT, IntegratedPrepareMessage::version, IntegratedPrepareMessage::new
+        );
+
+        @Override
+        public Type<IntegratedPrepareMessage> type() {
+            return TYPE;
+        }
+
+        private static void handle(IntegratedPrepareMessage message, IPayloadContext context) {
+            if (message.version != 1) {
+                return;
+            }
+            prepareClientTransport(context, new IntegratedReadyMessage(1));
+        }
+    }
+
+    private static void prepareClientTransport(IPayloadContext context, CustomPacketPayload ready) {
+        Connection connection = context.connection();
+        if (ZstdPipeline.canUpgrade(connection)) {
+            ZstdPipeline.installClientDecoder(connection, () -> ZstdPipeline.sendUpgradeReady(connection,
+                new ServerboundCustomPayloadPacket(ready)));
+        } else {
+            context.enqueueWork(() -> ZstdPipeline.notifyKryptonFallback(connection, context.player()::sendSystemMessage));
+        }
+    }
+
+    private static void activateIntegrated(Connection connection) {
+        if (!NetworkRegistry.hasChannel(connection, ConnectionProtocol.PLAY, IntegratedPrepareMessage.ID)
+            || !ZstdPipeline.consumeUpgradeOffer(connection)) {
+            return;
+        }
+        ZstdPipeline.installDecoder(connection,
+            ServerProxyBootstrap::addIntegratedRawUp,
+            ServerProxyBootstrap::addIntegratedWireUp,
+            () -> ZstdPipeline.sendUpgradeActivation(connection, new ClientboundCustomPayloadPacket(new ActivateMessage(-1)),
+                ServerProxyConfigFile.readLevel(),
+                ServerProxyBootstrap::addIntegratedRawDown,
+                ServerProxyBootstrap::addIntegratedWireDown,
+                () -> ServerProxyBootstrap.addIntegratedConnection(1),
+                () -> ServerProxyBootstrap.addIntegratedConnection(-1)
+            ));
+    }
+
+    private record IntegratedReadyMessage(int version) implements CustomPacketPayload {
+        private static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath(Zstdnet.MODID, "integrated_ready");
+        private static final Type<IntegratedReadyMessage> TYPE = new Type<>(ID);
+        private static final StreamCodec<RegistryFriendlyByteBuf, IntegratedReadyMessage> STREAM_CODEC = StreamCodec.composite(
+            ByteBufCodecs.VAR_INT, IntegratedReadyMessage::version, IntegratedReadyMessage::new
+        );
+
+        @Override
+        public Type<IntegratedReadyMessage> type() {
+            return TYPE;
+        }
+
+        private static void handle(IntegratedReadyMessage message, IPayloadContext context) {
+            if (message.version == 1) {
+                ReadyMessage.handle(new ReadyMessage(-1), context);
+            }
+        }
+    }
+
     public static void sendServerHudSnapshot(ServerPlayer player, ServerProxyBootstrap.ServerHudSnapshot snapshot) {
-        if (snapshot == null) {
+        if (snapshot == null || !NetworkRegistry.hasChannel(player.connection.getConnection(), ConnectionProtocol.PLAY, ServerHudMessage.ID)) {
+            return;
+        }
+        if ("INTEGRATED".equals(snapshot.mode())
+            && !NetworkRegistry.hasChannel(player.connection.getConnection(), ConnectionProtocol.PLAY, IntegratedPrepareMessage.ID)) {
             return;
         }
         PacketDistributor.sendToPlayer(player, ServerHudMessage.from(snapshot));
     }
 
-    public static void sendUdpDirectPorts(ServerPlayer player, List<Integer> ports) {
-        PacketDistributor.sendToPlayer(player, new UdpDirectPortsMessage(ports));
-    }
 
     public static void requestTrafficReport(String range) {
         PacketDistributor.sendToServer(new TrafficReportRequestMessage(range));
-    }
-
-    private static void applyClientThreshold(int threshold) {
-        Minecraft minecraft = Minecraft.getInstance();
-        if (minecraft.getConnection() == null) {
-            return;
-        }
-        minecraft.getConnection().getConnection().setupCompression(threshold, false);
-        LOGGER.info("[zstdnet-client] compression threshold switched to {}.", threshold);
     }
 
     private record PrepareMessage(int threshold) implements CustomPacketPayload {
@@ -117,7 +198,11 @@ public final class LanCompressionSync {
         }
 
         private static void handle(PrepareMessage message, IPayloadContext context) {
-            context.enqueueWork(() -> PacketDistributor.sendToServer(new ReadyMessage(message.threshold)));
+            if (message.threshold == -1) {
+                prepareClientTransport(context, new ReadyMessage(-1));
+            } else {
+                context.reply(new ReadyMessage(message.threshold));
+            }
         }
     }
 
@@ -136,6 +221,10 @@ public final class LanCompressionSync {
         }
 
         private static void handle(ReadyMessage message, IPayloadContext context) {
+            if (message.threshold == -1) {
+                activateIntegrated(context.connection());
+                return;
+            }
             context.enqueueWork(() -> {
                 if (!(context.player() instanceof ServerPlayer player)) {
                     LOGGER.warn("[zstdnet-server] ignored LAN compression ready packet without a server player context.");
@@ -168,7 +257,11 @@ public final class LanCompressionSync {
         }
 
         private static void handle(ActivateMessage message, IPayloadContext context) {
-            context.enqueueWork(() -> applyClientThreshold(message.threshold));
+            if (message.threshold == -1) {
+                ZstdPipeline.installClientEncoder(context.connection(), ClientConfig.getLevel());
+            } else {
+                context.connection().setupCompression(message.threshold, false);
+            }
         }
     }
 
@@ -227,53 +320,6 @@ public final class LanCompressionSync {
         }
     }
 
-    private record UdpDirectPortsMessage(List<Integer> ports) implements CustomPacketPayload {
-        private static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath(Zstdnet.MODID, "udp_direct_ports");
-        private static final Type<UdpDirectPortsMessage> TYPE = new Type<>(ID);
-        private static final StreamCodec<RegistryFriendlyByteBuf, UdpDirectPortsMessage> STREAM_CODEC = StreamCodec.of(
-            UdpDirectPortsMessage::encode,
-            UdpDirectPortsMessage::decode
-        );
-
-        private UdpDirectPortsMessage {
-            ports = ports == null ? List.of() : List.copyOf(ports);
-            if (ports.size() > 32) {
-                throw new IllegalArgumentException("too many direct UDP ports");
-            }
-        }
-
-        private static UdpDirectPortsMessage decode(RegistryFriendlyByteBuf buf) {
-            int count = buf.readVarInt();
-            if (count < 0 || count > 32) {
-                throw new IllegalArgumentException("invalid direct UDP port count " + count);
-            }
-            List<Integer> ports = new ArrayList<>(count);
-            for (int index = 0; index < count; index++) {
-                int port = buf.readVarInt();
-                if (port < 1 || port > 65535) {
-                    throw new IllegalArgumentException("invalid direct UDP port " + port);
-                }
-                ports.add(port);
-            }
-            return new UdpDirectPortsMessage(ports);
-        }
-
-        private static void encode(RegistryFriendlyByteBuf buf, UdpDirectPortsMessage message) {
-            buf.writeVarInt(message.ports.size());
-            for (int port : message.ports) {
-                buf.writeVarInt(port);
-            }
-        }
-
-        @Override
-        public Type<UdpDirectPortsMessage> type() {
-            return TYPE;
-        }
-
-        private static void handle(UdpDirectPortsMessage message, IPayloadContext context) {
-            context.enqueueWork(() -> ClientProxyPublisher.acceptUdpDirectPorts(message.ports));
-        }
-    }
 
     private record ServerHudMessage(
         String mode,

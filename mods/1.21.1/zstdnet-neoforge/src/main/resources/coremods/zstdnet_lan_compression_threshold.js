@@ -1,6 +1,5 @@
 var ASMAPI = Java.type('net.neoforged.coremod.api.ASMAPI');
 var Opcodes = Java.type('org.objectweb.asm.Opcodes');
-var InsnList = Java.type('org.objectweb.asm.tree.InsnList');
 var InsnNode = Java.type('org.objectweb.asm.tree.InsnNode');
 var MethodInsnNode = Java.type('org.objectweb.asm.tree.MethodInsnNode');
 var VarInsnNode = Java.type('org.objectweb.asm.tree.VarInsnNode');
@@ -14,13 +13,12 @@ function initializeCoreMod() {
             },
             'transformer': function(classNode) {
                 var mappedMethod = ASMAPI.mapMethod('getCompressionThreshold');
-
                 for (var i = 0; i < classNode.methods.size(); i++) {
                     var method = classNode.methods.get(i);
-                    if ((method.name != mappedMethod && method.name != 'getCompressionThreshold') || method.desc != '()I') {
+                    if ((method.name != mappedMethod && method.name != 'getCompressionThreshold')
+                            || method.desc != '()I') {
                         continue;
                     }
-
                     method.instructions.clear();
                     method.tryCatchBlocks.clear();
                     method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -34,128 +32,9 @@ function initializeCoreMod() {
                     method.instructions.add(new InsnNode(Opcodes.IRETURN));
                     method.maxStack = 1;
                     method.maxLocals = 1;
-                    ASMAPI.log('INFO', '[zstdnet] patched MinecraftServer#getCompressionThreshold for LAN mode.');
                     return classNode;
                 }
-
                 ASMAPI.log('ERROR', '[zstdnet] failed to patch MinecraftServer#getCompressionThreshold.');
-                return classNode;
-            }
-        },
-        'zstdnet_dedicated_auto_port': {
-            'target': {
-                'type': 'CLASS',
-                'name': 'net.minecraft.server.dedicated.DedicatedServer'
-            },
-            'transformer': function(classNode) {
-                var mappedInitServer = ASMAPI.mapMethod('initServer');
-                var mappedGetProperties = ASMAPI.mapMethod('getProperties');
-
-                for (var i = 0; i < classNode.methods.size(); i++) {
-                    var method = classNode.methods.get(i);
-                    if ((method.name != mappedInitServer && method.name != 'initServer') || method.desc != '()Z') {
-                        continue;
-                    }
-
-                    for (var insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
-                        if (!(insn instanceof MethodInsnNode) || insn.getOpcode() != Opcodes.INVOKEVIRTUAL) {
-                            continue;
-                        }
-                        if (insn.name != mappedGetProperties && insn.name != 'getProperties') {
-                            continue;
-                        }
-
-                        var next = insn.getNext();
-                        while (next != null && next.getOpcode() == -1) {
-                            next = next.getNext();
-                        }
-                        if (next == null || next.getOpcode() != Opcodes.ASTORE) {
-                            continue;
-                        }
-
-                        var injected = new InsnList();
-                        injected.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                        injected.add(new InsnNode(Opcodes.SWAP));
-                        injected.add(new MethodInsnNode(
-                            Opcodes.INVOKESTATIC,
-                            'cn/tohsaka/factory/zstdnet/server/DedicatedServerAutoPort',
-                            'prepareDedicatedServerProperties',
-                            '(Lnet/minecraft/server/dedicated/DedicatedServer;Lnet/minecraft/server/dedicated/DedicatedServerProperties;)Lnet/minecraft/server/dedicated/DedicatedServerProperties;',
-                            false
-                        ));
-                        method.instructions.insert(insn, injected);
-                        ASMAPI.log('INFO', '[zstdnet] patched DedicatedServer#initServer for auto port takeover.');
-                        return classNode;
-                    }
-                }
-
-                ASMAPI.log('ERROR', '[zstdnet] failed to patch DedicatedServer#initServer for auto port takeover.');
-                return classNode;
-            }
-        },
-        'zstdnet_lan_advertise_zstd_port': {
-            'target': {
-                'type': 'CLASS',
-                'name': 'net.minecraft.client.server.LanServerPinger'
-            },
-            'transformer': function(classNode) {
-                var mappedMethod = ASMAPI.mapMethod('createPingString');
-
-                for (var i = 0; i < classNode.methods.size(); i++) {
-                    var method = classNode.methods.get(i);
-                    if ((method.name != mappedMethod && method.name != 'createPingString' && method.name != 'a') || method.desc != '(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;') {
-                        continue;
-                    }
-
-                    var injected = new InsnList();
-                    injected.add(new VarInsnNode(Opcodes.ALOAD, 1));
-                    injected.add(new MethodInsnNode(
-                        Opcodes.INVOKESTATIC,
-                        'cn/tohsaka/factory/zstdnet/coremod/LanCompressionHooks',
-                        'resolveAdvertisedLanAddress',
-                        '(Ljava/lang/String;)Ljava/lang/String;',
-                        false
-                    ));
-                    injected.add(new VarInsnNode(Opcodes.ASTORE, 1));
-                    method.instructions.insert(injected);
-                    ASMAPI.log('INFO', '[zstdnet] patched LanServerPinger#createPingString to advertise zstd LAN port.');
-                    return classNode;
-                }
-
-                ASMAPI.log('ERROR', '[zstdnet] failed to patch LanServerPinger#createPingString.');
-                return classNode;
-            }
-        },
-        'zstdnet_lan_backend_port': {
-            'target': {
-                'type': 'CLASS',
-                'name': 'net.minecraft.client.server.IntegratedServer'
-            },
-            'transformer': function(classNode) {
-                var mappedMethod = ASMAPI.mapMethod('publishServer');
-
-                for (var i = 0; i < classNode.methods.size(); i++) {
-                    var method = classNode.methods.get(i);
-                    if ((method.name != mappedMethod && method.name != 'publishServer' && method.name != 'a') || method.desc != '(Lnet/minecraft/world/level/GameType;ZI)Z') {
-                        continue;
-                    }
-
-                    var injected = new InsnList();
-                    injected.add(new VarInsnNode(Opcodes.ILOAD, 3));
-                    injected.add(new MethodInsnNode(
-                        Opcodes.INVOKESTATIC,
-                        'cn/tohsaka/factory/zstdnet/server/ServerProxyBootstrap',
-                        'resolveLanBackendPort',
-                        '(I)I',
-                        false
-                    ));
-                    injected.add(new VarInsnNode(Opcodes.ISTORE, 3));
-                    method.instructions.insert(injected);
-                    ASMAPI.log('INFO', '[zstdnet] patched IntegratedServer#publishServer to use configured LAN backend port.');
-                    return classNode;
-                }
-
-                ASMAPI.log('ERROR', '[zstdnet] failed to patch IntegratedServer#publishServer LAN backend port.');
                 return classNode;
             }
         }

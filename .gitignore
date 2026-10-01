@@ -1,6 +1,10 @@
 # common
 *.log
+*.log.gz
 *.tmp
+*.jfr
+__pycache__/
+*.py[cod]
 
 # gradle
 .gradle/

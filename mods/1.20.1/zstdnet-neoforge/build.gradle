@@ -31,6 +31,7 @@ sourceSets {
     }
     test {
         java {
+            srcDir '../../../shared/src/test/java'
             srcDir '../zstdnet-forge/src/test/java'
         }
     }

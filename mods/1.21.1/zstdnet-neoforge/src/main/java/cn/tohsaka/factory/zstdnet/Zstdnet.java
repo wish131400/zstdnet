@@ -33,7 +33,7 @@ import org.slf4j.LoggerFactory;
 /**
  * 模组主入口。
  * <p>
- * 客户端侧初始化线路发布器，服务端侧初始化内置代理启动器。
+ * 客户端侧初始化 HUD，服务端侧初始化压缩协商与流量统计。
  */
 @Mod(Zstdnet.MODID)
 public class Zstdnet {

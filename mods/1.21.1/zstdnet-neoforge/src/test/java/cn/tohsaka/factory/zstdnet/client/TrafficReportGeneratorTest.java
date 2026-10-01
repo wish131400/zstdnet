@@ -50,7 +50,7 @@ class TrafficReportGeneratorTest {
         assertTrue(html.contains("https://www.curseforge.com/minecraft/mc-mods/zstdnet"));
         assertTrue(html.contains("data:image/png;base64,"));
         assertTrue(html.contains("rel=\"icon\" type=\"image/png\" href=\"data:image/png;base64,"));
-        assertTrue(html.contains("data:image/svg+xml;base64,"));
+        assertTrue(html.contains("data:image/svg+xml,%3Csvg"));
         assertTrue(html.contains("id=\"rateExplanation\""));
         assertTrue(html.contains("id=\"bandwidthContext\""));
         assertTrue(html.contains("id=\"directionShare\""));
@@ -58,7 +58,7 @@ class TrafficReportGeneratorTest {
         assertTrue(html.contains("data-direction=\"ingress\""));
         assertTrue(html.contains("@keyframes donut-ignite"));
         assertTrue(html.contains("@keyframes donut-core-light"));
-        assertTrue(html.contains("backdrop-filter: blur(18px) saturate(125%)"));
+        assertTrue(html.contains("backdrop-filter: blur(var(--glass-blur)) saturate(150%)"));
         assertFalse(html.contains("@keyframes glass-materialize"));
         assertFalse(html.contains(".card:hover, .panel:hover"));
         assertFalse(html.contains(".card:hover::before, .panel:hover::before"));

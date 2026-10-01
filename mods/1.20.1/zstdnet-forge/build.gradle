@@ -22,6 +22,7 @@ base {
 java.toolchain.languageVersion = JavaLanguageVersion.of(17)
 
 sourceSets {
+    test.java.srcDir '../../../shared/src/test/java'
     main {
         java.srcDir '../../../shared/src/main/java'
         resources.srcDir '../../../shared/src/main/resources'

@@ -1,469 +1,89 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-function Assert-FileExists {
-    param(
-        [string]$Path,
-        [System.Collections.Generic.List[string]]$Failures,
-        [string]$Label
-    )
-
-    if (-not (Test-Path $Path)) {
-        $Failures.Add("missing ${Label}: $Path")
-        return $false
-    }
-    return $true
-}
-
-function Assert-Contains {
-    param(
-        [string]$Path,
-        [string[]]$Patterns,
-        [System.Collections.Generic.List[string]]$Failures,
-        [string]$Label
-    )
-
-    if (-not (Assert-FileExists -Path $Path -Failures $Failures -Label $Label)) {
-        return
-    }
-
-    $text = Get-Content -Path $Path -Raw
-    foreach ($pattern in $Patterns) {
-        if ($text -notmatch [regex]::Escape($pattern)) {
-            $Failures.Add("$Label missing pattern: $pattern")
-        }
-    }
-}
-
-function Get-JarEntries {
-    param(
-        [string]$JarPath
-    )
-
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($JarPath)
-    try {
-        return @($zip.Entries | ForEach-Object { $_.FullName })
-    } finally {
-        $zip.Dispose()
-    }
-}
-
-function Assert-JarEntries {
-    param(
-        [string]$JarPath,
-        [string[]]$Entries,
-        [System.Collections.Generic.List[string]]$Failures,
-        [string]$Label
-    )
-
-    if (-not (Assert-FileExists -Path $JarPath -Failures $Failures -Label "$Label jar")) {
-        return
-    }
-
-    $entrySet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
-    foreach ($entry in Get-JarEntries -JarPath $JarPath) {
-        [void]$entrySet.Add($entry)
-    }
-
-    foreach ($entry in $Entries) {
-        if (-not $entrySet.Contains($entry)) {
-            $Failures.Add("$Label jar missing entry: $entry")
-        }
-    }
-}
-
-function Resolve-LatestJar {
-    param(
-        [string]$Directory,
-        [string]$Pattern
-    )
-
-    $match = Get-ChildItem -Path $Directory -Filter $Pattern -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($null -eq $match) {
-        throw "No jar matched pattern '$Pattern' in '$Directory'"
-    }
-    return $match.FullName
-}
-
-function Get-GradleProperty {
-    param(
-        [string]$Path,
-        [string]$Name
-    )
-
-    foreach ($line in Get-Content -Path $Path) {
-        $trimmed = $line.Trim()
-        if (-not $trimmed -or $trimmed.StartsWith('#') -or $trimmed.StartsWith('!')) {
-            continue
-        }
-        $idx = $trimmed.IndexOf('=')
-        if ($idx -le 0) {
-            continue
-        }
-        if ($trimmed.Substring(0, $idx).Trim() -eq $Name) {
-            return $trimmed.Substring($idx + 1).Trim()
-        }
-    }
-    throw "Missing Gradle property '$Name' in '$Path'"
-}
-
-function New-Result {
-    param(
-        [string]$Name,
-        [System.Collections.Generic.List[string]]$Failures,
-        [string]$JarPath
-    )
-
-    [pscustomobject]@{
-        Name    = $Name
-        Passed  = ($Failures.Count -eq 0)
-        JarPath = $JarPath
-        Failures = @($Failures)
-    }
-}
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $buildRoot = Join-Path (Split-Path -Parent $repoRoot) 'zstdnet-build'
-
-$translationKeys = @(
-    'zstdnet.share_to_lan.port_help',
-    'zstdnet.singleplayer.lan_hint',
-    'zstdnet.singleplayer.lan_command_hint',
-    'zstdnet.command.port.game_set_reopen'
+$retiredClasses = @(
+    'cn/tohsaka/factory/zstdnet/proxy/LocalZstdNet',
+    'cn/tohsaka/factory/zstdnet/server/ServerProxyRuntime',
+    'cn/tohsaka/factory/zstdnet/server/DedicatedServerAutoPort',
+    'cn/tohsaka/factory/zstdnet/coremod/ConnectScreenHooks',
+    'cn/tohsaka/factory/zstdnet/mixin/ConnectScreenMixin',
+    'cn/tohsaka/factory/zstdnet/mixin/ClientIntentionPacketMixin'
+)
+$requiredClasses = @(
+    'cn/tohsaka/factory/zstdnet/client/ClientProxyPublisher.class',
+    'cn/tohsaka/factory/zstdnet/server/ServerProxyBootstrap.class',
+    'cn/tohsaka/factory/zstdnet/coremod/ServerRealIpHooks.class',
+    'cn/tohsaka/factory/zstdnet/network/LanCompressionSync.class'
+)
+$targets = @(
+    @{ Version = '1.20.1'; Loader = 'forge'; SourceLoader = 'forge' },
+    @{ Version = '1.20.1'; Loader = 'neoforge'; SourceLoader = 'forge' },
+    @{ Version = '1.20.1'; Loader = 'fabric'; SourceLoader = 'fabric' },
+    @{ Version = '1.21.1'; Loader = 'neoforge'; SourceLoader = 'neoforge' },
+    @{ Version = '1.21.1'; Loader = 'fabric'; SourceLoader = 'fabric' }
 )
 
-$results = @()
-
-# forge 1.20.1
-$forgeFailures = New-Object System.Collections.Generic.List[string]
-$forgeRoot = Join-Path $repoRoot 'mods\1.20.1\zstdnet-forge'
-$forgeVersion = Get-GradleProperty -Path (Join-Path $forgeRoot 'gradle.properties') -Name 'mod_version'
-$forgeJar = Resolve-LatestJar -Directory (Join-Path $buildRoot 'mods\1.20.1\zstdnet-forge\libs') -Pattern "*$forgeVersion.jar"
-Assert-Contains -Path (Join-Path $forgeRoot 'src\main\java\cn\tohsaka\factory\zstdnet\client\ClientProxyPublisher.java') -Patterns @(
-    'buildPortCommand("zstdport")',
-    'Commands.literal(literal)',
-    'sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_hint"))',
-    'sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_command_hint"))',
-    'ServerProxyConfigFile.readListenPort()',
-    'zstdnet.command.port.game_set_reopen'
-) -Failures $forgeFailures -Label 'forge client publisher'
-Assert-Contains -Path (Join-Path $forgeRoot 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyBootstrap.java') -Patterns @(
-    'resolveLanBackendPort',
-    'currentLanAdvertisePort',
-    'config/LAN state changed, reloading proxy.',
-    'config/LAN state changed, reloading proxy before LAN advertisement.',
-    'LAN world published on {}, zstd proxy armed.',
-    'LAN mode detected, disabled online authentication by default.'
-) -Failures $forgeFailures -Label 'forge server bootstrap'
-Assert-Contains -Path (Join-Path $forgeRoot 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyRuntime.java') -Patterns @(
-    'start(lanPort, RuntimeMode.LAN);',
-    'bindLanWildcardServerSockets',
-    'new InetSocketAddress("::", port)',
-    'LAN host detected. Point your tunnel to {} instead of the raw LAN port {}.',
-    'return running && runtimeMode == RuntimeMode.LAN;'
-) -Failures $forgeFailures -Label 'forge server runtime'
-Assert-Contains -Path (Join-Path $forgeRoot 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyConfigFile.java') -Patterns @(
-    'public static int readListenPort()',
-    'public static void writePorts(Integer listenPort, Integer targetPort) throws IOException',
-    'props.putIfAbsent("auto_takeover", "false")',
-    'appendLine(builder, "auto_takeover=" + props.getProperty("auto_takeover"), lineSeparator)'
-) -Failures $forgeFailures -Label 'forge server config file'
-Assert-Contains -Path (Join-Path $forgeRoot 'src\main\java\cn\tohsaka\factory\zstdnet\coremod\LanCompressionHooks.java') -Patterns @(
-    'LAN_THRESHOLD = 1048576',
-    'return LAN_THRESHOLD;',
-    'resolveAdvertisedLanAddress',
-    'currentLanAdvertisePort'
-) -Failures $forgeFailures -Label 'forge LAN compression hook'
-Assert-Contains -Path (Join-Path $forgeRoot 'src\main\resources\coremods\zstdnet_lan_compression_threshold.js') -Patterns @(
-    'patched MinecraftServer#getCompressionThreshold for LAN mode.',
-    'DedicatedServerAutoPort',
-    'zstdnet_lan_advertise_zstd_port',
-    "ASMAPI.mapMethod('m_120113_')",
-    "method.name != 'a'",
-    'zstdnet_lan_backend_port',
-    'resolveLanBackendPort',
-    'patched IntegratedServer#publishServer to use configured LAN backend port.',
-    'resolveAdvertisedLanAddress',
-    'patched LanServerPinger#createPingString to advertise zstd LAN port.'
-) -Failures $forgeFailures -Label 'forge LAN coremod'
-foreach ($lang in @('en_us.json', 'zh_cn.json')) {
-    Assert-Contains -Path (Join-Path $forgeRoot "src\main\resources\assets\zstdnet\lang\$lang") -Patterns $translationKeys -Failures $forgeFailures -Label "forge $lang"
-}
-Assert-JarEntries -JarPath $forgeJar -Entries @(
-    'cn/tohsaka/factory/zstdnet/client/ClientProxyPublisher.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyBootstrap.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyRuntime.class',
-    'cn/tohsaka/factory/zstdnet/server/DedicatedServerAutoPort.class',
-    'cn/tohsaka/factory/zstdnet/network/LanCompressionSync.class',
-    'assets/zstdnet/lang/en_us.json',
-    'assets/zstdnet/lang/zh_cn.json',
-    'coremods/zstdnet_lan_compression_threshold.js'
-) -Failures $forgeFailures -Label 'forge-1.20.1'
-$results += New-Result -Name 'forge-1.20.1' -Failures $forgeFailures -JarPath $forgeJar
-
-# neoforge 1.20.1
-$neo1201Failures = New-Object System.Collections.Generic.List[string]
-$neo1201Root = Join-Path $repoRoot 'mods\1.20.1\zstdnet-neoforge'
-$neo1201Version = Get-GradleProperty -Path (Join-Path $neo1201Root 'gradle.properties') -Name 'mod_version'
-$neo1201Jar = Resolve-LatestJar -Directory (Join-Path $buildRoot 'mods\1.20.1\zstdnet-neoforge\libs') -Pattern "*$neo1201Version.jar"
-Assert-Contains -Path (Join-Path $neo1201Root 'build.gradle') -Patterns @(
-    "srcDir '../zstdnet-forge/src/main/java'",
-    "from('../zstdnet-forge/src/main/resources')",
-    'archivesName = "zstdnet-${minecraft_version}-neoforge"'
-) -Failures $neo1201Failures -Label 'neoforge 1.20.1 build.gradle'
-Assert-JarEntries -JarPath $neo1201Jar -Entries @(
-    'cn/tohsaka/factory/zstdnet/client/ClientProxyPublisher.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyBootstrap.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyRuntime.class',
-    'cn/tohsaka/factory/zstdnet/server/DedicatedServerAutoPort.class',
-    'cn/tohsaka/factory/zstdnet/network/LanCompressionSync.class',
-    'assets/zstdnet/lang/en_us.json',
-    'assets/zstdnet/lang/zh_cn.json',
-    'coremods/zstdnet_lan_compression_threshold.js'
-) -Failures $neo1201Failures -Label 'neoforge-1.20.1'
-$results += New-Result -Name 'neoforge-1.20.1' -Failures $neo1201Failures -JarPath $neo1201Jar
-
-# neoforge 1.21.1
-$neo1211Failures = New-Object System.Collections.Generic.List[string]
-$neo1211Root = Join-Path $repoRoot 'mods\1.21.1\zstdnet-neoforge'
-$neo1211Version = Get-GradleProperty -Path (Join-Path $neo1211Root 'gradle.properties') -Name 'mod_version'
-$neo1211Jar = Resolve-LatestJar -Directory (Join-Path $buildRoot 'mods\1.21.1\zstdnet-neoforge\libs') -Pattern "*$neo1211Version.jar"
-Assert-Contains -Path (Join-Path $neo1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\client\ClientProxyPublisher.java') -Patterns @(
-    'buildPortCommand("zstdport")',
-    'Commands.literal(literal)',
-    'sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_hint"))',
-    'sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_command_hint"))',
-    'ServerProxyConfigFile.readListenPort()',
-    'zstdnet.command.port.game_set_reopen'
-) -Failures $neo1211Failures -Label 'neoforge 1.21.1 client publisher'
-Assert-Contains -Path (Join-Path $neo1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyBootstrap.java') -Patterns @(
-    'resolveLanBackendPort',
-    'currentLanAdvertisePort',
-    'config/LAN state changed, reloading proxy.',
-    'config/LAN state changed, reloading proxy before LAN advertisement.',
-    'LAN world published on {}, zstd proxy armed.',
-    'LAN mode detected, disabled online authentication by default.'
-) -Failures $neo1211Failures -Label 'neoforge 1.21.1 server bootstrap'
-Assert-Contains -Path (Join-Path $neo1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyRuntime.java') -Patterns @(
-    'start(lanPort, RuntimeMode.LAN);',
-    'bindLanWildcardServerSockets',
-    'new InetSocketAddress("::", port)',
-    'LAN host detected. Point your tunnel to {} instead of the raw LAN port {}.',
-    'return running && runtimeMode == RuntimeMode.LAN;'
-) -Failures $neo1211Failures -Label 'neoforge 1.21.1 server runtime'
-Assert-Contains -Path (Join-Path $neo1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyConfigFile.java') -Patterns @(
-    'public static int readListenPort()',
-    'public static void writePorts(Integer listenPort, Integer targetPort) throws IOException',
-    'props.putIfAbsent("auto_takeover", "false")',
-    'appendLine(builder, "auto_takeover=" + props.getProperty("auto_takeover"), lineSeparator)'
-) -Failures $neo1211Failures -Label 'neoforge 1.21.1 server config file'
-Assert-Contains -Path (Join-Path $neo1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\coremod\LanCompressionHooks.java') -Patterns @(
-    'LAN_THRESHOLD = 1048576',
-    'return LAN_THRESHOLD;',
-    'resolveAdvertisedLanAddress',
-    'currentLanAdvertisePort'
-) -Failures $neo1211Failures -Label 'neoforge 1.21.1 LAN compression hook'
-Assert-Contains -Path (Join-Path $neo1211Root 'src\main\resources\coremods\zstdnet_lan_compression_threshold.js') -Patterns @(
-    'patched MinecraftServer#getCompressionThreshold for LAN mode.',
-    'DedicatedServerAutoPort',
-    'zstdnet_lan_advertise_zstd_port',
-    "method.name != 'a'",
-    'zstdnet_lan_backend_port',
-    'resolveLanBackendPort',
-    'patched IntegratedServer#publishServer to use configured LAN backend port.',
-    'resolveAdvertisedLanAddress',
-    'patched LanServerPinger#createPingString to advertise zstd LAN port.'
-) -Failures $neo1211Failures -Label 'neoforge 1.21.1 LAN coremod'
-foreach ($lang in @('en_us.json', 'zh_cn.json')) {
-    Assert-Contains -Path (Join-Path $neo1211Root "src\main\resources\assets\zstdnet\lang\$lang") -Patterns $translationKeys -Failures $neo1211Failures -Label "neoforge 1.21.1 $lang"
-}
-Assert-JarEntries -JarPath $neo1211Jar -Entries @(
-    'cn/tohsaka/factory/zstdnet/client/ClientProxyPublisher.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyBootstrap.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyRuntime.class',
-    'cn/tohsaka/factory/zstdnet/server/DedicatedServerAutoPort.class',
-    'cn/tohsaka/factory/zstdnet/network/LanCompressionSync.class',
-    'assets/zstdnet/lang/en_us.json',
-    'assets/zstdnet/lang/zh_cn.json',
-    'coremods/zstdnet_lan_compression_threshold.js'
-) -Failures $neo1211Failures -Label 'neoforge-1.21.1'
-$results += New-Result -Name 'neoforge-1.21.1' -Failures $neo1211Failures -JarPath $neo1211Jar
-
-# fabric 1.20.1
-$fabricFailures = New-Object System.Collections.Generic.List[string]
-$fabricRoot = Join-Path $repoRoot 'mods\1.20.1\zstdnet-fabric'
-$fabricVersion = Get-GradleProperty -Path (Join-Path $fabricRoot 'gradle.properties') -Name 'mod_version'
-$fabricJar = Resolve-LatestJar -Directory (Join-Path $buildRoot 'mods\1.20.1\zstdnet-fabric\libs') -Pattern "*$fabricVersion.jar"
-Assert-Contains -Path (Join-Path $fabricRoot 'src\main\java\cn\tohsaka\factory\zstdnet\client\ClientProxyPublisher.java') -Patterns @(
-    'buildPortCommand("zstdport")',
-    'ClientCommandManager.literal(literal)',
-    'sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_hint"))',
-    'sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_command_hint"))',
-    'ServerProxyConfigFile.readListenPort()',
-    'zstdnet.command.port.game_set_reopen'
-) -Failures $fabricFailures -Label 'fabric client publisher'
-Assert-Contains -Path (Join-Path $fabricRoot 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyBootstrap.java') -Patterns @(
-    'resolveLanBackendPort',
-    'currentLanAdvertisePort',
-    'config/LAN state changed, reloading proxy.',
-    'config/LAN state changed, reloading proxy before LAN advertisement.',
-    'LAN world published on {}, zstd proxy armed.',
-    'LAN mode detected, disabled online authentication by default.'
-) -Failures $fabricFailures -Label 'fabric server bootstrap'
-Assert-Contains -Path (Join-Path $fabricRoot 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyRuntime.java') -Patterns @(
-    'start(lanPort, RuntimeMode.LAN);',
-    'bindLanWildcardServerSockets',
-    'new InetSocketAddress("::", port)',
-    'LAN host detected. Point your tunnel to {} instead of the raw LAN port {}.',
-    'return running && runtimeMode == RuntimeMode.LAN;'
-) -Failures $fabricFailures -Label 'fabric server runtime'
-Assert-Contains -Path (Join-Path $fabricRoot 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyConfigFile.java') -Patterns @(
-    'public static int readListenPort()',
-    'public static void writePorts(Integer listenPort, Integer targetPort) throws IOException',
-    'props.putIfAbsent("auto_takeover", "false")',
-    'appendLine(builder, "auto_takeover=" + props.getProperty("auto_takeover"), lineSeparator)'
-) -Failures $fabricFailures -Label 'fabric server config file'
-Assert-Contains -Path (Join-Path $fabricRoot 'src\main\resources\zstdnet.mixins.json') -Patterns @(
-    '"DedicatedServerMixin"',
-    '"IntegratedServerMixin"',
-    '"LanServerPingerMixin"',
-    '"MinecraftServerMixin"',
-    '"ShareToLanScreenMixin"'
-) -Failures $fabricFailures -Label 'fabric mixins manifest'
-Assert-Contains -Path (Join-Path $fabricRoot 'src\main\java\cn\tohsaka\factory\zstdnet\mixin\DedicatedServerMixin.java') -Patterns @(
-    'DedicatedServerAutoPort.prepareDedicatedServerProperties'
-) -Failures $fabricFailures -Label 'fabric dedicated server mixin'
-Assert-Contains -Path (Join-Path $fabricRoot 'src\main\java\cn\tohsaka\factory\zstdnet\mixin\MinecraftServerMixin.java') -Patterns @(
-    'LanCompressionHooks.LAN_THRESHOLD',
-    'shouldOverrideCompressionThreshold'
-) -Failures $fabricFailures -Label 'fabric minecraft server mixin'
-Assert-Contains -Path (Join-Path $fabricRoot 'src\main\java\cn\tohsaka\factory\zstdnet\mixin\LanServerPingerMixin.java') -Patterns @(
-    'createPingString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;',
-    'resolveAdvertisedLanAddress'
-) -Failures $fabricFailures -Label 'fabric LAN pinger mixin'
-Assert-Contains -Path (Join-Path $fabricRoot 'src\main\java\cn\tohsaka\factory\zstdnet\mixin\IntegratedServerMixin.java') -Patterns @(
-    'publishServer',
-    'resolveLanBackendPort'
-) -Failures $fabricFailures -Label 'fabric integrated server mixin'
-foreach ($lang in @('en_us.json', 'zh_cn.json')) {
-    Assert-Contains -Path (Join-Path $fabricRoot "src\main\resources\assets\zstdnet\lang\$lang") -Patterns $translationKeys -Failures $fabricFailures -Label "fabric $lang"
-}
-Assert-JarEntries -JarPath $fabricJar -Entries @(
-    'cn/tohsaka/factory/zstdnet/client/ClientProxyPublisher.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyBootstrap.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyRuntime.class',
-    'cn/tohsaka/factory/zstdnet/server/DedicatedServerAutoPort.class',
-    'cn/tohsaka/factory/zstdnet/network/LanCompressionSync.class',
-    'cn/tohsaka/factory/zstdnet/mixin/DedicatedServerMixin.class',
-    'cn/tohsaka/factory/zstdnet/mixin/IntegratedServerMixin.class',
-    'cn/tohsaka/factory/zstdnet/mixin/LanServerPingerMixin.class',
-    'cn/tohsaka/factory/zstdnet/mixin/MinecraftServerMixin.class',
-    'cn/tohsaka/factory/zstdnet/mixin/ShareToLanScreenMixin.class',
-    'assets/zstdnet/lang/en_us.json',
-    'assets/zstdnet/lang/zh_cn.json',
-    'zstdnet.mixins.json'
-) -Failures $fabricFailures -Label 'fabric-1.20.1'
-$results += New-Result -Name 'fabric-1.20.1' -Failures $fabricFailures -JarPath $fabricJar
-
-# fabric 1.21.1
-$fabric1211Failures = New-Object System.Collections.Generic.List[string]
-$fabric1211Root = Join-Path $repoRoot 'mods\1.21.1\zstdnet-fabric'
-$fabric1211Version = Get-GradleProperty -Path (Join-Path $fabric1211Root 'gradle.properties') -Name 'mod_version'
-$fabric1211Jar = Resolve-LatestJar -Directory (Join-Path $buildRoot 'mods\1.21.1\zstdnet-fabric\libs') -Pattern "*$fabric1211Version.jar"
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\client\ClientProxyPublisher.java') -Patterns @(
-    'buildPortCommand("zstdport")',
-    'ClientCommandManager.literal(literal)',
-    'sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_hint"))',
-    'sendClientMessage(Component.translatable("zstdnet.singleplayer.lan_command_hint"))',
-    'ServerProxyConfigFile.readListenPort()',
-    'zstdnet.command.port.game_set_reopen',
-    'ServerData.Type.LAN',
-    'ServerData.Type.OTHER'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 client publisher'
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyBootstrap.java') -Patterns @(
-    'resolveLanBackendPort',
-    'currentLanAdvertisePort',
-    'config/LAN state changed, reloading proxy.',
-    'config/LAN state changed, reloading proxy before LAN advertisement.',
-    'LAN world published on {}, zstd proxy armed.',
-    'LAN mode detected, disabled online authentication by default.'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 server bootstrap'
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyRuntime.java') -Patterns @(
-    'start(lanPort, RuntimeMode.LAN);',
-    'bindLanWildcardServerSockets',
-    'new InetSocketAddress("::", port)',
-    'LAN host detected. Point your tunnel to {} instead of the raw LAN port {}.',
-    'return running && runtimeMode == RuntimeMode.LAN;'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 server runtime'
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyConfigFile.java') -Patterns @(
-    'public static int readListenPort()',
-    'public static void writePorts(Integer listenPort, Integer targetPort) throws IOException',
-    'props.putIfAbsent("auto_takeover", "false")',
-    'appendLine(builder, "auto_takeover=" + props.getProperty("auto_takeover"), lineSeparator)'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 server config file'
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\network\LanCompressionSync.java') -Patterns @(
-    'PayloadTypeRegistry.playS2C().register',
-    'PayloadTypeRegistry.playC2S().register',
-    'ClientPlayNetworking.send(new ReadyMessage',
-    'ServerPlayNetworking.send(player, new PrepareMessage'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 LAN sync'
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\resources\zstdnet.mixins.json') -Patterns @(
-    '"compatibilityLevel": "JAVA_21"',
-    '"DedicatedServerMixin"',
-    '"IntegratedServerMixin"',
-    '"LanServerPingerMixin"',
-    '"MinecraftServerMixin"',
-    '"ShareToLanScreenMixin"'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 mixins manifest'
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\mixin\DedicatedServerMixin.java') -Patterns @(
-    'DedicatedServerAutoPort.prepareDedicatedServerProperties'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 dedicated server mixin'
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\mixin\MinecraftServerMixin.java') -Patterns @(
-    'LanCompressionHooks.LAN_THRESHOLD',
-    'shouldOverrideCompressionThreshold'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 minecraft server mixin'
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\mixin\LanServerPingerMixin.java') -Patterns @(
-    'createPingString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;',
-    'resolveAdvertisedLanAddress'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 LAN pinger mixin'
-Assert-Contains -Path (Join-Path $fabric1211Root 'src\main\java\cn\tohsaka\factory\zstdnet\mixin\IntegratedServerMixin.java') -Patterns @(
-    'publishServer',
-    'resolveLanBackendPort'
-) -Failures $fabric1211Failures -Label 'fabric 1.21.1 integrated server mixin'
-foreach ($lang in @('en_us.json', 'zh_cn.json')) {
-    Assert-Contains -Path (Join-Path $fabric1211Root "src\main\resources\assets\zstdnet\lang\$lang") -Patterns $translationKeys -Failures $fabric1211Failures -Label "fabric 1.21.1 $lang"
-}
-Assert-JarEntries -JarPath $fabric1211Jar -Entries @(
-    'cn/tohsaka/factory/zstdnet/client/ClientProxyPublisher.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyBootstrap.class',
-    'cn/tohsaka/factory/zstdnet/server/ServerProxyRuntime.class',
-    'cn/tohsaka/factory/zstdnet/server/DedicatedServerAutoPort.class',
-    'cn/tohsaka/factory/zstdnet/network/LanCompressionSync.class',
-    'cn/tohsaka/factory/zstdnet/mixin/DedicatedServerMixin.class',
-    'cn/tohsaka/factory/zstdnet/mixin/IntegratedServerMixin.class',
-    'cn/tohsaka/factory/zstdnet/mixin/LanServerPingerMixin.class',
-    'cn/tohsaka/factory/zstdnet/mixin/MinecraftServerMixin.class',
-    'cn/tohsaka/factory/zstdnet/mixin/ShareToLanScreenMixin.class',
-    'assets/zstdnet/lang/en_us.json',
-    'assets/zstdnet/lang/zh_cn.json',
-    'zstdnet.mixins.json'
-) -Failures $fabric1211Failures -Label 'fabric-1.21.1'
-$results += New-Result -Name 'fabric-1.21.1' -Failures $fabric1211Failures -JarPath $fabric1211Jar
-
-$results | Format-Table Name, Passed, JarPath -AutoSize
-
-$failed = $results | Where-Object { -not $_.Passed }
-if ($failed) {
-    foreach ($item in $failed) {
-        Write-Host ""
-        Write-Host "[$($item.Name)] failures:"
-        foreach ($failure in $item.Failures) {
-            Write-Host "  - $failure"
-        }
-        Write-Host "  jar: $($item.JarPath)"
+foreach ($target in $targets) {
+    $name = "$($target.Version)-$($target.Loader)"
+    $project = Join-Path $repoRoot "mods\$($target.Version)\zstdnet-$($target.Loader)"
+    $source = Join-Path $repoRoot "mods\$($target.Version)\zstdnet-$($target.SourceLoader)"
+    $versionLine = Get-Content (Join-Path $project 'gradle.properties') |
+        Where-Object { $_ -match '^mod_version=' } | Select-Object -First 1
+    if (-not $versionLine) {
+        throw "$name is missing mod_version"
     }
-    throw 'LAN regression verification failed.'
+    $modVersion = $versionLine.Substring('mod_version='.Length)
+    $jarPath = Join-Path $buildRoot "mods\$($target.Version)\zstdnet-$($target.Loader)\libs\zstdnet-$name-$modVersion.jar"
+    if (-not (Test-Path -LiteralPath $jarPath)) {
+        throw "$name jar is missing: $jarPath"
+    }
+
+    $publisher = Get-Content -Raw (Join-Path $source 'src\main\java\cn\tohsaka\factory\zstdnet\client\ClientProxyPublisher.java')
+    if ($publisher -notmatch 'zstdnet.hud.integrated.title') {
+        throw "$name HUD title is missing"
+    }
+    $bootstrap = Get-Content -Raw (Join-Path $source 'src\main\java\cn\tohsaka\factory\zstdnet\server\ServerProxyBootstrap.java')
+    if ($bootstrap -match 'setUsesAuthentication\s*\(') {
+        throw "$name must leave Minecraft authentication to the server and LAN settings"
+    }
+    foreach ($lang in @('en_us.json', 'zh_cn.json')) {
+        $file = Join-Path $source "src\main\resources\assets\zstdnet\lang\$lang"
+        $translation = Get-Content -Raw -Encoding UTF8 $file | ConvertFrom-Json
+        $title = $translation.'zstdnet.hud.integrated.title'
+        if (-not $title -or $title -match '内置|外置|Integrated|External') {
+            throw "$name $lang HUD still exposes a proxy mode"
+        }
+    }
+
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
+    try {
+        $entries = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        foreach ($entry in $zip.Entries) {
+            [void]$entries.Add($entry.FullName)
+        }
+        foreach ($entry in $requiredClasses) {
+            if (-not $entries.Contains($entry)) {
+                throw "$name jar is missing $entry"
+            }
+        }
+        foreach ($class in $retiredClasses) {
+            if ($entries.Contains("$class.class") -or
+                    @($entries | Where-Object { $_.StartsWith("$class" + '$') }).Count -gt 0) {
+                throw "$name jar still contains $class"
+            }
+        }
+        if (-not $entries.Contains('assets/zstdnet/lang/en_us.json') -or
+                -not $entries.Contains('assets/zstdnet/lang/zh_cn.json')) {
+            throw "$name jar is missing HUD translations"
+        }
+    } finally {
+        $zip.Dispose()
+    }
+    Write-Host "$name OK: $jarPath"
 }
+
+Write-Host 'Static architecture verification passed.'

@@ -1,56 +1,23 @@
-/*
- * Copyright (c) 2026 wish
- *
- * This file is part of ZstdNet.
- *
- * ZstdNet is free software: you can redistribute it and/or modify
- * it under the terms of the MIT License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * ZstdNet is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * MIT License for more details.
- *
- * You should have received a copy of the MIT License
- * along with ZstdNet. If not, see <https://opensource.org/licenses/MIT>.
- */
-
 package cn.tohsaka.factory.zstdnet.server;
 
 import cn.tohsaka.factory.zstdnet.core.stats.TrafficStatisticsService;
 import cn.tohsaka.factory.zstdnet.core.stats.TrafficStats;
 import cn.tohsaka.factory.zstdnet.coremod.ServerRealIpHooks;
 import cn.tohsaka.factory.zstdnet.network.LanCompressionSync;
-import net.minecraft.ChatFormatting;
-import net.minecraft.network.Connection;
-import net.minecraft.network.PacketSendListener;
-import net.minecraft.network.chat.ClickEvent;
-import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.HoverEvent;
-import net.minecraft.network.protocol.login.ClientboundLoginDisconnectPacket;
-import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.level.ServerPlayer;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
-import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
+import org.slf4j.Logger;
 
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.SocketAddress;
+import java.io.IOException;
 import java.time.ZoneId;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * 服务端引导模块。
- * <p>
- * 监听 Forge 服务器生命周期，在专用服启动/停止时控制内置 zstd 代理运行时。
- */
 public final class ServerProxyBootstrap {
     private static final Logger LOGGER = LoggerFactory.getLogger(ServerProxyBootstrap.class);
     private static final AtomicBoolean INITIALIZED = new AtomicBoolean(false);
@@ -60,22 +27,48 @@ public final class ServerProxyBootstrap {
         ZoneId.systemDefault(),
         TRAFFIC_STATS
     );
-    private static final ServerProxyRuntime RUNTIME = new ServerProxyRuntime(TRAFFIC_STATS);
-    private static volatile int publishedLanPort = -1;
-    private static volatile int activeLanPort = -1;
-    private static volatile int notifiedLanPort = -1;
+    private static volatile boolean integratedMode;
+    private static volatile int integratedListenPort = -1;
     private static volatile long lastHudSyncMillis;
+    private static volatile long sampleAt;
+    private static volatile long sampleRawUp;
+    private static volatile long sampleRawDown;
+    private static volatile long sampleWireUp;
+    private static volatile long sampleWireDown;
+    private static ServerHudSnapshot cachedSnapshot;
 
     private ServerProxyBootstrap() {
     }
 
-    /**
-     * 注册服务端事件监听器（只注册一次）。
-     */
+    public static void addIntegratedRawUp(long bytes) {
+        TRAFFIC_STATS.addRawUp(bytes);
+    }
+
+    public static void addIntegratedWireUp(long bytes) {
+        TRAFFIC_STATS.addZstdUp(bytes);
+    }
+
+    public static void addIntegratedRawDown(long bytes) {
+        TRAFFIC_STATS.addRawDown(bytes);
+    }
+
+    public static void addIntegratedWireDown(long bytes) {
+        TRAFFIC_STATS.addZstdDown(bytes);
+    }
+
+    public static void addIntegratedConnection(int delta) {
+        TRAFFIC_STATS.addConn(delta);
+    }
+
     public static void init() {
         if (!INITIALIZED.compareAndSet(false, true)) {
             return;
         }
+        ServerRealIpHooks.configureDebugLogging(ServerProxyConfigFile.readDebug());
+        ServerRealIpHooks.configureProxyProtocol(
+            ServerProxyConfigFile.readTrustProxyProtocol(),
+            ServerProxyConfigFile.readTrustedProxyIps()
+        );
         NeoForge.EVENT_BUS.addListener(ServerProxyBootstrap::onServerStarted);
         NeoForge.EVENT_BUS.addListener(ServerProxyBootstrap::onServerStopping);
         NeoForge.EVENT_BUS.addListener(ServerProxyBootstrap::onServerTick);
@@ -83,106 +76,86 @@ public final class ServerProxyBootstrap {
         LOGGER.info("zstdnet server bootstrap initialized");
     }
 
-    public static ServerHudSnapshot currentHudSnapshot() {
-        ServerProxyRuntime.HudSnapshot snapshot = RUNTIME.hudSnapshot();
-        if (snapshot == null) {
+    public static synchronized ServerHudSnapshot currentHudSnapshot() {
+        if (!integratedMode || !ServerProxyConfigFile.readEnabled()) {
             return null;
         }
-        return new ServerHudSnapshot(
-            snapshot.modeName(),
-            snapshot.listenHost(),
-            snapshot.listenPort(),
-            snapshot.rawBytes(),
-            snapshot.zstdBytes(),
-            snapshot.rawUpBytes(),
-            snapshot.rawDownBytes(),
-            snapshot.zstdUpBytes(),
-            snapshot.zstdDownBytes(),
-            snapshot.rawUpRate(),
-            snapshot.rawDownRate(),
-            snapshot.zstdUpRate(),
-            snapshot.zstdDownRate(),
-            snapshot.rawRate(),
-            snapshot.zstdRate(),
-            snapshot.ratioPercent(),
-            snapshot.connections()
+        long now = System.currentTimeMillis();
+        if (cachedSnapshot != null && cachedSnapshot.listenPort() == integratedListenPort
+                && now - sampleAt < 1000L) {
+            return cachedSnapshot;
+        }
+        long rawUp = TRAFFIC_STATS.rawUpBytes();
+        long rawDown = TRAFFIC_STATS.rawDownBytes();
+        long wireUp = TRAFFIC_STATS.zstdUpBytes();
+        long wireDown = TRAFFIC_STATS.zstdDownBytes();
+        long elapsed = sampleAt == 0L ? 0L : Math.max(1L, now - sampleAt);
+        long rawUpRate = elapsed == 0L ? 0L : rate(rawUp - sampleRawUp, elapsed);
+        long rawDownRate = elapsed == 0L ? 0L : rate(rawDown - sampleRawDown, elapsed);
+        long wireUpRate = elapsed == 0L ? 0L : rate(wireUp - sampleWireUp, elapsed);
+        long wireDownRate = elapsed == 0L ? 0L : rate(wireDown - sampleWireDown, elapsed);
+        sampleAt = now;
+        sampleRawUp = rawUp;
+        sampleRawDown = rawDown;
+        sampleWireUp = wireUp;
+        sampleWireDown = wireDown;
+        long raw = rawUp + rawDown;
+        long wire = wireUp + wireDown;
+        cachedSnapshot = new ServerHudSnapshot(
+            "INTEGRATED", "0.0.0.0", integratedListenPort,
+            raw, wire, rawUp, rawDown, wireUp, wireDown,
+            rawUpRate, rawDownRate, wireUpRate, wireDownRate,
+            rawUpRate + rawDownRate, wireUpRate + wireDownRate,
+            raw == 0L ? 0.0D : (double) wire * 100.0D / (double) raw,
+            TRAFFIC_STATS.activeConnections()
         );
+        return cachedSnapshot;
+    }
+
+    private static long rate(long bytes, long elapsedMillis) {
+        return bytes <= 0L ? 0L : (long) Math.min(Long.MAX_VALUE, (double) bytes * 1000.0D / elapsedMillis);
     }
 
     public static String buildTrafficReport(String range) {
-        ServerProxyRuntime.HudSnapshot snapshot = RUNTIME.hudSnapshot();
-        String mode = snapshot == null ? "inactive" : snapshot.modeName();
+        ServerHudSnapshot snapshot = currentHudSnapshot();
+        String mode = snapshot == null ? "inactive" : snapshot.mode();
         String listen = snapshot == null ? "" : snapshot.listenHost() + ":" + snapshot.listenPort();
         return TRAFFIC_HISTORY.buildReportJson(range, mode, listen);
     }
 
-    public static int resolveLanBackendPort(int requestedPort) {
-        int listenPort = ServerProxyConfigFile.readListenPort();
-        int targetPort = ServerProxyConfigFile.readTargetPort();
-        if (targetPort > 0 && targetPort != listenPort) {
-            if (targetPort != requestedPort) {
-                LOGGER.info("[zstdnet-server] LAN backend port changed from {} to configured target {}.", requestedPort, targetPort);
-            }
-            return targetPort;
-        }
-        return requestedPort;
-    }
-
-    public static int currentLanAdvertisePort(int lanPort) {
-        if (lanPort <= 0) {
-            return -1;
-        }
-        synchronized (ServerProxyBootstrap.class) {
-            if (publishedLanPort != lanPort || !RUNTIME.isLanMode() || RUNTIME.configChangedOnDisk()) {
-                publishedLanPort = lanPort;
-                if (RUNTIME.isRunning()) {
-                    LOGGER.info("[zstdnet-server] config/LAN state changed, reloading proxy before LAN advertisement.");
-                    RUNTIME.stop();
-                }
-                RUNTIME.startLan(lanPort);
-                activeLanPort = RUNTIME.isLanMode() ? lanPort : -1;
-                notifiedLanPort = -1;
-                if (activeLanPort <= 0) {
-                    publishedLanPort = -1;
-                }
-            }
-            ServerProxyRuntime.HudSnapshot snapshot = RUNTIME.hudSnapshot();
-            return RUNTIME.isLanMode() && snapshot != null ? snapshot.listenPort() : -1;
-        }
-    }
-
-    /**
-     * 专用服启动后启动代理运行时。
-     */
     private static void onServerStarted(ServerStartedEvent event) {
+        MinecraftServer server = event.getServer();
         TRAFFIC_HISTORY.startSession();
-        if (!event.getServer().isDedicatedServer()) {
-            return;
+        try {
+            if (ServerProxyConfigFile.ensureExists()) {
+                LOGGER.info("[zstdnet-server] created server config at {}", ServerProxyConfigFile.path());
+            }
+            ServerProxyConfigFile.compactIntegratedConfig();
+        } catch (IOException e) {
+            LOGGER.warn("[zstdnet-server] could not update server config: {}", e.toString());
         }
-        DedicatedServerAutoPort.AutoPortPlan plan = DedicatedServerAutoPort.activePlan();
-        if (plan != null) {
-            LOGGER.info(
-                "[zstdnet-server] public entry is {}:{}, backend was reassigned to {}:{}",
-                plan.listenHost(),
-                plan.listenPort(),
-                plan.targetHost(),
-                plan.targetPort()
-            );
+        ServerRealIpHooks.configureFloodGuard(ServerProxyConfigFile.createFloodGuard());
+        ServerRealIpHooks.configureDebugLogging(ServerProxyConfigFile.readDebug());
+        ServerRealIpHooks.configureProxyProtocol(
+            ServerProxyConfigFile.readTrustProxyProtocol(),
+            ServerProxyConfigFile.readTrustedProxyIps()
+        );
+        if (server.isDedicatedServer()) {
+            integratedMode = true;
+            integratedListenPort = server.getPort();
+            LOGGER.info("[zstdnet-server] zstd transport ready on Minecraft port {} (online-mode={}).",
+                integratedListenPort, server.usesAuthentication());
         }
-        RUNTIME.start(event.getServer().getPort());
     }
 
-    /**
-     * 专用服停止前关闭代理运行时。
-     */
     private static void onServerStopping(ServerStoppingEvent event) {
-        publishedLanPort = -1;
-        activeLanPort = -1;
-        notifiedLanPort = -1;
+        integratedMode = false;
+        integratedListenPort = -1;
         lastHudSyncMillis = 0L;
-        RUNTIME.stop();
+        sampleAt = 0L;
+        cachedSnapshot = null;
+        ServerRealIpHooks.configureFloodGuard(null);
         TRAFFIC_HISTORY.stopSession();
-        DedicatedServerAutoPort.clear();
     }
 
     private static void onServerTick(ServerTickEvent.Post event) {
@@ -190,53 +163,14 @@ public final class ServerProxyBootstrap {
         if (server == null) {
             return;
         }
-
-        if (server.isDedicatedServer()) {
-            if (RUNTIME.configChangedOnDisk()) {
-                LOGGER.info("[zstdnet-server] config changed on disk, reloading proxy.");
-                RUNTIME.stop();
-                RUNTIME.start(server.getPort());
-            }
+        if (!server.isDedicatedServer()) {
+            boolean published = server.isPublished() && server.getPort() > 0;
+            integratedMode = published;
+            integratedListenPort = published ? server.getPort() : -1;
+        }
+        if (integratedMode) {
             syncServerHudSnapshot(server);
-            return;
         }
-
-        boolean published = server.isPublished();
-        int lanPort = published ? server.getPort() : -1;
-
-        if (published && lanPort > 0) {
-            forceDisableLanAuthentication(server);
-            if (publishedLanPort != lanPort || RUNTIME.configChangedOnDisk()) {
-                publishedLanPort = lanPort;
-                if (RUNTIME.isRunning()) {
-                    LOGGER.info("[zstdnet-server] config/LAN state changed, reloading proxy.");
-                    RUNTIME.stop();
-                }
-                RUNTIME.startLan(lanPort);
-                activeLanPort = RUNTIME.isLanMode() ? lanPort : -1;
-                if (activeLanPort > 0) {
-                    notifyLanProxyReady(server, lanPort);
-                    notifiedLanPort = lanPort;
-                    LOGGER.info("[zstdnet-server] LAN world published on {}, zstd proxy armed.", lanPort);
-                } else {
-                    LOGGER.warn("[zstdnet-server] LAN world published on {}, but zstd proxy did not start. Check zstdnet-server.properties.", lanPort);
-                }
-            }
-            if (activeLanPort > 0 && notifiedLanPort != lanPort) {
-                notifyLanProxyReady(server, lanPort);
-                notifiedLanPort = lanPort;
-                LOGGER.info("[zstdnet-server] LAN world published on {}, zstd proxy armed.", lanPort);
-            }
-            return;
-        }
-
-        if (RUNTIME.isLanMode()) {
-            LOGGER.info("[zstdnet-server] LAN world is no longer published, stopping zstd proxy.");
-            RUNTIME.stop();
-        }
-        publishedLanPort = -1;
-        activeLanPort = -1;
-        notifiedLanPort = -1;
     }
 
     private static void syncServerHudSnapshot(MinecraftServer server) {
@@ -245,7 +179,6 @@ public final class ServerProxyBootstrap {
             return;
         }
         lastHudSyncMillis = now;
-
         ServerHudSnapshot snapshot = currentHudSnapshot();
         if (snapshot == null) {
             return;
@@ -255,89 +188,18 @@ public final class ServerProxyBootstrap {
         }
     }
 
-    private static void notifyLanProxyReady(MinecraftServer server, int lanPort) {
-        ServerProxyRuntime.HudSnapshot snapshot = RUNTIME.hudSnapshot();
-        if (snapshot == null) {
-            return;
-        }
-        Component message = Component.translatable(
-            "zstdnet.singleplayer.lan_ready",
-            copyableZstdPort(snapshot.listenPort())
-        );
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            player.sendSystemMessage(message);
-        }
-        LOGGER.info("[zstdnet-server] LAN ready: zstd listen port={}, game port={}", snapshot.listenPort(), lanPort);
-    }
-
-    private static Component copyableZstdPort(int port) {
-        String text = String.valueOf(port);
-        return Component.literal(text).withStyle(style -> style
-            .withColor(ChatFormatting.AQUA)
-            .withUnderlined(true)
-            .withClickEvent(new ClickEvent(ClickEvent.Action.COPY_TO_CLIPBOARD, text))
-            .withHoverEvent(new HoverEvent(HoverEvent.Action.SHOW_TEXT, Component.translatable("zstdnet.singleplayer.lan_ready.copy_zstd"))));
-    }
-
-    private static void forceDisableLanAuthentication(MinecraftServer server) {
-        if (server.usesAuthentication()) {
-            server.setUsesAuthentication(false);
-            LOGGER.info("[zstdnet-server] LAN mode detected, disabled online authentication by default.");
-        }
-    }
-
-    public static boolean rejectDirectBackendLogin(Connection connection) {
-        if (connection == null || !RUNTIME.protectsBackendLogin()) {
-            return false;
-        }
-
-        SocketAddress remoteAddress = connection.getRemoteAddress();
-        if (isLoopback(remoteAddress) || ServerRealIpHooks.isForwardedConnection(connection)) {
-            return false;
-        }
-
-        Component reason = Component.literal(RUNTIME.zstdAddressHint());
-        connection.send(
-            new ClientboundLoginDisconnectPacket(reason),
-            PacketSendListener.thenRun(() -> connection.disconnect(reason))
-        );
-        connection.setReadOnly();
-        LOGGER.warn("[server] rejected direct backend login from {}", remoteAddress);
-        return true;
-    }
-
     private static void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
         if (!(event.getEntity() instanceof ServerPlayer player)) {
             return;
         }
-
-        LanCompressionSync.sendUdpDirectPorts(player, RUNTIME.udpDirectPorts());
-        if (!RUNTIME.protectsBackendLogin()) {
-            return;
+        MinecraftServer server = player.getServer();
+        if (server != null && !server.isDedicatedServer() && server.isPublished()) {
+            integratedMode = true;
+            integratedListenPort = server.getPort();
         }
-
-        SocketAddress remoteAddress = player.connection.getRemoteAddress();
-        if (isLoopback(remoteAddress) || ServerRealIpHooks.isForwardedConnection(player.connection.getConnection())) {
-            if (activeLanPort > 0 && !player.connection.getConnection().isMemoryConnection()) {
-                LanCompressionSync.requestCompressionUpgrade(player);
-            }
-            return;
+        if (integratedMode && ServerProxyConfigFile.readEnabled() && !player.connection.getConnection().isMemoryConnection()) {
+            LanCompressionSync.requestIntegratedUpgrade(player);
         }
-
-        LOGGER.warn("[server] rejected direct backend login from {}", remoteAddress);
-        player.connection.disconnect(Component.literal(RUNTIME.zstdAddressHint()));
-    }
-
-    private static boolean isLoopback(SocketAddress address) {
-        if (!(address instanceof InetSocketAddress inet)) {
-            return false;
-        }
-
-        InetAddress ip = inet.getAddress();
-        if (ip == null) {
-            return false;
-        }
-        return ip.isLoopbackAddress() || ip.isAnyLocalAddress();
     }
 
     public record ServerHudSnapshot(

@@ -1,54 +1,23 @@
 # ZstdNet 文档
 
-- English: [README.en-US.md](README.en-US.md)
-- 中文: [README.zh-CN.md](README.zh-CN.md)
-- (本项目自V1.3.8版本不在发布新版本jar在github，请前往curseforge下载)
-- (Starting from version V1.3.8, this project will no longer release new version JAR files on GitHub. Please go to CurseForge to download.)
+- 中文说明：[README.zh-CN.md](README.zh-CN.md)
+- English guide: [README.en-US.md](README.en-US.md)
+- 自 V1.3.8 起，发布版 JAR 请从 [CurseForge](https://www.curseforge.com/minecraft/mc-mods/zstdnet) 下载。
 
-## 省流版
+## 支持版本
 
-### 当前支持版本
+Forge 1.20.1、NeoForge 1.20.1、Fabric 1.20.1、NeoForge 1.21.1、Fabric 1.21.1 分别使用对应 JAR，同一 JAR 不能跨 Minecraft 版本或加载器使用。
 
-- Forge 1.20.1
-- NeoForge 1.20.1
-- NeoForge 1.21.1
-- Fabric 1.20.1
-- Fabric 1.21.1
+## 使用方法
 
-## Velocity版本
+客户端和服务端安装对应版本模组后，玩家直接连接 `server.properties` 中的游戏端口。正版验证由原版 `online-mode=true` 负责；离线模式也可在登录后协商 Zstd 压缩。单机开放局域网同样使用本次实际游戏端口。
 
-https://github.com/wish131400/zstdnet-Velocity
-VC版本因为兼容性原因，需要下载velocity插件版本
+客户端通道已确认时，Zstd 协商会提前到初始游戏同步之前。初始数据最多等待 5 秒或保留 4096 个包，协商未完成时恢复原版发送。登录阶段仍使用原版压缩，建议保持 `network-compression-threshold=256`。
 
-## spigot的插件版
-https://github.com/Meoyuta/ZstdNet-spigot
-感谢 https://github.com/Meoyuta 移植的插件版本
+`config/zstdnet-server.properties` 可按需设置压缩开关、服务端压缩等级 `level`（默认 9）、连接限流以及 PROXY v2 真实 IP 转发。旧代理的 `legacy_proxy`、`auto_takeover`、`listen`、`target` 和 UDP 端口列表已移除；升级后请把公网映射指向原游戏端口。其他模组使用 UDP 时，仍需按该模组的说明开放或映射 UDP 端口。
 
-### 客户端联机配置
+`debug=false` 默认关闭 PROXY v2 转发成功日志。排查代理连接时可设为 `true`，修改后重启服务端生效。
 
-安装好mod后，直接打开局域网即可。游戏端口通常可以留空，ZstdNet 会自动跟随本次实际 LAN 端口；Zstd 端口会优先使用配置里的端口，如果被占用会自动换到可用端口。开放成功后聊天框会提示实际 Zstd 端口，并且端口可以点击复制。如果使用高级联机 mod 完全替换界面导致看不到 Zstd UI，可以用 `/zstdport show` 查看当前端口；只有需要固定公网/隧道端口时，才用 `/zstdport zstd xxxxx` 手动指定。
-有正版验证需求，可以额外搭配 [TrueUUID（正版离线共存）](https://www.curseforge.com/minecraft/mc-mods/trueuuid)。使用/zstdhud on指令可以查看压缩状态。
+在游戏内使用 `/zstdhud on` 查看线路流量、原始流量与压缩率。管理员可用 `/zstdreport today|session|24h|7d|30d` 生成本地流量报告。
 
-### 服务器配置
-
-安装好 mod 后，最小配置只需要在 `server.properties` 里关闭正版验证：
-
-```properties
-online-mode=false
-```
-
-然后正常启动服务器即可体验带宽压缩。公网直连、局域网、虚拟局域网、FRP / 反代等详细配置请看 [中文完整文档](README.zh-CN.md)。
-有正版验证需求，可以额外搭配 [TrueUUID（正版离线共存）](https://www.curseforge.com/minecraft/mc-mods/trueuuid)。使用/zstdhud on指令可以查看压缩状态。
-
-### 本地流量统计面板
-
-拥有 2 级命令权限的玩家可使用 `/zstdreport today|session|24h|7d|30d` 生成自包含 HTML 面板。面板支持时间筛选、深浅模式、10 套主题色以及 `KiB/s` / `Mbps` 带宽参考；详细说明见 [中文完整文档](README.zh-CN.md#本地流量统计面板) 和 [面板设计文档](docs/design/zstdnet-report-dashboard.md)。
-
-# curseforge
-
-- https://www.curseforge.com/minecraft/mc-mods/zstdnet
-
-# 鸣谢
-- [齿轮盛宴官方网站]( https://www.xn--dctt54dhmrbwo.com/ )
-- [量子科技官方网站]( https://www.mcplay.cc/ )
-- [本项目灵感来源]( https://github.com/MeguminKato )
+Velocity 版本：[zstdnet-Velocity](https://github.com/wish131400/zstdnet-Velocity)。Spigot 移植：[ZstdNet-spigot](https://github.com/Meoyuta/ZstdNet-spigot)。
